@@ -1,0 +1,80 @@
+{
+  "metadata": {
+    "description": "Gaussian fitting parameters for atomic potentials",
+    "atom_types": [
+      "In",
+      "As",
+      "P1",
+      "P2"
+    ],
+    "use_global_optimization": false
+  },
+  "atoms": {
+    "In": {
+      "n_gaussians": 2,
+      "amplitudes": [
+        -2.040847493560314,
+        2.2109795713664187
+      ],
+      "exponents": [
+        0.2717494182900027,
+        0.5722608162298161
+      ],
+      "fit_quality": {
+        "success": true,
+        "r_squared": 0.9998813742836697,
+        "rmse": 0.001216122173533094,
+        "max_error": 0.0045403122814989
+      }
+    },
+    "As": {
+      "n_gaussians": 3,
+      "amplitudes": [
+        -2.009629347814207,
+        10.075799999833432,
+        -8.264343782063914
+      ],
+      "exponents": [
+        0.21204467548276962,
+        1.159988044560867,
+        1.245707203517337
+      ],
+      "fit_quality": {
+        "success": true,
+        "r_squared": 0.9995704306361983,
+        "rmse": 0.004684667013469904,
+        "max_error": 0.016609924202807047
+      }
+    },
+    "P1": {
+      "n_gaussians": 1,
+      "amplitudes": [
+        0.448
+      ],
+      "exponents": [
+        0.44869143463375805
+      ],
+      "fit_quality": {
+        "success": true,
+        "r_squared": 0.9999999999995308,
+        "rmse": 8.100462408478239e-08,
+        "max_error": 5.046167593780737e-07
+      }
+    },
+    "P2": {
+      "n_gaussians": 1,
+      "amplitudes": [
+        -0.3840001508395439
+      ],
+      "exponents": [
+        0.4486916627071681
+      ],
+      "fit_quality": {
+        "success": true,
+        "r_squared": 0.9999999999988728,
+        "rmse": 7.533680485066947e-08,
+        "max_error": 5.243383843778204e-07
+      }
+    }
+  }
+}
