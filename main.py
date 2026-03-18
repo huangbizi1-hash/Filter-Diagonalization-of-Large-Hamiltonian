@@ -1,4 +1,12 @@
 """
+仓库说明：
+这个脚本是本仓库的主入口，用来在三维离散格点上构造量子哈密顿量，
+并结合 FFT 动能算符、势能模型、哈密顿量滤波、SVD 截断与 Rayleigh-Ritz
+投影，对目标能量窗口内的本征值与本征态进行数值求解。
+
+程序支持多种势能来源，包括解析势场与从外部文件读入的拟合势能；
+运行后会自动保存参数、能谱结果、计时信息和图像，便于不同配置下的实验比较。
+
 main.py
 =======
 Quantum eigenvalue solver via FFT-based Hamiltonian filter + Rayleigh-Ritz.
