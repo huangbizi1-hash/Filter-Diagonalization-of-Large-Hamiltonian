@@ -84,11 +84,12 @@ from fft_code.params       import IstParams, PhysParams
 from fft_code.grid         import build_k_diagonal
 from fft_code.wavefunction import random_sine_psi, normalize_psi
 from fft_code.hamiltonian  import apply_H, apply_filter_H
-from fft_code.filter_coeff import build_filter_coefficients
+from fft_code.filter_coeff import build_filter_coefficients, build_monomial_coefficients
 from fft_code.rayleigh_ritz import svd_rayleigh_ritz
 from fft_code.potentials   import build_potential_from_config
 from fft_code.plotting     import (
     plot_filter_interpolation,
+    plot_filter_monomial,
     plot_filtered_energies,
     plot_energy_levels,
     plot_energy_errors,
@@ -267,6 +268,11 @@ def run(cfg: Dict[str, Any]) -> None:
 
     interval = (-4.5, 3.0)
     plot_filter_interpolation(El_list, an, samp, par, interval, out_dir)
+
+    print("\n2b. Converting Newton coefficients to monomial basis ...")
+    cn = build_monomial_coefficients(an, samp)
+    print(f"   cn shape: {cn.shape}")
+    plot_filter_monomial(El_list, cn, par, interval, out_dir)
 
     # ================================================================
     # 4. 滤波随机态

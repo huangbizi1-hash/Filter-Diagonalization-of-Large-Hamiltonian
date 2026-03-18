@@ -1,7 +1,7 @@
 """
 Newton 插值滤波系数构建。
 
-公开接口：build_filter_coefficients
+公开接口：build_filter_coefficients, build_monomial_coefficients
 """
 from typing import Tuple
 
@@ -40,6 +40,58 @@ def _newton_coefficients(x: np.ndarray, y: np.ndarray) -> np.ndarray:
         for i in range(j, n):
             f[i, j] = (f[i, j - 1] - f[i - 1, j - 1]) / (x[i] - x[i - j])
     return f[np.arange(n), np.arange(n)]
+
+
+def _newton_to_monomial(coeffs: np.ndarray, nodes: np.ndarray) -> np.ndarray:
+    """
+    将 Newton 插值多项式系数转换为单项式（幂次）基底系数。
+
+    Newton 形式：p(x̃) = a[0] + a[1]*(x̃-s[0]) + a[2]*(x̃-s[0])*(x̃-s[1]) + ...
+    转换为：p(x̃) = c[0] + c[1]*x̃ + c[2]*x̃² + ...
+
+    参数
+    ----
+    coeffs : (nc,)  Newton 除差系数
+    nodes  : (nc,)  Ashkenazy 节点（缩放后 [-2, 2] 区间）
+
+    返回
+    ----
+    c : (nc,)  单项式基底系数，c[k] 为 x̃^k 的系数
+    """
+    nc = len(coeffs)
+    result = np.zeros(nc)
+    # w 表示当前基底多项式 prod_{i<j}(x̃ - nodes[i])，按升幂存储
+    w = np.array([1.0])
+    for j in range(nc):
+        result[:len(w)] += coeffs[j] * w
+        if j < nc - 1:
+            # w *= (x̃ - nodes[j])
+            new_w = np.zeros(len(w) + 1)
+            new_w[1:] += w
+            new_w[:len(w)] -= nodes[j] * w
+            w = new_w
+    return result
+
+
+def build_monomial_coefficients(an: np.ndarray,
+                                 samp: np.ndarray) -> np.ndarray:
+    """
+    将所有滤波中心的 Newton 系数矩阵转换为单项式系数矩阵。
+
+    参数
+    ----
+    an   : (ms, nc)  Newton 系数矩阵（来自 build_filter_coefficients）
+    samp : (nc,)     Ashkenazy 节点
+
+    返回
+    ----
+    cn : (ms, nc)  单项式系数矩阵，cn[ie, k] 为第 ie 个滤波函数 x̃^k 的系数
+    """
+    ms, nc = an.shape
+    cn = np.zeros((ms, nc))
+    for ie in range(ms):
+        cn[ie] = _newton_to_monomial(an[ie], samp)
+    return cn
 
 
 # ---- 公开接口 ----
