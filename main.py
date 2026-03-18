@@ -141,6 +141,28 @@ CONFIG["dt"] = (CONFIG["nc"] / (CONFIG["dE"] * 2.5)) ** 2
 
 
 # ============================================================
+# ✅  SCAN  ― 参数扫描列表（留空则只跑一次 CONFIG）
+#
+# 用法：在列表中每加一个 dict，就多跑一次。
+# dict 里只写想要覆盖的键，其余键保持 CONFIG 默认值。
+# 支持嵌套 dict（如 "potential"）：会递归合并而非整体替换。
+#
+# 示例：
+#   SCAN = [
+#       {"nc": 100},                          # 第1次：nc=100
+#       {"nc": 200, "n_random": 10},          # 第2次：nc=200, n_random=10
+#       {"nc": 500, "dE": 60.0, "Vmin": -6}, # 第3次：同时改三个参数
+#   ]
+#
+# 若 SCAN = []，则退化为只跑一次 CONFIG，与原行为完全一致。
+# ============================================================
+SCAN = [
+    # {"nc": 100},
+    # {"nc": 200, "n_random": 10},
+]
+
+
+# ============================================================
 # JSON 辅助
 # ============================================================
 def _to_jsonable(obj: Any) -> Any:
@@ -355,27 +377,74 @@ def run(cfg: Dict[str, Any]) -> None:
 
 
 # ============================================================
+# 辅助：将 override dict 深度合并到 base dict（原地修改 base）
+# ============================================================
+def _merge_override(base: Dict[str, Any], override: Dict[str, Any]) -> None:
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _merge_override(base[k], v)
+        else:
+            base[k] = v
+    # 若 nc 或 dE 被覆盖，重新推导 dt
+    if "nc" in override or "dE" in override:
+        base["dt"] = (base["nc"] / (base["dE"] * 2.5)) ** 2
+
+
+# ============================================================
 # CLI 入口
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(description="FFT filter-diagonalise solver")
-    parser.add_argument("--cfg", type=str, default=None,
+    parser.add_argument("--cfg",  type=str, default=None,
                         help="Path to a JSON file that overrides CONFIG")
+    parser.add_argument("--scan", type=str, default=None,
+                        help="Path to a JSON file containing a SCAN list "
+                             "(overrides the in-file SCAN)")
     args = parser.parse_args()
 
-    cfg = copy.deepcopy(CONFIG)
-
+    # ---- 加载基础 cfg ----
+    base_cfg = copy.deepcopy(CONFIG)
     if args.cfg:
         with open(args.cfg, "r") as f:
-            override = json.load(f)
-        for k, v in override.items():
-            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-                cfg[k].update(v)
-            else:
-                cfg[k] = v
-        cfg["dt"] = (cfg["nc"] / (cfg["dE"] * 2.5)) ** 2
+            _merge_override(base_cfg, json.load(f))
 
-    run(cfg)
+    # ---- 确定 scan 列表 ----
+    if args.scan:
+        with open(args.scan, "r") as f:
+            scan_list = json.load(f)
+    else:
+        scan_list = SCAN  # 使用文件内定义的 SCAN
+
+    # ---- 无扫描：单次运行 ----
+    if not scan_list:
+        run(base_cfg)
+        return
+
+    # ---- 有扫描：遍历每个 override ----
+    n = len(scan_list)
+    print(f"\n{'='*60}")
+    print(f"  SCAN 模式：共 {n} 组配置")
+    print(f"{'='*60}")
+
+    for i, override in enumerate(scan_list, start=1):
+        cfg = copy.deepcopy(base_cfg)
+        _merge_override(cfg, override)
+
+        # 在 tag 里记录本次变化的参数（方便区分输出目录）
+        changed = ", ".join(
+            f"{k}={v}" for k, v in override.items() if k != "tag"
+        )
+        base_tag = cfg.get("tag", "")
+        cfg["tag"] = f"{base_tag}_scan{i}[{changed}]" if base_tag else f"scan{i}[{changed}]"
+
+        print(f"\n{'─'*60}")
+        print(f"  运行 {i}/{n}：{changed}")
+        print(f"{'─'*60}")
+        run(cfg)
+
+    print(f"\n{'='*60}")
+    print(f"  SCAN 完成：共 {n} 组配置均已运行")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
