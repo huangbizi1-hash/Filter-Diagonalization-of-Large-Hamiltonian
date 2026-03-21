@@ -44,6 +44,62 @@ def _newton_coefficients(x: np.ndarray, y: np.ndarray) -> np.ndarray:
 
 # ---- 公开接口 ----
 
+def _newton_to_monomial(coeffs: np.ndarray, nodes: np.ndarray) -> np.ndarray:
+    """
+    将 Newton 除差系数展开为单项式系数（升幂）。
+
+    Newton 形式：p(x̃) = c[0] + c[1](x̃-x0) + c[2](x̃-x0)(x̃-x1) + …
+    输出：mono[k] 满足  p(x̃) = Σ_k mono[k] * x̃^k
+
+    实现方式：从最内层系数出发，用 Horner 展开逐步展开基底多项式。
+    """
+    n = len(coeffs)
+    # 从最高阶开始，poly 表示升幂系数数组
+    poly = np.array([coeffs[-1]], dtype=complex)
+    for j in range(n - 2, -1, -1):
+        # poly ← poly * (x̃ - nodes[j]) + coeffs[j]
+        new_poly = np.zeros(len(poly) + 1, dtype=complex)
+        new_poly[:-1] -= nodes[j] * poly   # 乘以 -nodes[j]
+        new_poly[1:]  += poly               # 乘以 x̃
+        new_poly[0]   += coeffs[j]          # 加常数项
+        poly = new_poly
+    return poly.real
+
+
+def build_monomial_coefficients(an: np.ndarray,
+                                 samp: np.ndarray) -> np.ndarray:
+    """
+    将 (ms, nc) Newton 系数矩阵批量转换为单项式系数矩阵。
+
+    参数
+    ----
+    an   : (ms, nc) — build_filter_coefficients 返回的 Newton 系数
+    samp : (nc,)    — 对应的 Ashkenazy 节点（[-2,2] 内的缩放坐标）
+
+    返回
+    ----
+    cn : (ms, nc)  — 单项式系数（升幂），cn[ie, k] 对应 x̃^k 的系数
+
+    注意
+    ----
+    高阶单项式基底在数值上不稳定：nc > ~50 时展开误差会因灾难性消去
+    急剧增大，仅建议在 nc ≤ 50 时用于验证。
+    """
+    ms, nc = an.shape
+    if nc > 50:
+        import warnings
+        warnings.warn(
+            f"build_monomial_coefficients: nc={nc} > 50, "
+            "Newton→monomial conversion may be numerically unstable "
+            "(catastrophic cancellation). Use for small-nc verification only.",
+            RuntimeWarning, stacklevel=2,
+        )
+    cn = np.zeros((ms, nc))
+    for ie in range(ms):
+        cn[ie] = _newton_to_monomial(an[ie], samp)
+    return cn
+
+
 def build_filter_coefficients(El_list: np.ndarray, par: PhysParams,
                                nc: int) -> Tuple[np.ndarray, np.ndarray]:
     """

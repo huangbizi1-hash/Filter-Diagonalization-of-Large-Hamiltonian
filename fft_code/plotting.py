@@ -52,6 +52,43 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
     _savefig(fig, out_dir / "filter_interpolation.png")
 
 
+def plot_filter_monomial(El_list, cn, par: PhysParams,
+                         interval, out_dir: Path) -> None:
+    """用单项式系数（Horner 法）验证 Newton→单项式转换的精度。
+
+    对每个 El 计算并打印 MAE，并将真实滤波函数与单项式求值结果叠加绘图，
+    保存为 filter_monomial.png。
+    """
+    def _mono_eval(x_eval, mono):
+        # 将物理坐标映射到 [-2, 2] 缩放坐标
+        x = 4.0 * (x_eval - par.Vmin) / par.dE - 2.0
+        # Horner 法（升幂）
+        result = mono[-1]
+        for k in range(len(mono) - 2, -1, -1):
+            result = result * x + mono[k]
+        return result
+
+    x_plot = np.linspace(interval[0], interval[1], 1000)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for ie, El in enumerate(El_list):
+        y_true  = np.sqrt(par.dt / np.pi) * np.exp(-(x_plot - El)**2 * par.dt)
+        y_mono  = np.array([_mono_eval(x, cn[ie]) for x in x_plot])
+        mae = np.mean(np.abs(y_true - y_mono))
+        print(f"  [monomial] El={El:.2f}  MAE={mae:.6e}")
+        ax.plot(x_plot, y_true,  color='blue',
+                label='True filter' if ie == 0 else "")
+        ax.plot(x_plot, y_mono, '--', color='orange',
+                label=f'Monomial eval (nc={len(cn[0])})' if ie == 0 else "")
+    ax.set_xlabel('x')
+    ax.set_ylabel('f(x)')
+    ax.set_title(f'Filter Function vs Monomial Evaluation (nc={len(cn[0])})')
+    ax.set_xlim(interval[0], interval[1])
+    ax.legend()
+    ax.grid(True)
+    fig.tight_layout()
+    _savefig(fig, out_dir / "filter_monomial.png")
+
+
 def plot_filtered_energies(El_list, E_mean_all, E_std_all, N_values,
                             error_mean_all, n_random: int,
                             out_dir: Path) -> None:
