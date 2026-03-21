@@ -435,12 +435,12 @@ def main():
         cfg = copy.deepcopy(base_cfg)
         _merge_override(cfg, override)
 
-        # 在 tag 里记录本次变化的参数（方便区分输出目录）
+        # tag 只保留序号，参数详情打印到终端
         changed = ", ".join(
             f"{k}={v}" for k, v in override.items() if k != "tag"
         )
         base_tag = cfg.get("tag", "")
-        cfg["tag"] = f"{base_tag}_scan{i}[{changed}]" if base_tag else f"scan{i}[{changed}]"
+        cfg["tag"] = f"{base_tag}_scan{i}" if base_tag else f"scan{i}"
 
         print(f"\n{'─'*60}")
         print(f"  运行 {i}/{n}：{changed}")
