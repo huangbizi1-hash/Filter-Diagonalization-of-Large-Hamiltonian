@@ -61,6 +61,7 @@ def _label(disc: str, solver: str) -> str:
     if s_clean.lower() == "lanczos": s_clean = "Lanczos"
     elif s_clean.lower() == "lobpcg": s_clean = "LOBPCG"
     elif s_clean.lower() == "davidson": s_clean = "Davidson"
+    elif s_clean.lower() == "cgmin": s_clean = "CG-Min"
     
     d = disc_map.get(disc, disc.capitalize())
     return f"{d} ({s_clean})"
@@ -284,6 +285,157 @@ def build_3d_sinc_dvr_operator(N: int, potential_grid: Optional[PotentialGrid] =
     return spla.LinearOperator((N**3, N**3), matvec=matvec, dtype=float), N**3, V_flat
 
 # ---------------------------
+# CG-Minimization (Folded Spectrum)
+# ---------------------------
+
+def _sphere_geodesic(x: np.ndarray, p: np.ndarray):
+    """
+    单位球面上的测地线：x(θ) = x cosθ + p̂ sinθ，其中 x·p=0。
+    返回 (x_of_theta 函数, ||p||)。
+    """
+    pn = np.linalg.norm(p)
+    if pn == 0.0:
+        return lambda th: x.copy(), 0.0
+    p_hat = p / pn
+    return lambda th: x * np.cos(th) + p_hat * np.sin(th), pn
+
+
+def _golden_section_search(func, a: float, b: float,
+                           tol: float = 1e-4, maxit: int = 60):
+    """
+    黄金分割法最小化 func(theta) 在 [a, b] 上。
+    返回 (theta_min, func_min)。
+    """
+    gr = (np.sqrt(5) - 1) / 2
+    c = b - gr * (b - a)
+    d = a + gr * (b - a)
+    fc, fd = func(c), func(d)
+    for _ in range(maxit):
+        if (b - a) <= tol:
+            break
+        if fc < fd:
+            b, d, fd = d, c, fc
+            c = b - gr * (b - a)
+            fc = func(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + gr * (b - a)
+            fd = func(d)
+    th = 0.5 * (a + b)
+    return th, func(th)
+
+
+def cg_minimize_folded(H_op, E_target: float, x0: np.ndarray,
+                       maxiter: int = 500, gtol: float = 1e-8,
+                       theta_max: float = 0.8,
+                       verbose: bool = False) -> dict:
+    """
+    在单位球面上用非线性CG最小化折叠谱目标函数 f(x) = ||(H-E_target)x||²。
+
+    适用于稀疏矩阵、scipy.sparse.linalg.LinearOperator 或支持 @ 运算符的任何算子。
+    找到满足 (H-E_target)x≈0 的特征向量，即最接近 E_target 的本征态。
+
+    Parameters
+    ----------
+    H_op : matrix or LinearOperator
+        Hamiltonian 算子，支持 H_op @ v。
+    E_target : float
+        目标能量（折叠谱中心）。
+    x0 : np.ndarray, shape (n,)
+        初始猜测向量（无需归一化）。
+    maxiter : int
+        最大迭代次数。
+    gtol : float
+        梯度范数收敛阈值。
+    theta_max : float
+        线搜索区间上界（弧度），通常 0.5–1.0。
+    verbose : bool
+        是否打印迭代信息。
+
+    Returns
+    -------
+    dict with keys:
+        'x'      : 收敛的单位特征向量
+        'E_ritz' : Ritz 能量 <x|H|x>
+        'f_val'  : 最终目标函数值
+        'n_iter' : 实际迭代次数
+        'history': {'f', 'gnorm', 'E_ritz'} 列表
+    """
+    def A(v):
+        return H_op @ v - E_target * v
+
+    x = np.array(x0, dtype=float)
+    x /= np.linalg.norm(x)
+
+    def f_of(xv):
+        y = A(xv)
+        return float(np.dot(y, y))
+
+    def grad_tangent(xv):
+        y = A(xv)          # (H-E)x
+        z = A(y)           # (H-E)²x
+        g = 2.0 * z
+        g -= np.dot(xv, g) * xv   # 投影到切空间
+        return g, y
+
+    hist = {"f": [], "gnorm": [], "E_ritz": []}
+    f0 = f_of(x)
+    g, _ = grad_tangent(x)
+    p = -g - np.dot(x, -g) * x    # 初始搜索方向（切空间内）
+    g_prev, p_prev = g.copy(), p.copy()
+
+    E_ritz = float(np.dot(x, H_op @ x))
+    n_iter = 0
+
+    for it in range(1, maxiter + 1):
+        n_iter = it
+        gnorm = np.linalg.norm(g)
+        E_ritz = float(np.dot(x, H_op @ x))
+        hist["f"].append(f0)
+        hist["gnorm"].append(gnorm)
+        hist["E_ritz"].append(E_ritz)
+
+        if gnorm < gtol:
+            if verbose:
+                print(f"  CG 收敛 it={it}: ||g||={gnorm:.3e}, E≈{E_ritz:.10f}")
+            break
+
+        # 重新投影方向到切空间
+        p = p - np.dot(x, p) * x
+        if np.linalg.norm(p) == 0.0:
+            if verbose:
+                print("  方向消失，停止。")
+            break
+
+        x_of_th, _ = _sphere_geodesic(x, p)
+
+        def phi(th):
+            return f_of(x_of_th(th))
+
+        theta, f_new = _golden_section_search(phi, 0.0, theta_max, tol=1e-4)
+        x = x_of_th(theta)
+        x /= np.linalg.norm(x)
+
+        # Polak-Ribière beta（带重启）
+        g, _ = grad_tangent(x)
+        dg = g - g_prev
+        denom = float(np.dot(g_prev, g_prev)) + 1e-30
+        beta = max(0.0, float(np.dot(g, dg)) / denom)
+        p = -g + beta * p_prev
+        p = p - np.dot(x, p) * x
+
+        g_prev, p_prev = g.copy(), p.copy()
+        f0 = f_new
+
+        if verbose and (it % 50 == 0 or it == 1):
+            print(f"  it={it:5d}: f={f0:.4e}, ||g||={gnorm:.3e}, "
+                  f"theta={theta:.3e}, E≈{E_ritz:.10f}")
+
+    return {"x": x, "E_ritz": E_ritz, "f_val": f0,
+            "n_iter": n_iter, "history": hist}
+
+
+# ---------------------------
 # 核心求解器（增强版）
 # ---------------------------
 
@@ -401,13 +553,79 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
             X0 = v0[:, :n_levels]
         else:
             X0 = np.random.standard_normal((n_un, n_levels))
-        evals, evecs = spla.lobpcg(H_op, X0, 
+        evals, evecs = spla.lobpcg(H_op, X0,
                                   M=M_op if disc=="sinc_dvr" else None,
                                   largest=False, **kwargs)
         # LOBPCG不支持target模式，如果指定target会给出警告
         if target is not None:
             print("Warning: LOBPCG does not support target mode, computing smallest eigenvalues")
-    
+
+    elif solver_method.lower() == "cgmin":
+        # ---- 折叠谱 CG 最小化 ----
+        if target is None:
+            raise ValueError("cgmin solver 需要指定 target 能量")
+
+        cg_maxiter  = kwargs.get("cg_maxiter",  500)
+        cg_gtol     = kwargs.get("cg_gtol",     1e-8)
+        cg_theta_max= kwargs.get("cg_theta_max",0.8)
+        cg_verbose  = kwargs.get("cg_verbose",  False)
+
+        rng = np.random.default_rng(42)
+        evals_list, evecs_list = [], []
+        found_vecs = []   # 已找到的本征向量，用于投影偏移
+
+        for k in range(n_levels):
+            # 初始向量：若提供 v0 则取第 k 列，否则随机
+            if v0 is not None and v0.ndim == 1 and k == 0:
+                x0_k = v0.copy()
+            elif v0 is not None and v0.ndim == 2 and k < v0.shape[1]:
+                x0_k = v0[:, k].copy()
+            else:
+                x0_k = rng.standard_normal(n_un)
+            # 对已找到的态正交化
+            for fv in found_vecs:
+                x0_k -= np.dot(fv, x0_k) * fv
+            norm_k = np.linalg.norm(x0_k)
+            if norm_k < 1e-14:
+                x0_k = rng.standard_normal(n_un)
+            x0_k /= np.linalg.norm(x0_k)
+
+            # 构建偏移算子：已找到的态加上大的惩罚，使其远离 E_target
+            if found_vecs:
+                shift_val = 100.0
+                _fv_arr = found_vecs  # closure
+                def _deflated_matvec(v, _fvs=_fv_arr, _s=shift_val):
+                    Hv = H_op @ v
+                    for fv in _fvs:
+                        Hv = Hv + _s * np.dot(fv, v) * fv
+                    return Hv
+                H_eff = spla.LinearOperator((n_un, n_un),
+                                            matvec=_deflated_matvec, dtype=float)
+            else:
+                H_eff = H_op
+
+            res_cg = cg_minimize_folded(
+                H_eff, E_target=target, x0=x0_k,
+                maxiter=cg_maxiter, gtol=cg_gtol,
+                theta_max=cg_theta_max, verbose=cg_verbose,
+            )
+
+            xk = res_cg["x"]
+            # Ritz 能量用原始（未偏移）H 计算
+            Ek = float(np.dot(xk, H_op @ xk))
+            evals_list.append(Ek)
+            evecs_list.append(xk)
+            found_vecs.append(xk)
+
+            if cg_verbose or True:  # 总是打印每个态的结果
+                print(f"  [cgmin] state {k}: E={Ek:.10f}, "
+                      f"n_iter={res_cg['n_iter']}, "
+                      f"f={res_cg['f_val']:.3e}, "
+                      f"||g||≈{res_cg['history']['gnorm'][-1]:.3e}")
+
+        evals = np.array(evals_list)
+        evecs = np.column_stack(evecs_list)
+
     else:
         # PRIMME系列求解器
         if not HAS_PRIMME:
