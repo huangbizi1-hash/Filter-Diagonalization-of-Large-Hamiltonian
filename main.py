@@ -74,78 +74,13 @@ CONFIG: Dict[str, Any] = {
 
     # ---------- misc ----------
     "print_every_filter": 1,
+
+    # ---------- filter plot ----------
+    # x-axis range for filter_interpolation.png
+    "filter_plot_interval": [-0.26, -0.08],
 }
 CONFIG["dt"] = (CONFIG["nc"] / (CONFIG["dE"] * 2.5)) ** 2
-'''
-CONFIG: Dict[str, Any] = {
-    # ---------- output ----------
-    "out_root": "results",
-    "tag": "ho3d_test",
 
-    # ---------- potential ----------
-    # type = "ho3d"          : pure V = 0.5*omega^2*r^2 (unbounded)
-    # type = "harmonic_well" : truncated harmonic well (same as refactored_code)
-    # type = "gaussian_blob" : single Gaussian dip
-    # type = "gaussian_files": load from .cube + .json
-    #
-    # ⚠️  Vmin and dE MUST satisfy:
-    #       Vmin + dE  >=  V_max(grid) + kinetic_cut   (covers full spectrum)
-    #       Vmin       <=  V_min(grid)
-    #
-    #   harmonic_well (d=0.5, width=4): V in [0,8],  H_max~38  → Vmin=-5, dE=50  ✓
-    #   ho3d          (d=0.5, N=20)   : V in [0,34], H_max~64  → Vmin=-1, dE=70
-    "potential": {
-        "type": "harmonic_well",   # ← switch potential type here
-
-        # ── shared: grid spacing (used by all types) ──
-        "d": 0.5,
-
-        # ── ho3d ──
-        "omega": 1.0,
-
-        # ── harmonic_well ──
-        "center_locations": [[0.0, 0.0, 0.0]],
-        "width": 4.0,
-
-        # ── gaussian_blob ──
-        "h": -5.0,
-        "mu": 0.1,
-
-        # ── gaussian_files ──
-        "cube_file": "localPot.cube",
-        "params_file": "gaussian_fit_params.json",
-        "r_cut": 7.0,
-    },
-
-    # ---------- grid ----------
-    "N": 20,                # grid points per axis
-
-    # ---------- filter ----------
-    # ⚠️  Adjust Vmin/dE when switching potential type (see note above)
-    "nc": 200,              # Newton interpolation nodes
-    "dE": 50.0,             # energy window width  (harmonic_well default)
-    "Vmin": -5.0,           # lower bound          (harmonic_well default)
-    # For ho3d use:  "dE": 70.0, "Vmin": -1.0
-    "El_list": list(np.arange(0.5, 5.5, 1.0).tolist()),  # filter centres
-
-    # ---------- random states ----------
-    "n_random": 50,
-    "seed": 42,
-
-    # ---------- SVD / Rayleigh-Ritz ----------
-    "svd_tol": 1e-3,
-    "max_energies": 200,
-
-    # ---------- kinetic cutoff ----------
-    "kinetic_cut": 30.0,
-
-    # ---------- misc ----------
-    "print_every_filter": 1,   # print progress every N filter centres
-}
-# dt is derived, not set manually
-CONFIG["dt"] = (CONFIG["nc"] / (CONFIG["dE"] * 2.5)) ** 2
-
-'''
 # ============================================================
 # JSON helper
 # ============================================================
@@ -741,11 +676,9 @@ def run(cfg: Dict[str, Any]) -> None:
     print(f"   Time: {timings['build_filter']:.3f} s")
 
     # filter interpolation plot
-    interval = (float(El_list[0]) - 0.5, float(El_list[-1]) + 0.5)
-    interval = (-4.5,3.0)
+    interval = tuple(cfg["filter_plot_interval"])
     if interval[0] < interval[1]:
         plot_filter_interpolation(El_list, an, samp, par, interval, out_dir)
-        #print('\nplot_filter_interpolation\n')
 
     # ================================================================
     # 4. Filter random states
