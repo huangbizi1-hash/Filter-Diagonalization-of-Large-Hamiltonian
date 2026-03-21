@@ -84,12 +84,11 @@ from fft_code.params       import IstParams, PhysParams
 from fft_code.grid         import build_k_diagonal
 from fft_code.wavefunction import random_sine_psi, normalize_psi
 from fft_code.hamiltonian  import apply_H, apply_filter_H_all
-from fft_code.filter_coeff import build_filter_coefficients, build_monomial_coefficients
+from fft_code.filter_coeff import build_filter_coefficients
 from fft_code.rayleigh_ritz import svd_rayleigh_ritz
 from fft_code.potentials   import build_potential_from_config
 from fft_code.plotting     import (
     plot_filter_interpolation,
-    plot_filter_monomial,
     plot_filtered_energies,
     plot_energy_levels,
     plot_energy_errors,
@@ -137,6 +136,9 @@ CONFIG: Dict[str, Any] = {
 
     # ---------- 杂项 ----------
     "print_every_filter": 1,
+
+    # ---------- 画图 ----------
+    "plot_interval": [-0.26, -0.08],   # 滤波函数绘图能量区间 [E_lo, E_hi]
 }
 CONFIG["dt"] = (CONFIG["nc"] / (CONFIG["dE"] * 2.5)) ** 2
 
@@ -266,13 +268,8 @@ def run(cfg: Dict[str, Any]) -> None:
     timings["build_filter"] = time.perf_counter() - t0
     print(f"   Time: {timings['build_filter']:.3f} s")
 
-    interval = (-4.5, 3.0)
+    interval = tuple(cfg["plot_interval"])
     plot_filter_interpolation(El_list, an, samp, par, interval, out_dir)
-
-    # ---- 步骤 2b：Newton→单项式转换并验证 ----
-    print("\n2b. Newton → monomial conversion ...")
-    cn = build_monomial_coefficients(an, samp)
-    plot_filter_monomial(El_list, cn, par, interval, out_dir)
 
     # ================================================================
     # 4. 滤波随机态
