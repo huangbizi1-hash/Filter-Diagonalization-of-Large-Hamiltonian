@@ -83,7 +83,7 @@ matplotlib.use("Agg")
 from fft_code.params       import IstParams, PhysParams
 from fft_code.grid         import build_k_diagonal
 from fft_code.wavefunction import random_sine_psi, normalize_psi
-from fft_code.hamiltonian  import apply_H, apply_filter_H, apply_filter_H_all
+from fft_code.hamiltonian  import apply_H, apply_filter_H_all
 from fft_code.filter_coeff import build_filter_coefficients, build_monomial_coefficients
 from fft_code.rayleigh_ritz import svd_rayleigh_ritz
 from fft_code.potentials   import build_potential_from_config
@@ -137,14 +137,6 @@ CONFIG: Dict[str, Any] = {
 
     # ---------- 杂项 ----------
     "print_every_filter": 1,
-
-    # ---------- 共享 Newton 基底优化 ----------
-    # True : 使用 apply_filter_H_all，nc 次 H 作用（所有 El 共享基底向量）
-    # False: 使用 apply_filter_H，ms*nc 次 H 作用（原始逐 El 计算）
-    # 首次启用 shared_basis 时，程序会自动用一个随机态做正确性验证，
-    # 若最大误差 > tol 则报错停止。
-    "shared_basis": True,
-    "shared_basis_verify_tol": 1e-10,  # 验证时允许的最大逐点绝对误差
 }
 CONFIG["dt"] = (CONFIG["nc"] / (CONFIG["dE"] * 2.5)) ** 2
 
@@ -285,31 +277,9 @@ def run(cfg: Dict[str, Any]) -> None:
     # ================================================================
     # 4. 滤波随机态
     # ================================================================
-    shared_basis = cfg.get("shared_basis", False)
-    verify_tol   = cfg.get("shared_basis_verify_tol", 1e-10)
-
-    # ---- 正确性验证（shared_basis 首次启用时自动运行） ----
-    if shared_basis:
-        print("\n3a. Verifying shared_basis correctness ...")
-        _psi_v = random_sine_psi(X, Y, Z, rng=rng)
-        _ref   = np.stack([
-            apply_filter_H(_psi_v, V, samp, an[ie], par, T_k_diagonal)
-            for ie in range(ist.ms)
-        ])                                                    # (ms, Nx, Ny, Nz)
-        _fast  = apply_filter_H_all(_psi_v, V, samp, an, par, T_k_diagonal)
-        _err   = float(np.max(np.abs(_ref - _fast)))
-        print(f"   max |apply_filter_H_all - apply_filter_H| = {_err:.3e}  "
-              f"(tol={verify_tol:.0e})")
-        if _err > verify_tol:
-            raise RuntimeError(
-                f"shared_basis verification FAILED: max error {_err:.3e} > {verify_tol:.0e}. "
-                "Falling back is not automatic — please investigate or set shared_basis=False."
-            )
-        print("   Verification PASSED.")
-        del _psi_v, _ref, _fast
-
-    print(f"\n3. Filtering random states "
-          f"[{'shared_basis: nc H-applies' if shared_basis else 'original: ms*nc H-applies'}] ...")
+    # 使用 apply_filter_H_all：所有 El 共享 Newton 基底向量，
+    # H 作用次数从 ms*nc 降至 nc。
+    print("\n3. Filtering random states ...")
     t0 = time.perf_counter()
 
     n_random            = cfg["n_random"]
@@ -318,30 +288,16 @@ def run(cfg: Dict[str, Any]) -> None:
     E_temp_all  = [[] for _ in range(ist.ms)]
     print_every = cfg.get("print_every_filter", 1)
 
-    if shared_basis:
-        # 外层循环随机态，内层 ms 个滤波中心一次性完成（共 nc 次 H 作用）
-        for i in range(n_random):
-            psi_rand       = random_sine_psi(X, Y, Z, rng=rng)
-            psi_filt_all   = apply_filter_H_all(
-                psi_rand, V, samp, an, par, T_k_diagonal)  # (ms, Nx, Ny, Nz)
-            for ie in range(ist.ms):
-                psi_filt   = normalize_psi(psi_filt_all[ie])
-                H_psi      = apply_H(psi_filt, V, T_k_diagonal)
-                E_exp      = float(np.sum(psi_filt.conj() * H_psi).real)
-                E_temp_all[ie].append(E_exp)
-                filtered_psi_matrix[ie * n_random + i] = psi_filt
-    else:
-        # 原始路径：每个 El 独立调用 apply_filter_H（ms * nc 次 H 作用）
+    for i in range(n_random):
+        psi_rand     = random_sine_psi(X, Y, Z, rng=rng)
+        psi_filt_all = apply_filter_H_all(
+            psi_rand, V, samp, an, par, T_k_diagonal)  # (ms, Nx, Ny, Nz)
         for ie in range(ist.ms):
-            for i in range(n_random):
-                psi_rand = random_sine_psi(X, Y, Z, rng=rng)
-                psi_filt = apply_filter_H(
-                    psi_rand, V, samp, an[ie], par, T_k_diagonal)
-                psi_filt = normalize_psi(psi_filt)
-                H_psi    = apply_H(psi_filt, V, T_k_diagonal)
-                E_exp    = float(np.sum(psi_filt.conj() * H_psi).real)
-                E_temp_all[ie].append(E_exp)
-                filtered_psi_matrix[ie * n_random + i] = psi_filt
+            psi_filt = normalize_psi(psi_filt_all[ie])
+            H_psi    = apply_H(psi_filt, V, T_k_diagonal)
+            E_exp    = float(np.sum(psi_filt.conj() * H_psi).real)
+            E_temp_all[ie].append(E_exp)
+            filtered_psi_matrix[ie * n_random + i] = psi_filt
 
     E_mean = []
     E_std  = []
