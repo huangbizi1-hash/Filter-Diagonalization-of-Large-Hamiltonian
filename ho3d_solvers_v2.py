@@ -46,7 +46,7 @@ def _parse_method_spec(method_str: str) -> Tuple[str, str]:
     parts = method_str.split(":")
     if len(parts) == 1:
         m = parts[0].lower()
-        if m in ["gd", "lobpcg", "davidson", "jd"]: return "sinc_dvr", m
+        if m in ["gd", "lobpcg", "davidson", "jd", "cgmin"]: return "sinc_dvr", m
         return m, "lanczos"
     return parts[0].lower(), parts[1]
 
@@ -170,6 +170,152 @@ def interpolate_eigenvector(evec_coarse: np.ndarray, N_coarse: int, N_fine: int,
         return evec_fine.ravel()
     else:
         return evec_fine
+
+# ---------------------------
+# CG 最小化法
+# ---------------------------
+
+def _golden_section_search(func, a: float, b: float, tol: float = 1e-4, maxit: int = 60) -> float:
+    """黄金分割法在 [a, b] 上极小化 func(theta)。"""
+    gr = (np.sqrt(5) - 1) / 2
+    c = b - gr * (b - a)
+    d = a + gr * (b - a)
+    fc, fd = func(c), func(d)
+    for _ in range(maxit):
+        if (b - a) <= tol:
+            break
+        if fc < fd:
+            b, d, fd = d, c, fc
+            c = b - gr * (b - a)
+            fc = func(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + gr * (b - a)
+            fd = func(d)
+    return 0.5 * (a + b)
+
+
+def cg_minimize_folded(
+    H_op,
+    E_target: float,
+    x0: np.ndarray,
+    maxiter: int = 500,
+    gtol: float = 1e-8,
+    theta_max: float = 0.8,
+    verbose: bool = True,
+) -> dict:
+    """
+    非线性 CG 法在单位球面上极小化 f(x) = ||(H - E_target)x||^2。
+
+    H_op 可以是 numpy ndarray、scipy 稀疏矩阵或 LinearOperator，
+    只需支持矩阵-向量乘法即可（不需要存储完整矩阵）。
+
+    Parameters
+    ----------
+    H_op     : 哈密顿量算符（ndarray / sparse / LinearOperator）
+    E_target : 目标能量
+    x0       : 初始向量（任意范数，函数内部归一化）
+    maxiter  : 最大迭代次数
+    gtol     : 切空间梯度范数收敛阈值
+    theta_max: 测地线步长搜索上界（弧度）
+    verbose  : 是否打印迭代信息
+
+    Returns
+    -------
+    dict 包含
+      'x'      : 收敛的单位向量
+      'E_ritz' : Ritz 能量 <x|H|x>
+      'history': {'f', 'gnorm', 'E_ritz'} 列表
+      'n_iter' : 实际迭代次数
+    """
+    # 统一 matvec 接口
+    if hasattr(H_op, "matvec"):
+        Hv = H_op.matvec
+    else:
+        Hv = lambda v: H_op @ v
+
+    def A(v):
+        return Hv(v) - E_target * v
+
+    x = x0.astype(float).ravel()
+    x /= np.linalg.norm(x)
+
+    def f_of(xvec):
+        y = A(xvec)
+        return float(np.dot(y, y))
+
+    def grad_tangent(xvec):
+        """返回切空间梯度 g_t 和 A(x)（后者供外部复用以省一次 matvec）。"""
+        y = A(xvec)          # 一次 matvec
+        z = A(y)             # 二次 matvec：(H-E)^2 x
+        g = 2.0 * z
+        g_t = g - np.dot(xvec, g) * xvec
+        return g_t, y
+
+    hist: dict = {"f": [], "gnorm": [], "E_ritz": []}
+
+    f0 = f_of(x)
+    g, _ = grad_tangent(x)
+    p = -g - np.dot(x, -g) * x   # 投影到切空间
+    g_prev = g.copy()
+    p_prev = p.copy()
+
+    if verbose:
+        print(f"  CG-min init: f={f0:.6e}, ||g||={np.linalg.norm(g):.3e}")
+
+    n_iter = 0
+    for it in range(1, maxiter + 1):
+        n_iter = it
+        gnorm = np.linalg.norm(g)
+        E_ritz = float(np.dot(x, Hv(x)))
+        hist["f"].append(f0)
+        hist["gnorm"].append(gnorm)
+        hist["E_ritz"].append(E_ritz)
+
+        if gnorm < gtol:
+            if verbose:
+                print(f"  Converged it={it}: ||g||={gnorm:.3e}, E≈{E_ritz:.10f}")
+            break
+
+        # 将搜索方向重新投影到切空间
+        p = p - np.dot(x, p) * x
+        pn = np.linalg.norm(p)
+        if pn == 0.0:
+            if verbose:
+                print("  Direction vanished; stopping.")
+            break
+        p_hat = p / pn
+
+        # 沿测地线 x(θ) = x cosθ + p_hat sinθ 做黄金分割
+        def phi(theta: float) -> float:
+            xx = x * np.cos(theta) + p_hat * np.sin(theta)
+            return f_of(xx)
+
+        theta = _golden_section_search(phi, 0.0, theta_max)
+        x = x * np.cos(theta) + p_hat * np.sin(theta)
+        x /= np.linalg.norm(x)
+        f0 = f_of(x)
+
+        # 更新梯度
+        g, _ = grad_tangent(x)
+
+        # Polak–Ribière beta（带重启）
+        dg = g - g_prev
+        denom = np.dot(g_prev, g_prev) + 1e-30
+        beta = max(0.0, float(np.dot(g, dg) / denom))
+        p = -g + beta * p_prev
+        p = p - np.dot(x, p) * x
+
+        g_prev = g.copy()
+        p_prev = p.copy()
+
+        if verbose and (it % 50 == 0 or it == 1):
+            print(f"  it={it:4d}: f={f0:.6e}, ||g||={np.linalg.norm(g):.3e}, "
+                  f"theta={theta:.3e}, E≈{E_ritz:.10f}")
+
+    E_final = float(np.dot(x, Hv(x)))
+    return {"x": x, "E_ritz": E_final, "history": hist, "n_iter": n_iter}
+
 
 # ---------------------------
 # 离散化算子构造
@@ -401,13 +547,29 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
             X0 = v0[:, :n_levels]
         else:
             X0 = np.random.standard_normal((n_un, n_levels))
-        evals, evecs = spla.lobpcg(H_op, X0, 
+        evals, evecs = spla.lobpcg(H_op, X0,
                                   M=M_op if disc=="sinc_dvr" else None,
                                   largest=False, **kwargs)
         # LOBPCG不支持target模式，如果指定target会给出警告
         if target is not None:
             print("Warning: LOBPCG does not support target mode, computing smallest eigenvalues")
-    
+
+    elif solver_method.lower() == "cgmin":
+        # 非线性 CG 最小化 ||(H - E_target)x||^2，每次求一个态
+        if target is None:
+            raise ValueError("cgmin solver requires target energy (use target= parameter)")
+        rng = np.random.default_rng(42)
+        x0_cg = v0.ravel() if v0 is not None else rng.standard_normal(n_un)
+        cg_res = cg_minimize_folded(
+            H_op, target, x0_cg,
+            maxiter=kwargs.pop("cgmin_maxiter", 2000),
+            gtol=kwargs.pop("cgmin_gtol", 1e-8),
+            theta_max=kwargs.pop("cgmin_theta_max", 0.8),
+            verbose=kwargs.pop("cgmin_verbose", True),
+        )
+        evals = np.array([cg_res["E_ritz"]])
+        evecs = cg_res["x"].reshape(-1, 1)
+
     else:
         # PRIMME系列求解器
         if not HAS_PRIMME:
