@@ -119,18 +119,20 @@ CONFIG: Dict[str, Any] = {
 
     # ---------- 滤波器 ----------
     # ⚠️  先用小参数跑一次，看启动时打印的 Spectrum check 里的 H_max，再调这两个值
-    "nc": 100,
+    "nc": 1000,
     "dE": 50.0,             # 根据实际 H_max 调整
     "Vmin": -5.0,           # 根据实际 V_min 调整
     "El_list": list(np.arange(-0.2, -0.1, 0.1).tolist()),
 
     # ---------- 窗函数类型 ----------
     # "gaussian" : 经典高斯，宽度由 dt=(nc/(dE×2.5))² 决定（窄 → 高 nc）
-    # "gabor"    : 高斯包络 × cos 调制，关于 El 对称，宽度由 alpha_f 控制（宽 → 低 nc）
-    #              f(x) = exp(-alpha_f*(x-El)²) · cos(k_f*(x-El))
+    # "gabor"    : 超高斯包络 × cos 调制，关于 El 对称，宽度由 alpha_f/n0 控制
+    #              f(x) = exp(-alpha_f*(x-El)**n0) · cos(k_f*(x-El))
+    #              n0=2 → 普通高斯包络；n0>2 → 超高斯（平顶更宽、边沿更陡）
     "filter_type": "gabor",   # "gaussian" | "gabor"
-    "alpha_f": 0.5,              # Gabor 高斯包络参数（sigma=1/sqrt(2*alpha_f) Hartree）
-    "k_f": 1.0,                  # Gabor 余弦调制频率（Hartree⁻¹）
+    "alpha_f": 45.0,             # Gabor 包络衰减系数
+    "k_f": 20.0,                 # Gabor 余弦调制频率（Hartree⁻¹）
+    "n0": 4,                     # Gabor 包络指数（n0=2 普通高斯，n0=4 超高斯）
 
     # ---------- 窗函数对比绘图 ----------
     # 若 plot_window_bands 非空，在 window_comparison.png 中标记目标频带和 gap
@@ -154,7 +156,7 @@ CONFIG: Dict[str, Any] = {
     "print_every_filter": 1,
 
     # ---------- 画图 ----------
-    "plot_interval": [-0.26, -0.08],   # 滤波函数绘图能量区间 [E_lo, E_hi]
+    "plot_interval": [-0.4, 0.1],   # 滤波函数绘图能量区间 [E_lo, E_hi]
 }
 CONFIG["dt"] = (CONFIG["nc"] / (CONFIG["dE"] * 2.5)) ** 2
 
@@ -275,11 +277,12 @@ def run(cfg: Dict[str, Any]) -> None:
     filter_type = cfg.get("filter_type", "gaussian")
     alpha_f     = cfg.get("alpha_f", 0.5)
     k_f         = cfg.get("k_f", 1.0)
+    n0          = cfg.get("n0", 4)
     par         = PhysParams(dE=cfg["dE"], Vmin=cfg["Vmin"], dt=dt)
     ist         = IstParams(nc=nc, ms=len(El_list))
 
     # 构造窗函数
-    filter_func = make_filter_func(filter_type, dt=dt, alpha_f=alpha_f, k_f=k_f)
+    filter_func = make_filter_func(filter_type, dt=dt, alpha_f=alpha_f, k_f=k_f, n0=n0)
 
     print(f"   nc={nc},  dE={par.dE},  Vmin={par.Vmin},  dt={dt:.4f}")
     print(f"   Filter type : {filter_type}")
@@ -287,10 +290,8 @@ def run(cfg: Dict[str, Any]) -> None:
         print(f"   sigma (Gaussian) = {1/np.sqrt(2*dt):.6f} Hartree")
         filter_label = f"Gaussian (sigma={1/np.sqrt(2*dt):.4f})"
     elif filter_type == "gabor":
-        sigma_gabor = 1.0 / np.sqrt(2.0 * alpha_f)
-        print(f"   alpha_f = {alpha_f},  k_f = {k_f}")
-        print(f"   sigma (Gabor envelope) = {sigma_gabor:.4f} Hartree")
-        filter_label = f"Gabor cos (alpha_f={alpha_f}, k_f={k_f})"
+        print(f"   alpha_f = {alpha_f},  k_f = {k_f},  n0 = {n0}")
+        filter_label = f"Gabor (alpha_f={alpha_f}, k_f={k_f}, n0={n0})"
     else:
         filter_label = filter_type
     print(f"   Number of filter centres: {len(El_list)}")
@@ -314,8 +315,8 @@ def run(cfg: Dict[str, Any]) -> None:
     cmp_funcs: Dict[str, Any] = {filter_label: filter_func}
     if filter_type == "gaussian":
         from fft_code.filter_coeff import _filt_func_gabor
-        cmp_funcs["Gabor (alpha_f=0.5, k_f=1.0) [参考]"] = (
-            lambda x, El: _filt_func_gabor(x, El, 0.5, 1.0)
+        cmp_funcs["Gabor (alpha_f=0.5, k_f=1.0, n0=4) [参考]"] = (
+            lambda x, El: _filt_func_gabor(x, El, 0.5, 1.0, 4)
         )
     elif filter_type == "gabor":
         from fft_code.filter_coeff import _filt_func_gaussian
@@ -421,8 +422,7 @@ def run(cfg: Dict[str, Any]) -> None:
             "nc":     nc,
             "dt":     dt,
             "sigma_gaussian": float(1 / np.sqrt(2 * dt)),
-            **({"alpha_f": alpha_f, "k_f": k_f,
-                "sigma_gabor": float(1 / np.sqrt(2 * alpha_f))}
+            **({"alpha_f": alpha_f, "k_f": k_f, "n0": n0}
                if filter_type == "gabor" else {}),
             "El_list": El_list.tolist(),
             "E_mean": E_mean,
