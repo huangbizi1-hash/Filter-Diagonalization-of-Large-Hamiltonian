@@ -46,7 +46,8 @@ def _parse_method_spec(method_str: str) -> Tuple[str, str]:
     parts = method_str.split(":")
     if len(parts) == 1:
         m = parts[0].lower()
-        if m in ["gd", "lobpcg", "davidson", "jd", "cgmin"]: return "sinc_dvr", m
+        if m == "cgmin": return "fft_dvr", m
+        if m in ["gd", "lobpcg", "davidson", "jd"]: return "sinc_dvr", m
         return m, "lanczos"
     return parts[0].lower(), parts[1]
 
@@ -200,8 +201,9 @@ def cg_minimize_folded(
     H_op,
     E_target: float,
     x0: np.ndarray,
-    maxiter: int = 500,
+    maxiter: int = 2000,
     gtol: float = 1e-8,
+    energy_tol: float = 5e-4,
     theta_max: float = 0.8,
     verbose: bool = True,
 ) -> dict:
@@ -211,23 +213,30 @@ def cg_minimize_folded(
     H_op 可以是 numpy ndarray、scipy 稀疏矩阵或 LinearOperator，
     只需支持矩阵-向量乘法即可（不需要存储完整矩阵）。
 
+    收敛判据（满足其一即停止）：
+      1. 相邻迭代 Ritz 能量变化 |ΔE| < energy_tol  （主判据）
+      2. 切空间梯度范数 ||g|| < gtol                （辅助判据）
+
     Parameters
     ----------
-    H_op     : 哈密顿量算符（ndarray / sparse / LinearOperator）
-    E_target : 目标能量
-    x0       : 初始向量（任意范数，函数内部归一化）
-    maxiter  : 最大迭代次数
-    gtol     : 切空间梯度范数收敛阈值
-    theta_max: 测地线步长搜索上界（弧度）
-    verbose  : 是否打印迭代信息
+    H_op       : 哈密顿量算符（ndarray / sparse / LinearOperator）
+    E_target   : 目标能量
+    x0         : 初始向量（任意范数，函数内部归一化）
+    maxiter    : 最大迭代次数，默认 2000
+    gtol       : 切空间梯度范数收敛阈值，默认 1e-8
+    energy_tol : 相邻迭代 Ritz 能量变化收敛阈值，默认 5e-4
+    theta_max  : 测地线步长搜索上界（弧度）
+    verbose    : 是否打印迭代信息
 
     Returns
     -------
     dict 包含
-      'x'      : 收敛的单位向量
-      'E_ritz' : Ritz 能量 <x|H|x>
-      'history': {'f', 'gnorm', 'E_ritz'} 列表
-      'n_iter' : 实际迭代次数
+      'x'          : 收敛的单位向量
+      'E_ritz'     : Ritz 能量 <x|H|x>
+      'history'    : {'f', 'gnorm', 'E_ritz'} 列表
+      'n_iter'     : 实际迭代次数
+      'converged'  : 是否满足收敛判据（True/False）
+      'conv_reason': 收敛原因字符串
     """
     # 统一 matvec 接口
     if hasattr(H_op, "matvec"):
@@ -265,6 +274,10 @@ def cg_minimize_folded(
         print(f"  CG-min init: f={f0:.6e}, ||g||={np.linalg.norm(g):.3e}")
 
     n_iter = 0
+    converged = False
+    conv_reason = "maxiter"
+    E_ritz_prev = None
+
     for it in range(1, maxiter + 1):
         n_iter = it
         gnorm = np.linalg.norm(g)
@@ -273,15 +286,30 @@ def cg_minimize_folded(
         hist["gnorm"].append(gnorm)
         hist["E_ritz"].append(E_ritz)
 
-        if gnorm < gtol:
+        # 主判据：相邻迭代 Ritz 能量变化
+        if E_ritz_prev is not None and abs(E_ritz - E_ritz_prev) < energy_tol:
+            converged = True
+            conv_reason = f"ΔE={abs(E_ritz - E_ritz_prev):.2e}<{energy_tol:.2e}"
             if verbose:
-                print(f"  Converged it={it}: ||g||={gnorm:.3e}, E≈{E_ritz:.10f}")
+                print(f"  Converged (ΔE) it={it}: ΔE={abs(E_ritz-E_ritz_prev):.3e}, "
+                      f"E≈{E_ritz:.10f}")
             break
+
+        # 辅助判据：切空间梯度范数
+        if gnorm < gtol:
+            converged = True
+            conv_reason = f"||g||={gnorm:.2e}<{gtol:.2e}"
+            if verbose:
+                print(f"  Converged (||g||) it={it}: ||g||={gnorm:.3e}, E≈{E_ritz:.10f}")
+            break
+
+        E_ritz_prev = E_ritz
 
         # 将搜索方向重新投影到切空间
         p = p - np.dot(x, p) * x
         pn = np.linalg.norm(p)
         if pn == 0.0:
+            conv_reason = "direction_vanished"
             if verbose:
                 print("  Direction vanished; stopping.")
             break
@@ -311,11 +339,12 @@ def cg_minimize_folded(
         p_prev = p.copy()
 
         if verbose and (it % 50 == 0 or it == 1):
-            print(f"  it={it:4d}: f={f0:.6e}, ||g||={np.linalg.norm(g):.3e}, "
+            print(f"  it={it:4d}: f={f0:.6e}, ||g||={gnorm:.3e}, "
                   f"theta={theta:.3e}, E≈{E_ritz:.10f}")
 
     E_final = float(np.dot(x, Hv(x)))
-    return {"x": x, "E_ritz": E_final, "history": hist, "n_iter": n_iter}
+    return {"x": x, "E_ritz": E_final, "history": hist,
+            "n_iter": n_iter, "converged": converged, "conv_reason": conv_reason}
 
 
 # ---------------------------
@@ -650,6 +679,7 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
             H_op, target, x0_cg,
             maxiter=kwargs.pop("cgmin_maxiter", 2000),
             gtol=kwargs.pop("cgmin_gtol", 1e-8),
+            energy_tol=kwargs.pop("cgmin_energy_tol", 5e-4),
             theta_max=kwargs.pop("cgmin_theta_max", 0.8),
             verbose=kwargs.pop("cgmin_verbose", True),
         )
