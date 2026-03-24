@@ -244,6 +244,28 @@ def main():
             if hasattr(final_rnorms, "tolist"):
                 final_rnorms = final_rnorms.tolist()
 
+            # 打印 PRIMME stats 中所有收敛相关信息
+            _fmt_stat = lambda v: (
+                f"{v:.4e}" if isinstance(v, float) else
+                (", ".join(f"{x:.4e}" for x in v)
+                 if hasattr(v, "__iter__") else str(v))
+            )
+            stat_fields = [
+                ("numOuterIterations", "外迭代次数"),
+                ("numRestarts",        "重启次数"),
+                ("numMatvecs",         "矩阵向量乘次数"),
+                ("numPreconds",        "预条件器次数"),
+                ("elapsedTime",        "求解耗时(s)"),
+                ("rnorms",             "各本征对最终|r|"),
+                ("estimateMinEVal",    "估计 E_min"),
+                ("estimateMaxEVal",    "估计 E_max"),
+                ("estimateLargestSVal","估计最大奇异值"),
+            ]
+            print(f"    收敛统计 (E_target={E_t:.4f}):")
+            for key, label in stat_fields:
+                if key in stats and stats[key] is not None:
+                    print(f"      {label:<20}: {_fmt_stat(stats[key])}")
+
             history_data = None
             if args.history:
                 # 将 numpy 数组转为列表以便 JSON 序列化
