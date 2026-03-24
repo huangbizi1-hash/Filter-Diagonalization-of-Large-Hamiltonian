@@ -52,7 +52,8 @@ def _parse_method_spec(method_str: str) -> Tuple[str, str]:
 
 def _label(disc: str, solver: str) -> str:
     """生成图表显示的专业标签"""
-    disc_map = {"numerov3d": "Numerov-3D", "chebyshev": "Chebyshev", "sinc_dvr": "Sinc-DVR"}
+    disc_map = {"numerov3d": "Numerov-3D", "chebyshev": "Chebyshev",
+                "sinc_dvr": "Sinc-DVR", "fft_dvr": "FFT-DVR"}
     
     s_clean = solver
     if s_clean.upper().startswith("PRIMME_"):
@@ -429,6 +430,88 @@ def build_3d_sinc_dvr_operator(N: int, potential_grid: Optional[PotentialGrid] =
         
     return spla.LinearOperator((N**3, N**3), matvec=matvec, dtype=float), N**3, V_flat
 
+
+def build_3d_fft_operator(N: int, potential_grid: Optional[PotentialGrid] = None,
+                           L: float = 5.0, kinetic_cut: float = 30.0):
+    """
+    构建基于 FFT 的 3D 哈密顿量算符（LinearOperator）。
+
+    每次 matvec 复杂度 O(N³ log N)，优于 Sinc-DVR 的 O(N⁴)。
+    动能通过三维 FFT 对角化：T̂|ψ⟩ = IFFT[ T(k)·FFT(ψ) ]。
+    使用周期边界条件，盒子足够大时近似等价于 Dirichlet BC。
+
+    参考 fft_code/hamiltonian.py 的 apply_H 实现，
+    区别在于预先规划 pyfftw 变换（降低重复调用开销），
+    并将结果封装为 LinearOperator 供 cgmin 等求解器使用。
+
+    Parameters
+    ----------
+    N            : 每轴网格点数
+    potential_grid : 自定义势能网格；为 None 时使用 3D 谐振子 V=½r²
+    L            : 谐振子盒子半长（仅当 potential_grid=None 时有效）
+    kinetic_cut  : k 空间动能截断值（Hartree）
+
+    Returns
+    -------
+    H_op  : LinearOperator  (N³, N³)
+    n_un  : int  总自由度 N³
+    V_flat: np.ndarray  势能展平向量 (N³,)
+    """
+    if potential_grid is None:
+        # 谐振子：周期盒长 2L，步长 d = 2L/N
+        d = 2.0 * L / N
+        x1d = (np.arange(N) - N / 2) * d
+        X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
+        V = 0.5 * (X ** 2 + Y ** 2 + Z ** 2)
+        d_use = d
+    else:
+        if potential_grid.Nx != N:
+            from grid_reader import resample_potential
+            potential_grid = resample_potential(potential_grid, N)
+        V = potential_grid.potential
+        d_use = potential_grid.x[1] - potential_grid.x[0]
+
+    # k 空间动能对角元 T(k) = |k|²/2，截断于 kinetic_cut
+    k1d = 2.0 * np.pi * np.fft.fftfreq(N, d=d_use)
+    K1d_sq = k1d ** 2
+    T_k = (K1d_sq[:, None, None] +
+           K1d_sq[None, :, None] +
+           K1d_sq[None, None, :]) / 2.0
+    T_k = np.minimum(T_k, kinetic_cut)
+
+    # 尝试使用 pyfftw 预规划变换（参考 fft_code/hamiltonian.py）
+    # pyfftw FFTW_BACKWARD 不归一化：IFFT_unnorm(FFT(x)) = N³·x
+    # 因此在 k 空间乘以 T_k/N³ 以补偿归一化
+    try:
+        import pyfftw
+        _buf  = pyfftw.empty_aligned((N, N, N), dtype='complex128')
+        _kbuf = pyfftw.empty_aligned((N, N, N), dtype='complex128')
+        _fwd  = pyfftw.FFTW(_buf,  _kbuf, axes=(0, 1, 2),
+                             direction='FFTW_FORWARD',  flags=('FFTW_MEASURE',))
+        _bwd  = pyfftw.FFTW(_kbuf, _buf,  axes=(0, 1, 2),
+                             direction='FFTW_BACKWARD', flags=('FFTW_MEASURE',))
+        # pyfftw 默认 normalise_idft=True，与 numpy.fft.ifftn 行为一致，无需额外除以 N³
+
+        def matvec(v: np.ndarray) -> np.ndarray:
+            psi = v.reshape(N, N, N)
+            _buf[:]  = psi
+            _fwd()              # _buf -> _kbuf  (FFT，无归一化)
+            _kbuf[:] *= T_k     # 乘 T(k)
+            _bwd()              # _kbuf -> _buf  (IFFT，pyfftw 自动除以 N³)
+            Tpsi = _buf.real.copy()
+            return (Tpsi + V * psi).ravel()
+
+    except ImportError:
+        # 回退到 numpy.fft（自动归一化，公式更简洁）
+        def matvec(v: np.ndarray) -> np.ndarray:
+            psi = v.reshape(N, N, N)
+            psi_k = np.fft.fftn(psi)
+            Tpsi  = np.fft.ifftn(T_k * psi_k).real
+            return (Tpsi + V * psi).ravel()
+
+    return spla.LinearOperator((N**3, N**3), matvec=matvec, dtype=float), N**3, V.ravel()
+
+
 # ---------------------------
 # 核心求解器（增强版）
 # ---------------------------
@@ -507,15 +590,18 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
             V_interior = potential_grid.potential[1:-1, 1:-1, 1:-1]
             H_op += sp.diags(V_interior.ravel(), 0, format="csc")
         n_un, M_op = n1**3, None
+    elif disc == "fft_dvr":
+        H_op, n_un, _ = build_3d_fft_operator(N, potential_grid, L)
+        M_op = None
     else:  # sinc_dvr
         H_op, n_un, V_diag = build_3d_sinc_dvr_operator(N, potential_grid, L)
-        
+
         # 获取正确的步长
         if potential_grid is None:
             h = (2.0*L)/(N-1)
         else:
             h = potential_grid.x[1] - potential_grid.x[0]
-        
+
         T_diag_val = (np.pi**2)/(2.0*h**2)
         shift = target if target is not None else 0.0
         M_vals = 1.0 / (T_diag_val + V_diag - shift + 1e-3)
