@@ -119,18 +119,18 @@ CONFIG: Dict[str, Any] = {
 
     # ---------- 滤波器 ----------
     # ⚠️  先用小参数跑一次，看启动时打印的 Spectrum check 里的 H_max，再调这两个值
-    "nc": 1000,
+    "nc": 100,
     "dE": 50.0,             # 根据实际 H_max 调整
     "Vmin": -5.0,           # 根据实际 V_min 调整
-    "El_list": list(np.arange(-0.7, -0.6, 0.1).tolist()),
+    "El_list": list(np.arange(-0.2, -0.1, 0.1).tolist()),
 
     # ---------- 窗函数类型 ----------
     # "gaussian" : 经典高斯，宽度由 dt=(nc/(dE×2.5))² 决定（窄 → 高 nc）
-    # "gabor"    : 高斯包络 × sin 调制，宽度由 alpha_f 控制（宽 → 低 nc）
-    #              f(x) = exp(-alpha_f*(x-El)²) · sin(k_f*x)
-    "filter_type": "gaussian",   # "gaussian" | "gabor"
+    # "gabor"    : 高斯包络 × cos 调制，关于 El 对称，宽度由 alpha_f 控制（宽 → 低 nc）
+    #              f(x) = exp(-alpha_f*(x-El)²) · cos(k_f*(x-El))
+    "filter_type": "gabor",   # "gaussian" | "gabor"
     "alpha_f": 0.5,              # Gabor 高斯包络参数（sigma=1/sqrt(2*alpha_f) Hartree）
-    "k_f": 1.0,                  # Gabor 正弦调制频率（Hartree⁻¹）
+    "k_f": 1.0,                  # Gabor 余弦调制频率（Hartree⁻¹）
 
     # ---------- 窗函数对比绘图 ----------
     # 若 plot_window_bands 非空，在 window_comparison.png 中标记目标频带和 gap
@@ -140,7 +140,7 @@ CONFIG: Dict[str, Any] = {
     },
 
     # ---------- 随机态 ----------
-    "n_random": 40,
+    "n_random": 1,
     "seed": 42,
 
     # ---------- SVD / Rayleigh-Ritz ----------
@@ -290,7 +290,7 @@ def run(cfg: Dict[str, Any]) -> None:
         sigma_gabor = 1.0 / np.sqrt(2.0 * alpha_f)
         print(f"   alpha_f = {alpha_f},  k_f = {k_f}")
         print(f"   sigma (Gabor envelope) = {sigma_gabor:.4f} Hartree")
-        filter_label = f"Gabor (alpha_f={alpha_f}, k_f={k_f})"
+        filter_label = f"Gabor cos (alpha_f={alpha_f}, k_f={k_f})"
     else:
         filter_label = filter_type
     print(f"   Number of filter centres: {len(El_list)}")

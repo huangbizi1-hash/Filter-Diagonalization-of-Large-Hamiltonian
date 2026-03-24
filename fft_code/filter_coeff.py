@@ -15,14 +15,16 @@ build_filter_coefficients — 构建 Newton 插值系数矩阵
     高精度需要高阶多项式（dt 越大 → sigma 越窄 → nc 越大）。
 
 "gabor"
-    Gabor 型滤波（高斯包络 × 正弦调制）：
-        f(x) = exp(-alpha_f·(x-El)²) · sin(k_f·x)
+    Gabor 型滤波（高斯包络 × 余弦调制，关于 El 对称）：
+        f(x) = exp(-alpha_f·(x-El)²) · cos(k_f·(x-El))
     参数：
         alpha_f (float, 默认 0.5)：高斯包络宽度，sigma = 1/sqrt(2·alpha_f)。
-        k_f     (float, 默认 1.0)：正弦调制频率（Hartree⁻¹）。
+        k_f     (float, 默认 1.0)：余弦调制频率（Hartree⁻¹）。
     特点：alpha_f 远小于 dt（如 0.5 vs 1600），包络宽 ~1 Hartree，
     所需 Newton 节点数 nc 大幅低于高斯情形（约 150-300 vs 5000），
     适合在不需要极窄窗的场合降低计算量。
+    余弦形式使滤波窗关于 El 严格偶对称，避免了 sin(k_f·x) 因 x 平移
+    引入的相位偏差。
 
     filter_func 签名：filter_func(x_phys: np.ndarray, El: float) -> np.ndarray
 """
@@ -44,8 +46,8 @@ def _filt_func_gaussian(x_phys: np.ndarray, El: float, dt: float) -> np.ndarray:
 
 def _filt_func_gabor(x_phys: np.ndarray, El: float,
                      alpha_f: float, k_f: float) -> np.ndarray:
-    """Gabor 窗：exp(-alpha_f·(x-El)²)·sin(k_f·x)"""
-    return np.exp(-alpha_f * (x_phys - El) ** 2) * np.sin(k_f * x_phys)
+    """Gabor 窗：exp(-alpha_f·(x-El)²)·cos(k_f·(x-El))，关于 El 对称"""
+    return np.exp(-alpha_f * (x_phys - El) ** 2) * np.cos(k_f * (x_phys - El))
 
 
 def _samp_points_ashkenazy(min_val: float, max_val: float, nc: int) -> np.ndarray:
@@ -148,7 +150,7 @@ def make_filter_func(filter_type: str,
     filter_type : "gaussian" 或 "gabor"
     dt          : 高斯参数（仅 filter_type="gaussian" 使用）
     alpha_f     : Gabor 高斯包络宽度（仅 filter_type="gabor" 使用）
-    k_f         : Gabor 正弦频率（仅 filter_type="gabor" 使用）
+    k_f         : Gabor 余弦调制频率（仅 filter_type="gabor" 使用）
     """
     if filter_type == "gaussian":
         return lambda x, El: _filt_func_gaussian(x, El, dt)
