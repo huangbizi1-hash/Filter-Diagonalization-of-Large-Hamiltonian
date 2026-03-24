@@ -1,19 +1,51 @@
 """
 Newton 插值滤波系数构建。
 
-公开接口：build_filter_coefficients
+公开接口
+--------
+make_filter_func          — 窗函数工厂（返回 callable）
+build_filter_coefficients — 构建 Newton 插值系数矩阵
+
+支持的窗函数类型
+----------------
+"gaussian"
+    经典高斯滤波（默认），参数由 PhysParams.dt 控制：
+        f(x) = sqrt(dt/π) · exp(-(x-El)² · dt)
+    展宽 sigma = 1/sqrt(2·dt)（物理单位，Hartree）。
+    高精度需要高阶多项式（dt 越大 → sigma 越窄 → nc 越大）。
+
+"gabor"
+    Gabor 型滤波（高斯包络 × 正弦调制）：
+        f(x) = exp(-alpha_f·(x-El)²) · sin(k_f·x)
+    参数：
+        alpha_f (float, 默认 0.5)：高斯包络宽度，sigma = 1/sqrt(2·alpha_f)。
+        k_f     (float, 默认 1.0)：正弦调制频率（Hartree⁻¹）。
+    特点：alpha_f 远小于 dt（如 0.5 vs 1600），包络宽 ~1 Hartree，
+    所需 Newton 节点数 nc 大幅低于高斯情形（约 150-300 vs 5000），
+    适合在不需要极窄窗的场合降低计算量。
+
+    filter_func 签名：filter_func(x_phys: np.ndarray, El: float) -> np.ndarray
 """
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 
 from .params import PhysParams
 
 
-# ---- 内部辅助 ----
+# ──────────────────────────────────────────────
+# 内部辅助
+# ──────────────────────────────────────────────
 
-def _filt_func_values(x: np.ndarray, dt: float) -> np.ndarray:
-    return np.sqrt(dt / np.pi) * np.exp(-x**2 * dt)
+def _filt_func_gaussian(x_phys: np.ndarray, El: float, dt: float) -> np.ndarray:
+    """高斯窗：sqrt(dt/π)·exp(-(x-El)²·dt)"""
+    return np.sqrt(dt / np.pi) * np.exp(-(x_phys - El) ** 2 * dt)
+
+
+def _filt_func_gabor(x_phys: np.ndarray, El: float,
+                     alpha_f: float, k_f: float) -> np.ndarray:
+    """Gabor 窗：exp(-alpha_f·(x-El)²)·sin(k_f·x)"""
+    return np.exp(-alpha_f * (x_phys - El) ** 2) * np.sin(k_f * x_phys)
 
 
 def _samp_points_ashkenazy(min_val: float, max_val: float, nc: int) -> np.ndarray:
@@ -42,7 +74,9 @@ def _newton_coefficients(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return f[np.arange(n), np.arange(n)]
 
 
-# ---- 公开接口 ----
+# ──────────────────────────────────────────────
+# 单项式转换（仅供小 nc 验证）
+# ──────────────────────────────────────────────
 
 def _newton_to_monomial(coeffs: np.ndarray, nodes: np.ndarray) -> np.ndarray:
     """
@@ -54,14 +88,12 @@ def _newton_to_monomial(coeffs: np.ndarray, nodes: np.ndarray) -> np.ndarray:
     实现方式：从最内层系数出发，用 Horner 展开逐步展开基底多项式。
     """
     n = len(coeffs)
-    # 从最高阶开始，poly 表示升幂系数数组
     poly = np.array([coeffs[-1]], dtype=complex)
     for j in range(n - 2, -1, -1):
-        # poly ← poly * (x̃ - nodes[j]) + coeffs[j]
         new_poly = np.zeros(len(poly) + 1, dtype=complex)
-        new_poly[:-1] -= nodes[j] * poly   # 乘以 -nodes[j]
-        new_poly[1:]  += poly               # 乘以 x̃
-        new_poly[0]   += coeffs[j]          # 加常数项
+        new_poly[:-1] -= nodes[j] * poly
+        new_poly[1:]  += poly
+        new_poly[0]   += coeffs[j]
         poly = new_poly
     return poly.real
 
@@ -100,16 +132,65 @@ def build_monomial_coefficients(an: np.ndarray,
     return cn
 
 
-def build_filter_coefficients(El_list: np.ndarray, par: PhysParams,
-                               nc: int) -> Tuple[np.ndarray, np.ndarray]:
+# ──────────────────────────────────────────────
+# 公开接口：窗函数工厂
+# ──────────────────────────────────────────────
+
+def make_filter_func(filter_type: str,
+                     dt: float = 1.0,
+                     alpha_f: float = 0.5,
+                     k_f: float = 1.0) -> Callable:
+    """
+    返回 filter_func(x_phys, El) -> np.ndarray。
+
+    参数
+    ----
+    filter_type : "gaussian" 或 "gabor"
+    dt          : 高斯参数（仅 filter_type="gaussian" 使用）
+    alpha_f     : Gabor 高斯包络宽度（仅 filter_type="gabor" 使用）
+    k_f         : Gabor 正弦频率（仅 filter_type="gabor" 使用）
+    """
+    if filter_type == "gaussian":
+        return lambda x, El: _filt_func_gaussian(x, El, dt)
+    elif filter_type == "gabor":
+        return lambda x, El: _filt_func_gabor(x, El, alpha_f, k_f)
+    else:
+        raise ValueError(
+            f"Unknown filter_type={filter_type!r}. "
+            "Supported: 'gaussian', 'gabor'."
+        )
+
+
+# ──────────────────────────────────────────────
+# 公开接口：构建 Newton 系数
+# ──────────────────────────────────────────────
+
+def build_filter_coefficients(
+        El_list: np.ndarray,
+        par: PhysParams,
+        nc: int,
+        filter_func: Optional[Callable] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     为 El_list 中每个滤波中心构建 Newton 插值系数。
+
+    参数
+    ----
+    El_list     : 滤波中心能量列表（物理单位，Hartree）
+    par         : PhysParams（提供 dE、Vmin、dt）
+    nc          : Newton 节点数
+    filter_func : callable(x_phys, El) -> np.ndarray，可选。
+                  若为 None，默认使用高斯滤波（由 par.dt 控制宽度）。
+                  可由 make_filter_func() 构造。
 
     返回
     ----
     an   : (ms, nc) 系数矩阵
     samp : (nc,)    [-2, 2] 区间的 Ashkenazy 节点
     """
+    if filter_func is None:
+        filter_func = make_filter_func("gaussian", dt=par.dt)
+
     Smin, Smax = -2.0, 2.0
     scale  = (Smax - Smin) / par.dE
     samp   = _samp_points_ashkenazy(Smin, Smax, nc)
@@ -117,6 +198,6 @@ def build_filter_coefficients(El_list: np.ndarray, par: PhysParams,
 
     an = np.zeros((len(El_list), nc))
     for ie, El in enumerate(El_list):
-        y = _filt_func_values(x_phys - El, par.dt)
+        y = filter_func(x_phys, El)
         an[ie] = _newton_coefficients(samp, y)
     return an, samp

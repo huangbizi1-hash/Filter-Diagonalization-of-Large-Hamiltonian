@@ -2,6 +2,7 @@
 绘图函数集合。所有函数均将图像保存为文件，不调用 plt.show()。
 """
 from pathlib import Path
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import matplotlib
@@ -19,9 +20,28 @@ def _savefig(fig, path: Path, close: bool = True) -> None:
         plt.close(fig)
 
 
+# ──────────────────────────────────────────────
+# 滤波函数 vs Newton 插值
+# ──────────────────────────────────────────────
+
 def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
-                               interval, out_dir: Path) -> None:
-    """真实滤波函数 vs Newton 插值。"""
+                               interval, out_dir: Path,
+                               filter_func: Optional[Callable] = None,
+                               filter_label: str = "Filter") -> None:
+    """
+    真实窗函数 vs Newton 多项式插值。
+
+    参数
+    ----
+    filter_func : callable(x_arr, El) -> y_arr
+        若为 None，默认使用高斯公式 sqrt(dt/π)·exp(-(x-El)²·dt)。
+    filter_label : 图例中真实函数的名称。
+    """
+    if filter_func is None:
+        filter_func = lambda x, El: (
+            np.sqrt(par.dt / np.pi) * np.exp(-(x - El) ** 2 * par.dt)
+        )
+
     def _scaled_eval(x_eval, nodes, coeffs):
         x = 4.0 * (x_eval - par.Vmin) / par.dE - 2.0
         result = coeffs[0]
@@ -34,17 +54,17 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
     x_plot = np.linspace(interval[0], interval[1], 1000)
     fig, ax = plt.subplots(figsize=(10, 6))
     for ie, El in enumerate(El_list):
-        y_true   = np.sqrt(par.dt / np.pi) * np.exp(-(x_plot - El)**2 * par.dt)
+        y_true   = filter_func(x_plot, El)
         y_interp = np.array([_scaled_eval(x, samp, an[ie]) for x in x_plot])
         mae = np.mean(np.abs(y_true - y_interp))
-        print(f"  El={El:.2f}  MAE={mae:.6e}")
+        print(f"  El={El:.4f}  MAE={mae:.6e}")
         ax.plot(x_plot, y_true,   color='blue',
-                label='True filter' if ie == 0 else "")
+                label=filter_label if ie == 0 else "")
         ax.plot(x_plot, y_interp, '--', color='red',
                 label=f'Newton interp (nc={len(samp)})' if ie == 0 else "")
-    ax.set_xlabel('x')
+    ax.set_xlabel('Energy (Hartree)')
     ax.set_ylabel('f(x)')
-    ax.set_title(f'Filter Function vs Newton Interpolation (nc={len(samp)})')
+    ax.set_title(f'{filter_label} vs Newton Interpolation (nc={len(samp)})')
     ax.set_xlim(interval[0], interval[1])
     ax.legend()
     ax.grid(True)
@@ -52,17 +72,87 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
     _savefig(fig, out_dir / "filter_interpolation.png")
 
 
-def plot_filter_monomial(El_list, cn, par: PhysParams,
-                         interval, out_dir: Path) -> None:
-    """用单项式系数（Horner 法）验证 Newton→单项式转换的精度。
+# ──────────────────────────────────────────────
+# 多种窗函数对比图
+# ──────────────────────────────────────────────
 
-    对每个 El 计算并打印 MAE，并将真实滤波函数与单项式求值结果叠加绘图，
-    保存为 filter_monomial.png。
+def plot_window_comparison(
+        El_list,
+        par: PhysParams,
+        interval: Tuple[float, float],
+        out_dir: Path,
+        window_funcs: Optional[Dict[str, Callable]] = None,
+        highlight_band: Optional[Tuple[float, float]] = None,
+        gap_band: Optional[Tuple[float, float]] = None,
+) -> None:
     """
+    在同一图上对比多种窗函数的形状。
+
+    参数
+    ----
+    window_funcs : {label: callable(x_arr, El) -> y_arr}
+        若为 None，自动用 par.dt 绘制默认高斯窗和示例 Gabor 窗。
+    highlight_band : (lo, hi) — 感兴趣能量区间（绿色阴影）。
+    gap_band       : (lo, hi) — 无本征值的 gap 区间（红色阴影）。
+    """
+    if window_funcs is None:
+        from .filter_coeff import _filt_func_gaussian, _filt_func_gabor
+        window_funcs = {
+            f"Gaussian (sigma={1/np.sqrt(2*par.dt):.3f})": (
+                lambda x, El: _filt_func_gaussian(x, El, par.dt)
+            ),
+            "Gabor (alpha_f=0.5, k_f=1.0)": (
+                lambda x, El: _filt_func_gabor(x, El, 0.5, 1.0)
+            ),
+        }
+
+    x_plot = np.linspace(interval[0], interval[1], 2000)
+    colors = plt.cm.tab10(np.linspace(0, 1, len(window_funcs)))
+
+    fig, axes = plt.subplots(1, len(El_list), figsize=(6 * len(El_list), 5),
+                             squeeze=False)
+
+    for col, El in enumerate(El_list):
+        ax = axes[0][col]
+
+        # 感兴趣区间 / gap 阴影
+        if highlight_band is not None:
+            ax.axvspan(highlight_band[0], highlight_band[1],
+                       alpha=0.15, color='green', label='Target band')
+        if gap_band is not None:
+            ax.axvspan(gap_band[0], gap_band[1],
+                       alpha=0.20, color='red', label='Gap (no eigenvalues)')
+
+        for (label, func), color in zip(window_funcs.items(), colors):
+            y = func(x_plot, El)
+            ax.plot(x_plot, y, label=label, color=color)
+
+        ax.axvline(El, color='black', linestyle=':', linewidth=0.8, label=f'El={El:.3f}')
+        ax.set_xlabel('Energy (Hartree)')
+        ax.set_ylabel('f(x)')
+        ax.set_title(f'Window functions  El={El:.4f}')
+        ax.legend(fontsize=7)
+        ax.grid(True)
+
+    fig.tight_layout()
+    _savefig(fig, out_dir / "window_comparison.png")
+
+
+# ──────────────────────────────────────────────
+# 单项式验证
+# ──────────────────────────────────────────────
+
+def plot_filter_monomial(El_list, cn, par: PhysParams,
+                         interval, out_dir: Path,
+                         filter_func: Optional[Callable] = None) -> None:
+    """用单项式系数（Horner 法）验证 Newton→单项式转换的精度。"""
+    if filter_func is None:
+        filter_func = lambda x, El: (
+            np.sqrt(par.dt / np.pi) * np.exp(-(x - El) ** 2 * par.dt)
+        )
+
     def _mono_eval(x_eval, mono):
-        # 将物理坐标映射到 [-2, 2] 缩放坐标
         x = 4.0 * (x_eval - par.Vmin) / par.dE - 2.0
-        # Horner 法（升幂）
         result = mono[-1]
         for k in range(len(mono) - 2, -1, -1):
             result = result * x + mono[k]
@@ -71,15 +161,15 @@ def plot_filter_monomial(El_list, cn, par: PhysParams,
     x_plot = np.linspace(interval[0], interval[1], 1000)
     fig, ax = plt.subplots(figsize=(10, 6))
     for ie, El in enumerate(El_list):
-        y_true  = np.sqrt(par.dt / np.pi) * np.exp(-(x_plot - El)**2 * par.dt)
-        y_mono  = np.array([_mono_eval(x, cn[ie]) for x in x_plot])
+        y_true = filter_func(x_plot, El)
+        y_mono = np.array([_mono_eval(x, cn[ie]) for x in x_plot])
         mae = np.mean(np.abs(y_true - y_mono))
-        print(f"  [monomial] El={El:.2f}  MAE={mae:.6e}")
+        print(f"  [monomial] El={El:.4f}  MAE={mae:.6e}")
         ax.plot(x_plot, y_true,  color='blue',
                 label='True filter' if ie == 0 else "")
         ax.plot(x_plot, y_mono, '--', color='orange',
                 label=f'Monomial eval (nc={len(cn[0])})' if ie == 0 else "")
-    ax.set_xlabel('x')
+    ax.set_xlabel('Energy (Hartree)')
     ax.set_ylabel('f(x)')
     ax.set_title(f'Filter Function vs Monomial Evaluation (nc={len(cn[0])})')
     ax.set_xlim(interval[0], interval[1])
@@ -88,6 +178,10 @@ def plot_filter_monomial(El_list, cn, par: PhysParams,
     fig.tight_layout()
     _savefig(fig, out_dir / "filter_monomial.png")
 
+
+# ──────────────────────────────────────────────
+# 其余绘图函数（不变）
+# ──────────────────────────────────────────────
 
 def plot_filtered_energies(El_list, E_mean_all, E_std_all, N_values,
                             error_mean_all, n_random: int,

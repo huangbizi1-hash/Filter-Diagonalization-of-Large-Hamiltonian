@@ -84,11 +84,12 @@ from fft_code.params       import IstParams, PhysParams
 from fft_code.grid         import build_k_diagonal
 from fft_code.wavefunction import random_sine_psi, normalize_psi
 from fft_code.hamiltonian  import apply_H, apply_filter_H_all
-from fft_code.filter_coeff import build_filter_coefficients
+from fft_code.filter_coeff import build_filter_coefficients, make_filter_func
 from fft_code.rayleigh_ritz import svd_rayleigh_ritz
 from fft_code.potentials   import build_potential_from_config
 from fft_code.plotting     import (
     plot_filter_interpolation,
+    plot_window_comparison,
     plot_filtered_energies,
     plot_energy_levels,
     plot_energy_errors,
@@ -122,6 +123,21 @@ CONFIG: Dict[str, Any] = {
     "dE": 50.0,             # 根据实际 H_max 调整
     "Vmin": -5.0,           # 根据实际 V_min 调整
     "El_list": list(np.arange(-0.7, -0.6, 0.1).tolist()),
+
+    # ---------- 窗函数类型 ----------
+    # "gaussian" : 经典高斯，宽度由 dt=(nc/(dE×2.5))² 决定（窄 → 高 nc）
+    # "gabor"    : 高斯包络 × sin 调制，宽度由 alpha_f 控制（宽 → 低 nc）
+    #              f(x) = exp(-alpha_f*(x-El)²) · sin(k_f*x)
+    "filter_type": "gaussian",   # "gaussian" | "gabor"
+    "alpha_f": 0.5,              # Gabor 高斯包络参数（sigma=1/sqrt(2*alpha_f) Hartree）
+    "k_f": 1.0,                  # Gabor 正弦调制频率（Hartree⁻¹）
+
+    # ---------- 窗函数对比绘图 ----------
+    # 若 plot_window_bands 非空，在 window_comparison.png 中标记目标频带和 gap
+    "plot_window_bands": {
+        "target": [-0.22, -0.13],   # 感兴趣的本征值区间（绿色阴影）
+        "gap":    [-0.20, -0.15],   # 无本征值的 gap（红色阴影）
+    },
 
     # ---------- 随机态 ----------
     "n_random": 40,
@@ -253,23 +269,63 @@ def run(cfg: Dict[str, Any]) -> None:
     print("\n2. Building filter coefficients ...")
     t0 = time.perf_counter()
 
-    El_list = np.array(cfg["El_list"], dtype=float)
-    nc      = cfg["nc"]
-    dt      = cfg["dt"]
-    par     = PhysParams(dE=cfg["dE"], Vmin=cfg["Vmin"], dt=dt)
-    ist     = IstParams(nc=nc, ms=len(El_list))
+    El_list     = np.array(cfg["El_list"], dtype=float)
+    nc          = cfg["nc"]
+    dt          = cfg["dt"]
+    filter_type = cfg.get("filter_type", "gaussian")
+    alpha_f     = cfg.get("alpha_f", 0.5)
+    k_f         = cfg.get("k_f", 1.0)
+    par         = PhysParams(dE=cfg["dE"], Vmin=cfg["Vmin"], dt=dt)
+    ist         = IstParams(nc=nc, ms=len(El_list))
+
+    # 构造窗函数
+    filter_func = make_filter_func(filter_type, dt=dt, alpha_f=alpha_f, k_f=k_f)
 
     print(f"   nc={nc},  dE={par.dE},  Vmin={par.Vmin},  dt={dt:.4f}")
-    print(f"   sigma = {1/np.sqrt(2*dt):.4f}")
+    print(f"   Filter type : {filter_type}")
+    if filter_type == "gaussian":
+        print(f"   sigma (Gaussian) = {1/np.sqrt(2*dt):.6f} Hartree")
+        filter_label = f"Gaussian (sigma={1/np.sqrt(2*dt):.4f})"
+    elif filter_type == "gabor":
+        sigma_gabor = 1.0 / np.sqrt(2.0 * alpha_f)
+        print(f"   alpha_f = {alpha_f},  k_f = {k_f}")
+        print(f"   sigma (Gabor envelope) = {sigma_gabor:.4f} Hartree")
+        filter_label = f"Gabor (alpha_f={alpha_f}, k_f={k_f})"
+    else:
+        filter_label = filter_type
     print(f"   Number of filter centres: {len(El_list)}")
 
-    an, samp = build_filter_coefficients(El_list, par, nc)
+    an, samp = build_filter_coefficients(El_list, par, nc, filter_func=filter_func)
 
     timings["build_filter"] = time.perf_counter() - t0
     print(f"   Time: {timings['build_filter']:.3f} s")
 
     interval = tuple(cfg["plot_interval"])
-    plot_filter_interpolation(El_list, an, samp, par, interval, out_dir)
+
+    # 窗函数 vs Newton 插值对比图
+    plot_filter_interpolation(El_list, an, samp, par, interval, out_dir,
+                              filter_func=filter_func, filter_label=filter_label)
+
+    # 多种窗函数形状对比图（帮助直观比较 gaussian / gabor 宽度差异）
+    bands     = cfg.get("plot_window_bands", {})
+    target    = bands.get("target", None)
+    gap       = bands.get("gap",    None)
+    # 构造对比所用的两条曲线：当前使用的窗 + 另一种窗（仅当两者不同时才添加对比）
+    cmp_funcs: Dict[str, Any] = {filter_label: filter_func}
+    if filter_type == "gaussian":
+        from fft_code.filter_coeff import _filt_func_gabor
+        cmp_funcs["Gabor (alpha_f=0.5, k_f=1.0) [参考]"] = (
+            lambda x, El: _filt_func_gabor(x, El, 0.5, 1.0)
+        )
+    elif filter_type == "gabor":
+        from fft_code.filter_coeff import _filt_func_gaussian
+        cmp_funcs[f"Gaussian (sigma={1/np.sqrt(2*dt):.4f}) [参考]"] = (
+            lambda x, El: _filt_func_gaussian(x, El, dt)
+        )
+    plot_window_comparison(El_list, par, interval, out_dir,
+                           window_funcs=cmp_funcs,
+                           highlight_band=target,
+                           gap_band=gap)
 
     # ================================================================
     # 4. 滤波随机态
@@ -361,9 +417,13 @@ def run(cfg: Dict[str, Any]) -> None:
             "V_mean": float(V.mean()),
         },
         "filter": {
+            "filter_type": filter_type,
             "nc":     nc,
             "dt":     dt,
-            "sigma":  float(1 / np.sqrt(2 * dt)),
+            "sigma_gaussian": float(1 / np.sqrt(2 * dt)),
+            **({"alpha_f": alpha_f, "k_f": k_f,
+                "sigma_gabor": float(1 / np.sqrt(2 * alpha_f))}
+               if filter_type == "gabor" else {}),
             "El_list": El_list.tolist(),
             "E_mean": E_mean,
             "E_std":  E_std,
