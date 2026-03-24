@@ -127,7 +127,7 @@ CONFIG: Dict[str, Any] = {
     # ---------- 窗函数类型 ----------
     # "gaussian" : 经典高斯，宽度由 dt=(nc/(dE×2.5))² 决定（窄 → 高 nc）
     # "gabor"    : 超高斯包络 × cos 调制，关于 El 对称，宽度由 alpha_f/n0 控制
-    #              f(x) = exp(-alpha_f*(x-El)**n0) · cos(k_f*(x-El))
+    #              f(x) = exp(-alpha_f*|x-El|**n0) · cos(k_f*(x-El))
     #              n0=2 → 普通高斯包络；n0>2 → 超高斯（平顶更宽、边沿更陡）
     "filter_type": "gabor",   # "gaussian" | "gabor"
     "alpha_f": 45.0,             # Gabor 包络衰减系数
