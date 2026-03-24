@@ -47,6 +47,7 @@ def _parse_method_spec(method_str: str) -> Tuple[str, str]:
     if len(parts) == 1:
         m = parts[0].lower()
         if m == "cgmin": return "fft_dvr", m
+        if m == "jdqmr": return "fft_dvr", m   # jdqmr 默认使用 FFT 离散化
         if m in ["gd", "lobpcg", "davidson", "jd"]: return "sinc_dvr", m
         return m, "lanczos"
     return parts[0].lower(), parts[1]
@@ -694,7 +695,8 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
         p_map = {
             "gd": "PRIMME_GD",
             "davidson": "PRIMME_DEFAULT_METHOD",
-            "jd": "PRIMME_JDQMR"
+            "jd": "PRIMME_JDQMR",
+            "jdqmr": "PRIMME_JDQMR",
         }
         
         actual_method = solver_method if solver_method.upper().startswith("PRIMME_") else \
