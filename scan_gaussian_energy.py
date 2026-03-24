@@ -70,8 +70,8 @@ def parse_args():
                    help="扫描终止能量（含，默认 0.20）")
     p.add_argument("--e_step",     type=float, default=0.002,
                    help="扫描间隔（默认 0.002）")
-    p.add_argument("--n",          type=int,   default=20,
-                   help="每轴网格点数（默认 20）")
+    p.add_argument("--n",          type=int,   default=64,
+                   help="每轴网格点数（默认 64）")
     p.add_argument("--r_cut",      type=float, default=7.0,
                    help="Gaussian 截断半径（Angstrom，默认 7.0）")
     p.add_argument("--cube_file",  type=str,   default="localPot.cube",
