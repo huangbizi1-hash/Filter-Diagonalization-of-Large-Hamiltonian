@@ -343,9 +343,13 @@ def cg_minimize_folded(
             print(f"  it={it:4d}: f={f0:.6e}, ||g||={gnorm:.3e}, "
                   f"theta={theta:.3e}, E≈{E_ritz:.10f}")
 
-    E_final = float(np.dot(x, Hv(x)))
+    Hx = Hv(x)
+    E_final = float(np.dot(x, Hx))
+    eig_res  = float(np.linalg.norm(Hx - E_final * x))          # ||Hx - E_ritz x||
+    fold_res = float(np.linalg.norm(Hx - E_target * x))         # ||(H - target I)x||
     return {"x": x, "E_ritz": E_final, "history": hist,
-            "n_iter": n_iter, "converged": converged, "conv_reason": conv_reason}
+            "n_iter": n_iter, "converged": converged, "conv_reason": conv_reason,
+            "eig_res": eig_res, "fold_res": fold_res}
 
 
 # ---------------------------

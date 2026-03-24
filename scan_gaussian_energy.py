@@ -135,8 +135,9 @@ def main():
     # ── 扫描 ────────────────────────────────────
     print(f"\n开始扫描（共 {len(targets)} 个目标）...")
     print(f"\n  {'E_target':>10}  {'E_ritz':>12}  {'|E_ritz-E_t|':>13}  "
+          f"{'eig_res':>10}  {'fold_res':>10}  "
           f"{'n_iter':>7}  {'收敛':>5}  {'原因':<20}  {'耗时':>7}")
-    print(f"  {'-'*90}")
+    print(f"  {'-'*115}")
 
     results = []
     rng = np.random.default_rng(42)
@@ -156,11 +157,15 @@ def main():
         t_it = time.perf_counter() - t0
         E_r = cg_res["E_ritz"]
         diff = abs(E_r - float(E_t))
+        eig_res  = cg_res["eig_res"]   # ||Hx - E_ritz x||
+        fold_res = cg_res["fold_res"]  # ||(H - target I)x||
 
         results.append({
             "E_target":    float(E_t),
             "E_ritz":      E_r,
             "diff":        diff,
+            "eig_res":     eig_res,
+            "fold_res":    fold_res,
             "n_iter":      cg_res["n_iter"],
             "converged":   cg_res["converged"],
             "conv_reason": cg_res["conv_reason"],
@@ -169,6 +174,7 @@ def main():
 
         conv_mark = "✓" if cg_res["converged"] else "✗"
         print(f"  {E_t:>10.4f}  {E_r:>12.6f}  {diff:>13.4e}  "
+              f"{eig_res:>10.3e}  {fold_res:>10.3e}  "
               f"{cg_res['n_iter']:>7d}  {conv_mark:>5}  "
               f"{cg_res['conv_reason']:<20}  {t_it:>6.1f}s")
 
