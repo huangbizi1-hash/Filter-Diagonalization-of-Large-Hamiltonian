@@ -25,6 +25,16 @@ build_filter_coefficients — 构建 Newton 插值系数矩阵
     特点：余弦形式使滤波窗关于 El 严格偶对称；超高斯包络（n0=4）在目标
     区间内响应更平坦，边沿截止更锐利。
 
+"bandpass"
+    平滑带通窗（双 tanh 差分），关于 El 对称：
+        w(x) = 0.5·[tanh(β·(x-EL)) - tanh(β·(x-ER))]
+    其中 EL = El - E1，ER = El + E1。
+    参数：
+        beta (float, 默认 10.0)：边沿陡峭程度（越大截止越锐利）。
+        E1   (float, 默认 0.05)：带通半宽（Hartree），即窗口覆盖 [El-E1, El+E1]。
+    特点：在 [El-E1, El+E1] 内响应近似为 1，在 El±E1 处以 tanh 平滑过渡到 0；
+    无余弦震荡，适合直接截取能量区间。
+
     filter_func 签名：filter_func(x_phys: np.ndarray, El: float) -> np.ndarray
 """
 from typing import Callable, Optional, Tuple
@@ -47,6 +57,14 @@ def _filt_func_gabor(x_phys: np.ndarray, El: float,
                      alpha_f: float, k_f: float, n0: int = 4) -> np.ndarray:
     """超高斯 Gabor 窗：exp(-alpha_f·|x-El|^n0)·cos(k_f·(x-El))，关于 El 对称"""
     return np.exp(-alpha_f * np.abs(x_phys - El) ** n0) * np.cos(k_f * (x_phys - El))
+
+
+def _filt_func_bandpass(x_phys: np.ndarray, El: float,
+                        beta: float, E1: float) -> np.ndarray:
+    """平滑带通窗：0.5·[tanh(β(x-EL)) - tanh(β(x-ER))]，EL=El-E1，ER=El+E1"""
+    EL = El - E1
+    ER = El + E1
+    return 0.5 * (np.tanh(beta * (x_phys - EL)) - np.tanh(beta * (x_phys - ER)))
 
 
 def _samp_points_ashkenazy(min_val: float, max_val: float, nc: int) -> np.ndarray:
@@ -141,26 +159,32 @@ def make_filter_func(filter_type: str,
                      dt: float = 1.0,
                      alpha_f: float = 0.5,
                      k_f: float = 1.0,
-                     n0: int = 4) -> Callable:
+                     n0: int = 4,
+                     beta: float = 10.0,
+                     E1: float = 0.05) -> Callable:
     """
     返回 filter_func(x_phys, El) -> np.ndarray。
 
     参数
     ----
-    filter_type : "gaussian" 或 "gabor"
+    filter_type : "gaussian"、"gabor" 或 "bandpass"
     dt          : 高斯参数（仅 filter_type="gaussian" 使用）
     alpha_f     : Gabor 包络衰减系数（仅 filter_type="gabor" 使用）
     k_f         : Gabor 余弦调制频率（仅 filter_type="gabor" 使用）
     n0          : Gabor 包络指数（仅 filter_type="gabor" 使用，默认 4）
+    beta        : 带通窗边沿陡峭系数（仅 filter_type="bandpass" 使用，默认 10.0）
+    E1          : 带通窗半宽（仅 filter_type="bandpass" 使用，默认 0.05 Hartree）
     """
     if filter_type == "gaussian":
         return lambda x, El: _filt_func_gaussian(x, El, dt)
     elif filter_type == "gabor":
         return lambda x, El: _filt_func_gabor(x, El, alpha_f, k_f, n0)
+    elif filter_type == "bandpass":
+        return lambda x, El: _filt_func_bandpass(x, El, beta, E1)
     else:
         raise ValueError(
             f"Unknown filter_type={filter_type!r}. "
-            "Supported: 'gaussian', 'gabor'."
+            "Supported: 'gaussian', 'gabor', 'bandpass'."
         )
 
 

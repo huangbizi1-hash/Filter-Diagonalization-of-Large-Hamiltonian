@@ -129,10 +129,16 @@ CONFIG: Dict[str, Any] = {
     # "gabor"    : 超高斯包络 × cos 调制，关于 El 对称，宽度由 alpha_f/n0 控制
     #              f(x) = exp(-alpha_f*|x-El|**n0) · cos(k_f*(x-El))
     #              n0=2 → 普通高斯包络；n0>2 → 超高斯（平顶更宽、边沿更陡）
-    "filter_type": "gabor",   # "gaussian" | "gabor"
+    # "bandpass" : 平滑带通窗（双 tanh 差分），关于 El 对称
+    #              w(x) = 0.5·[tanh(β(x-EL)) - tanh(β(x-ER))]
+    #              EL = El - E1，ER = El + E1
+    #              beta 越大截止越锐利；E1 为带通半宽（Hartree）
+    "filter_type": "gabor",   # "gaussian" | "gabor" | "bandpass"
     "alpha_f": 45.0,             # Gabor 包络衰减系数
     "k_f": 20.0,                 # Gabor 余弦调制频率（Hartree⁻¹）
     "n0": 4,                     # Gabor 包络指数（n0=2 普通高斯，n0=4 超高斯）
+    "beta": 10.0,                # 带通窗边沿陡峭系数（仅 bandpass 使用）
+    "E1": 0.05,                  # 带通窗半宽（Hartree，仅 bandpass 使用）
 
     # ---------- 窗函数对比绘图 ----------
     # 若 plot_window_bands 非空，在 window_comparison.png 中标记目标频带和 gap
@@ -278,11 +284,14 @@ def run(cfg: Dict[str, Any]) -> None:
     alpha_f     = cfg.get("alpha_f", 0.5)
     k_f         = cfg.get("k_f", 1.0)
     n0          = cfg.get("n0", 4)
+    beta        = cfg.get("beta", 10.0)
+    E1          = cfg.get("E1", 0.05)
     par         = PhysParams(dE=cfg["dE"], Vmin=cfg["Vmin"], dt=dt)
     ist         = IstParams(nc=nc, ms=len(El_list))
 
     # 构造窗函数
-    filter_func = make_filter_func(filter_type, dt=dt, alpha_f=alpha_f, k_f=k_f, n0=n0)
+    filter_func = make_filter_func(
+        filter_type, dt=dt, alpha_f=alpha_f, k_f=k_f, n0=n0, beta=beta, E1=E1)
 
     print(f"   nc={nc},  dE={par.dE},  Vmin={par.Vmin},  dt={dt:.4f}")
     print(f"   Filter type : {filter_type}")
@@ -292,6 +301,9 @@ def run(cfg: Dict[str, Any]) -> None:
     elif filter_type == "gabor":
         print(f"   alpha_f = {alpha_f},  k_f = {k_f},  n0 = {n0}")
         filter_label = f"Gabor (alpha_f={alpha_f}, k_f={k_f}, n0={n0})"
+    elif filter_type == "bandpass":
+        print(f"   beta = {beta},  E1 = {E1}  →  半带宽 ±{E1} Hartree")
+        filter_label = f"Bandpass (beta={beta}, E1={E1})"
     else:
         filter_label = filter_type
     print(f"   Number of filter centres: {len(El_list)}")
@@ -319,6 +331,11 @@ def run(cfg: Dict[str, Any]) -> None:
             lambda x, El: _filt_func_gabor(x, El, 0.5, 1.0, 4)
         )
     elif filter_type == "gabor":
+        from fft_code.filter_coeff import _filt_func_gaussian
+        cmp_funcs[f"Gaussian (sigma={1/np.sqrt(2*dt):.4f}) [参考]"] = (
+            lambda x, El: _filt_func_gaussian(x, El, dt)
+        )
+    elif filter_type == "bandpass":
         from fft_code.filter_coeff import _filt_func_gaussian
         cmp_funcs[f"Gaussian (sigma={1/np.sqrt(2*dt):.4f}) [参考]"] = (
             lambda x, El: _filt_func_gaussian(x, El, dt)
@@ -424,6 +441,8 @@ def run(cfg: Dict[str, Any]) -> None:
             "sigma_gaussian": float(1 / np.sqrt(2 * dt)),
             **({"alpha_f": alpha_f, "k_f": k_f, "n0": n0}
                if filter_type == "gabor" else {}),
+            **({"beta": beta, "E1": E1}
+               if filter_type == "bandpass" else {}),
             "El_list": El_list.tolist(),
             "E_mean": E_mean,
             "E_std":  E_std,
