@@ -58,6 +58,8 @@ def parse_args():
     )
     p.add_argument("--delta_e",    type=float, default=5e-4,
                    help="能量收敛阈值 |ΔE|（默认 5e-4）")
+    p.add_argument("--tolerance",  type=float, default=0.003,
+                   help="候选本征值筛选阈值 |E_ritz-E_target|（默认 0.003）")
     p.add_argument("--maxiter",    type=int,   default=2000,
                    help="最大迭代次数（默认 2000）")
     p.add_argument("--e_targets",  type=float, nargs="+", default=None,
@@ -185,14 +187,14 @@ def main():
     print(f"  平均每个目标：{t_total/len(targets):.1f}s")
 
     # 找出接近自身 E_target 的结果（|E_ritz - E_target| < 5*delta_e，候选本征值）
-    candidates = [r for r in results if r["diff"] < 5 * args.delta_e]
+    candidates = [r for r in results if r["diff"] < args.tolerance]
     if candidates:
-        print(f"\n候选本征值（|E_ritz - E_target| < {5*args.delta_e:.3e}）：")
+        print(f"\n候选本征值（|E_ritz - E_target| < {args.tolerance:.3e}）：")
         for r in candidates:
             print(f"  E_target={r['E_target']:>8.4f}  E_ritz={r['E_ritz']:>10.6f}  "
                   f"diff={r['diff']:.3e}")
     else:
-        print(f"\n未找到与目标相差 < {5*args.delta_e:.3e} 的候选本征值。")
+        print(f"\n未找到与目标相差 < {args.tolerance:.3e} 的候选本征值。")
 
     # ── 保存 ────────────────────────────────────
     if args.output:
