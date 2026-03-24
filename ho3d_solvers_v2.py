@@ -550,7 +550,7 @@ def build_3d_fft_operator(N: int, potential_grid: Optional[PotentialGrid] = None
 # 核心求解器（增强版）
 # ---------------------------
 
-def solve_ho3d(method_spec: str, N: int, n_levels: int, 
+def solve_ho3d(method_spec: str, N: int, n_levels: int,
                potential_grid: Optional[PotentialGrid] = None,
                L: float = 5.0,
                target: Optional[float] = None,
@@ -756,6 +756,10 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
         "mode": mode,
         "used_v0": used_v0,
         "spatial_range": (x_min, x_max),  # 记录实际使用的空间范围
+        "n_levels": n_levels,
+        "maxBlockSize": maxBlockSize,
+        "target": target,
+        "ncv": ncv_value if "ncv_value" in locals() else None,
     })
 
 # ---------------------------
