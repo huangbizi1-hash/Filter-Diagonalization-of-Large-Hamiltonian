@@ -152,7 +152,7 @@ def main():
     print(header)
     print(f"  {'-'*80}")
 
-    verbosity = 3 if args.verbose else 0
+    verbosity = 3 if args.verbose else 0   # maps to primme printLevel
     results = []
     t_scan_start = time.perf_counter()
 
@@ -165,7 +165,7 @@ def main():
                 which=float(E_t),
                 method="PRIMME_JDQMR",
                 tol=args.tol,
-                verbosity=verbosity,
+                printLevel=verbosity,
             )
             evals = np.sort(evals)
             min_diff = float(np.min(np.abs(evals - E_t)))
