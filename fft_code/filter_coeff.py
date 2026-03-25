@@ -68,7 +68,12 @@ def _filt_func_bandpass(x_phys: np.ndarray, El: float,
 
 
 def _samp_points_ashkenazy(min_val: float, max_val: float, nc: int) -> np.ndarray:
-    """Ashkenazy 最优采样节点（贪心最大化行列式）。"""
+    """Ashkenazy 最优采样节点（贪心最大化 Vandermonde 行列式）。
+
+    算法：在 32*nc 个均匀候选点中贪心地选 nc 个，每步选使
+    log|Vandermonde 行列式| 增量最大的候选点。结果近似于
+    Chebyshev 节点（两端密、中间稀），Lebesgue 常数为 O(log nc)。
+    """
     nc3  = 32 * nc
     samp = (min_val + np.arange(nc3) * (max_val - min_val) / (nc3 - 1)).astype(complex)
     point = np.zeros(nc, dtype=complex)
@@ -81,6 +86,76 @@ def _samp_points_ashkenazy(min_val: float, max_val: float, nc: int) -> np.ndarra
         dv   = (samp.real - point[j].real)**2 + (samp.imag - point[j].imag)**2
         veca = np.where(dv < 1e-10, -1e30, veca + np.log(dv))
     return point.real
+
+
+def _samp_points_chebyshev(min_val: float, max_val: float, nc: int) -> np.ndarray:
+    """第一类 Chebyshev 节点，映射到 [min_val, max_val]。
+
+    x_k = cos((2k+1)π/(2n))，k=0..n-1，两端密、中间稀。
+    最小化插值误差上界的节点分布，Lebesgue 常数 ~ (2/π)·log(n)。
+    """
+    k = np.arange(nc)
+    # cos((2k+1)π/(2n)) 在 [-1,1] 上升序排列（k 从大到小对应升序）
+    nodes_unit = np.cos((2 * (nc - 1 - k) + 1) * np.pi / (2 * nc))
+    return 0.5 * (min_val + max_val) + 0.5 * (max_val - min_val) * nodes_unit
+
+
+def _samp_points_derivative_adapted(
+        min_val: float, max_val: float, nc: int,
+        El_list_phys: np.ndarray,
+        E1: float,
+        beta: float,
+        Vmin: float,
+        dE: float,
+        bg_frac: float = 0.2,
+) -> np.ndarray:
+    """基于带通窗导数的反 CDF 自适应采样节点。
+
+    原理
+    ----
+    带通窗 w(x) = 0.5·[tanh(β(x-EL)) - tanh(β(x-ER))] 的导数为：
+        |dw/dx| ∝ sech²(β(x-EL)) + sech²(β(x-ER))
+    两个 sech² 峰分别集中在过渡点 EL=El-E1 和 ER=El+E1 附近，
+    宽度约 4/β（β 越大过渡越陡，峰越窄）。
+
+    算法：以 |dw/dx| + 均匀背景 构造概率密度，对 CDF 反函数均匀采样，
+    使过渡区密集放点，通带顶部（函数≈1）和远端衰减区（函数≈0）放较少点。
+
+    参数
+    ----
+    El_list_phys : 所有滤波中心的物理坐标（所有窗共享同一套节点，
+                   密度取各 El 对应 sech² 之和）
+    E1           : 带通半宽（Hartree）
+    beta         : tanh 过渡陡峭系数
+    Vmin         : 物理坐标最小值（scaled→physical 转换用）
+    dE           : 能量范围（physical 坐标跨度）
+    bg_frac      : 均匀背景占比（0 = 纯自适应；0.2 = 20% 均匀背景）。
+                   适当背景保证远端衰减区（函数已为 0）也有几个节点，
+                   避免插值在域边界外推失控。
+    """
+    n_fine = 8000
+    s_fine = np.linspace(min_val, max_val, n_fine)  # scaled [-2, 2]
+    x_fine = (s_fine + 2.0) * dE / 4.0 + Vmin       # physical
+
+    # 密度 = 各 El 对应两个过渡点的 sech² 之和
+    density = np.zeros(n_fine)
+    for El in El_list_phys:
+        density += 1.0 / np.cosh(beta * (x_fine - (El - E1))) ** 2
+        density += 1.0 / np.cosh(beta * (x_fine - (El + E1))) ** 2
+
+    # 归一化后叠加均匀背景
+    peak = density.max()
+    if peak > 0:
+        density /= peak
+    density = (1.0 - bg_frac) * density + bg_frac
+
+    # 梯形积分得 CDF，再均匀采样反 CDF
+    ds = s_fine[1] - s_fine[0]
+    cdf = np.concatenate([[0.0],
+                           np.cumsum(0.5 * (density[:-1] + density[1:]) * ds)])
+    cdf /= cdf[-1]
+    quantiles = (np.arange(nc) + 0.5) / nc
+    return np.interp(quantiles, cdf, s_fine)
 
 
 def _newton_coefficients(x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -197,6 +272,8 @@ def build_filter_coefficients(
         par: PhysParams,
         nc: int,
         filter_func: Optional[Callable] = None,
+        samp_method: str = "ashkenazy",
+        **samp_kw,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     为 El_list 中每个滤波中心构建 Newton 插值系数。
@@ -209,18 +286,47 @@ def build_filter_coefficients(
     filter_func : callable(x_phys, El) -> np.ndarray，可选。
                   若为 None，默认使用高斯滤波（由 par.dt 控制宽度）。
                   可由 make_filter_func() 构造。
+    samp_method : 插值节点选取方式，可选：
+                  "ashkenazy"          — 贪心最大化 Vandermonde 行列式（默认）；
+                  "chebyshev"          — 第一类 Chebyshev 节点，两端密、中间稀；
+                  "derivative_adapted" — 基于带通窗导数 |dw/dx| 的反 CDF 自适应，
+                                         在 EL=El-E1 和 ER=El+E1 过渡区密集放点。
+    **samp_kw   : 传给 derivative_adapted 的额外参数：
+                  E1       (float, 默认 0.05)  — 带通半宽（Hartree）
+                  beta     (float, 默认 10.0)  — tanh 陡峭系数
+                  bg_frac  (float, 默认 0.2)   — 均匀背景占比
 
     返回
     ----
     an   : (ms, nc) 系数矩阵
-    samp : (nc,)    [-2, 2] 区间的 Ashkenazy 节点
+    samp : (nc,)    [-2, 2] 区间的插值节点
     """
     if filter_func is None:
         filter_func = make_filter_func("gaussian", dt=par.dt)
 
     Smin, Smax = -2.0, 2.0
+
+    if samp_method == "ashkenazy":
+        samp = _samp_points_ashkenazy(Smin, Smax, nc)
+    elif samp_method == "chebyshev":
+        samp = _samp_points_chebyshev(Smin, Smax, nc)
+    elif samp_method == "derivative_adapted":
+        samp = _samp_points_derivative_adapted(
+            Smin, Smax, nc,
+            El_list_phys=np.asarray(El_list),
+            E1=samp_kw.get("E1", 0.05),
+            beta=samp_kw.get("beta", 10.0),
+            Vmin=par.Vmin,
+            dE=par.dE,
+            bg_frac=samp_kw.get("bg_frac", 0.2),
+        )
+    else:
+        raise ValueError(
+            f"Unknown samp_method={samp_method!r}. "
+            "Supported: 'ashkenazy', 'chebyshev', 'derivative_adapted'."
+        )
+
     scale  = (Smax - Smin) / par.dE
-    samp   = _samp_points_ashkenazy(Smin, Smax, nc)
     x_phys = (samp + 2.0) / scale + par.Vmin
 
     an = np.zeros((len(El_list), nc))

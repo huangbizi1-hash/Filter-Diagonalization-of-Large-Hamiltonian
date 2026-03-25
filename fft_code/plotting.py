@@ -51,6 +51,10 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
             result += coeffs[j] * basis
         return result
 
+    # 将节点从缩放坐标 [-2, 2] 转换为物理坐标（Hartree）
+    # 转换关系：x_phys = (samp + 2) * dE/4 + Vmin
+    x_nodes = (samp + 2.0) * par.dE / 4.0 + par.Vmin
+
     x_plot = np.linspace(interval[0], interval[1], 1000)
     fig, ax = plt.subplots(figsize=(10, 6))
     for ie, El in enumerate(El_list):
@@ -62,6 +66,15 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
                 label=filter_label if ie == 0 else "")
         ax.plot(x_plot, y_interp, '--', color='red',
                 label=f'Newton interp (nc={len(samp)})' if ie == 0 else "")
+
+    # 在 x 轴底部标注 Newton 插值节点位置（rug plot 风格）
+    y_lo, y_hi = ax.get_ylim()
+    rug_y = y_lo - 0.06 * (y_hi - y_lo)   # 略低于 y 轴下边界
+    ax.plot(x_nodes, np.full_like(x_nodes, rug_y),
+            '|', color='darkorange', markersize=10, markeredgewidth=1.5,
+            label=f'Newton nodes (nc={len(samp)})', clip_on=False)
+    ax.set_ylim(y_lo, y_hi)               # 恢复 ylim，rug 用 clip_on=False 显示
+
     ax.set_xlabel('Energy (Hartree)')
     ax.set_ylabel('f(x)')
     ax.set_title(f'{filter_label} vs Newton Interpolation (nc={len(samp)})')

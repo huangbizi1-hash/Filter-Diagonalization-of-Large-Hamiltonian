@@ -140,6 +140,16 @@ CONFIG: Dict[str, Any] = {
     "beta": 10.0,                # 带通窗边沿陡峭系数（仅 bandpass 使用）
     "E1": 0.05,                  # 带通窗半宽（Hartree，仅 bandpass 使用）
 
+    # ---------- Newton 插值节点选取方式 ----------
+    # "ashkenazy"          : 贪心最大化 Vandermonde 行列式（默认），近似 Chebyshev 分布
+    # "chebyshev"          : 第一类 Chebyshev 节点，两端密、中间稀
+    # "derivative_adapted" : 基于 |dw/dx| 的反 CDF 自适应（仅推荐与 bandpass 配合使用）
+    #                        在 EL=El-E1 和 ER=El+E1 两个 tanh 过渡区密集放点，
+    #                        通带顶部（≈1）和远端衰减区（≈0）少放点
+    "samp_method": "ashkenazy",  # "ashkenazy" | "chebyshev" | "derivative_adapted"
+    # 以下仅在 samp_method="derivative_adapted" 时生效：
+    "deriv_bg_frac": 0.2,        # 均匀背景占比（0=纯自适应；0.2 = 20% 均匀，保证远端衰减区有节点）
+
     # ---------- 窗函数对比绘图 ----------
     # 若 plot_window_bands 非空，在 window_comparison.png 中标记目标频带和 gap
     "plot_window_bands": {
@@ -286,6 +296,7 @@ def run(cfg: Dict[str, Any]) -> None:
     n0          = cfg.get("n0", 4)
     beta        = cfg.get("beta", 10.0)
     E1          = cfg.get("E1", 0.05)
+    samp_method = cfg.get("samp_method", "ashkenazy")
     par         = PhysParams(dE=cfg["dE"], Vmin=cfg["Vmin"], dt=dt)
     ist         = IstParams(nc=nc, ms=len(El_list))
 
@@ -306,9 +317,17 @@ def run(cfg: Dict[str, Any]) -> None:
         filter_label = f"Bandpass (beta={beta}, E1={E1})"
     else:
         filter_label = filter_type
+    print(f"   Sampling method : {samp_method}")
     print(f"   Number of filter centres: {len(El_list)}")
 
-    an, samp = build_filter_coefficients(El_list, par, nc, filter_func=filter_func)
+    # 构建 Newton 插值节点和系数
+    samp_kw = {}
+    if samp_method == "derivative_adapted":
+        samp_kw["E1"]      = E1
+        samp_kw["beta"]    = beta
+        samp_kw["bg_frac"] = cfg.get("deriv_bg_frac", 0.2)
+    an, samp = build_filter_coefficients(El_list, par, nc, filter_func=filter_func,
+                                          samp_method=samp_method, **samp_kw)
 
     timings["build_filter"] = time.perf_counter() - t0
     print(f"   Time: {timings['build_filter']:.3f} s")
