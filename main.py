@@ -603,16 +603,83 @@ def _merge_override(base: Dict[str, Any], override: Dict[str, Any]) -> None:
         base["dt"] = (base["nc"] / (base["dE"] * 2.5)) ** 2
 
 
+def _set_nested(cfg: Dict[str, Any], key_path: str, value: Any) -> None:
+    """将点号分隔的键路径写入 cfg，支持嵌套 dict。
+
+    示例：
+        _set_nested(cfg, "potential.d", 0.6)   → cfg["potential"]["d"] = 0.6
+        _set_nested(cfg, "nc", 500)             → cfg["nc"] = 500
+    """
+    parts = key_path.split(".", 1)
+    if len(parts) == 1:
+        cfg[key_path] = value
+    else:
+        parent, rest = parts
+        if not isinstance(cfg.get(parent), dict):
+            cfg[parent] = {}
+        _set_nested(cfg[parent], rest, value)
+
+
+def _parse_val(s: str) -> Any:
+    """将 --set VALUE 字符串转为 Python 对象。
+
+    优先尝试 JSON 解析（覆盖数字、布尔、列表、dict、null）；
+    若失败则按原始字符串返回，方便传 filter_type=bandpass 这类值。
+    """
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        return s
+
+
 # ============================================================
 # CLI 入口
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="FFT filter-diagonalise solver")
-    parser.add_argument("--cfg",  type=str, default=None,
-                        help="Path to a JSON file that overrides CONFIG")
-    parser.add_argument("--scan", type=str, default=None,
-                        help="Path to a JSON file containing a SCAN list "
-                             "(overrides the in-file SCAN)")
+    parser = argparse.ArgumentParser(
+        description="FFT filter-diagonalise solver",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例（shell 脚本中调参）：
+  # 单次运行，覆盖若干参数
+  python main.py --set nc=500 --set filter_type=bandpass --set "El_list=[-0.2,-0.15,-0.1]"
+
+  # 嵌套键（势能子字典）
+  python main.py --set potential.d=0.6 --set potential.r_cut=8.0
+
+  # 传入外部 JSON 覆盖文件，再额外覆盖单个参数
+  python main.py --cfg base.json --set nc=800
+
+  # 内联 SCAN 列表（无需单独 JSON 文件）
+  python main.py --scan_json '[{"nc":500},{"nc":1000}]'
+
+  # 从外部文件读取 SCAN 列表
+  python main.py --scan my_scan.json
+""",
+    )
+    parser.add_argument(
+        "--cfg", type=str, default=None,
+        help="JSON 文件路径，其内容深度合并覆盖 CONFIG",
+    )
+    parser.add_argument(
+        "--scan", type=str, default=None,
+        help="JSON 文件路径，包含 SCAN 列表（每项为 override dict）",
+    )
+    parser.add_argument(
+        "--scan_json", type=str, default=None,
+        help="内联 JSON 字符串形式的 SCAN 列表，无需单独文件。"
+             "例：'[{\"nc\":500},{\"nc\":1000}]'",
+    )
+    parser.add_argument(
+        "--set", action="append", default=[], metavar="KEY=VALUE",
+        help=(
+            "覆盖单个 CONFIG 键，可重复使用。"
+            "VALUE 先按 JSON 解析（数字/bool/列表/null），失败则当字符串。"
+            "支持点号嵌套键，如 potential.d=0.6。"
+            "示例：--set nc=500  --set filter_type=bandpass  "
+            "--set \"El_list=[-0.2,-0.15]\"  --set potential.d=0.6"
+        ),
+    )
     args = parser.parse_args()
 
     # ---- 加载基础 cfg ----
@@ -621,8 +688,20 @@ def main():
         with open(args.cfg, "r") as f:
             _merge_override(base_cfg, json.load(f))
 
+    # ---- 应用 --set 覆盖 ----
+    for kv in args.set:
+        if "=" not in kv:
+            parser.error(f"--set 需要 KEY=VALUE 格式，收到：{kv!r}")
+        key, val_str = kv.split("=", 1)
+        _set_nested(base_cfg, key, _parse_val(val_str))
+    # --set 可能改了 nc/dE，统一重算 dt
+    if args.set:
+        base_cfg["dt"] = (base_cfg["nc"] / (base_cfg["dE"] * 2.5)) ** 2
+
     # ---- 确定 scan 列表 ----
-    if args.scan:
+    if args.scan_json:
+        scan_list = json.loads(args.scan_json)
+    elif args.scan:
         with open(args.scan, "r") as f:
             scan_list = json.load(f)
     else:
@@ -643,7 +722,6 @@ def main():
         cfg = copy.deepcopy(base_cfg)
         _merge_override(cfg, override)
 
-        # tag 只保留序号，参数详情打印到终端
         changed = ", ".join(
             f"{k}={v}" for k, v in override.items() if k != "tag"
         )
