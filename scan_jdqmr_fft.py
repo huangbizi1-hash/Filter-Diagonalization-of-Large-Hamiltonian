@@ -6,6 +6,9 @@ scan_jdqmr_fft.py
 1) 扫描模式（兼容旧流程）：对多个 E_target 分别求解；
 2) 直接模式（新增，推荐）：一次性求出最低 n_levels 个本征值，并筛选 E <= energy_cut。
 
+双网格加速（可选）：指定 --n_coarse N_C 后先在粗网格 N_C 上求解，
+把本征向量插值到细网格 N 作为 JDQMR 初始猜测，可显著减少迭代次数。
+
 示例
 ----
 # 直接模式：一次求 40 个能级，筛选 E <= -0.18
@@ -13,6 +16,9 @@ python scan_jdqmr_fft.py --direct_below --energy_cut -0.18 --n_levels 40
 
 # 扫描模式：兼容旧做法
 python scan_jdqmr_fft.py --e_min -0.25 --e_max 0.2 --e_step 0.002 --n_levels 3
+
+# 双网格：N=32 粗网格预热，N=64 精细求解
+python scan_jdqmr_fft.py --direct_below --energy_cut -0.18 --n_levels 50 --n 64 --n_coarse 32
 """
 
 import argparse
@@ -59,6 +65,11 @@ def parse_args():
     p.add_argument("--maxBlockSize", type=int, default=1,
                    help="PRIMME maxBlockSize（默认 1）")
 
+    # 双网格参数
+    p.add_argument("--n_coarse", type=int, default=None,
+                   help="双网格粗网格点数（不指定则不使用双网格）。"
+                        "先在 n_coarse 上求解，插值结果作为 n 网格的初始猜测。")
+
     # 网格与势能参数
     p.add_argument("--n", type=int, default=64,
                    help="每轴网格点数（默认 64）")
@@ -78,15 +89,17 @@ def parse_args():
     return p.parse_args()
 
 
-def build_potential(args):
-    print("\n加载高斯重构势能...")
+def build_potential(args, n_override=None):
+    """构建势能网格。n_override 可覆盖 args.n（用于粗网格）。"""
+    N = n_override if n_override is not None else args.n
+    print(f"\n加载高斯重构势能（N={N}）...")
     try:
         builder = GaussianPotentialBuilder(
             cube_file=args.cube_file,
             params_file=args.params_file,
             r_cut=args.r_cut,
         )
-        x, y, z, V = builder.build_potential(args.n)
+        x, y, z, V = builder.build_potential(N)
         pot_grid = PotentialGrid(x, y, z, V, source="gaussian_files")
     except FileNotFoundError as e:
         print(f"错误：找不到文件 {e}", file=sys.stderr)
@@ -98,7 +111,47 @@ def build_potential(args):
     return pot_grid
 
 
-def solve_once(pot_grid, args, target=None):
+def _build_coarse_v0(args, target):
+    """
+    双网格：在粗网格 n_coarse 上求解，将本征向量插值到细网格 n。
+
+    返回形状 (n^3, n_levels) 的初始猜测矩阵，或 None（粗求解失败时）。
+    """
+    print(f"\n  [双网格] 粗网格求解（N={args.n_coarse} → N={args.n}）...")
+    t0 = time.perf_counter()
+    pot_coarse = build_potential(args, n_override=args.n_coarse)
+    kwargs = {"tol": args.tol}
+    if args.ncv is not None:
+        kwargs["ncv"] = args.ncv
+    try:
+        res_coarse = solver.solve_ho3d(
+            method_spec="fft_dvr:jdqmr",
+            N=args.n_coarse,
+            n_levels=args.n_levels,
+            potential_grid=pot_coarse,
+            target=target,
+            maxBlockSize=args.maxBlockSize,
+            **kwargs,
+        )
+    except Exception as exc:
+        print(f"  [双网格] 粗网格求解失败：{exc}，将使用随机初始猜测。")
+        return None
+
+    dt = time.perf_counter() - t0
+    print(f"  [双网格] 粗网格完成，耗时 {dt:.1f}s，本征值：{np.round(res_coarse.evals, 6).tolist()}")
+
+    # 将粗网格本征向量插值到细网格
+    evecs_coarse = res_coarse.evecs  # (n_coarse^3, k)
+    v0 = solver.interpolate_eigenvector(
+        evecs_coarse,
+        N_coarse=args.n_coarse,
+        N_fine=args.n,
+        potential_grid=pot_coarse,
+    )
+    return v0  # (n^3, k)
+
+
+def solve_once(pot_grid, args, target=None, v0=None):
     kwargs = {"tol": args.tol}
     if args.ncv is not None:
         kwargs["ncv"] = args.ncv
@@ -109,16 +162,23 @@ def solve_once(pot_grid, args, target=None):
         n_levels=args.n_levels,
         potential_grid=pot_grid,
         target=target,
+        v0=v0,
         maxBlockSize=args.maxBlockSize,
         **kwargs,
     )
 
 
 def run_direct_mode(args, pot_grid):
+    multigrid = args.n_coarse is not None
     print("\n模式：直接模式（一次性求多个能级）")
     print(f"  求解 n_levels={args.n_levels}，筛选 E <= {args.energy_cut:.6f}")
+    if multigrid:
+        print(f"  双网格：粗 N={args.n_coarse} → 细 N={args.n}")
+
+    v0 = _build_coarse_v0(args, target=None) if multigrid else None
+
     t0 = time.perf_counter()
-    res = solve_once(pot_grid, args, target=None)
+    res = solve_once(pot_grid, args, target=None, v0=v0)
     dt = time.perf_counter() - t0
 
     evals = np.array(res.evals, dtype=float)
@@ -141,6 +201,7 @@ def run_direct_mode(args, pot_grid):
 
 
 def run_scan_mode(args, pot_grid):
+    multigrid = args.n_coarse is not None
     print("\n模式：扫描模式（兼容旧流程）")
     if args.e_targets is not None:
         targets = np.array(sorted(args.e_targets))
@@ -151,6 +212,8 @@ def run_scan_mode(args, pot_grid):
     print(f"  扫描目标：{len(targets)} 个，[{targets[0]:.4f}, {targets[-1]:.4f}]")
     print(f"  每个目标求 n_levels={args.n_levels}")
     print(f"  tolerance={args.tolerance:.3e}")
+    if multigrid:
+        print(f"  双网格：粗 N={args.n_coarse} → 细 N={args.n}")
     print(f"\n  {'E_target':>10}  {'E_ritz(s)':>40}  {'min|ΔE|':>10}  {'耗时':>7}")
     print(f"  {'-'*80}")
 
@@ -159,7 +222,8 @@ def run_scan_mode(args, pot_grid):
     for E_t in targets:
         t0 = time.perf_counter()
         try:
-            res = solve_once(pot_grid, args, target=float(E_t))
+            v0 = _build_coarse_v0(args, target=float(E_t)) if multigrid else None
+            res = solve_once(pot_grid, args, target=float(E_t), v0=v0)
             evals = np.array(res.evals, dtype=float)
             min_diff = float(np.min(np.abs(evals - E_t)))
             closest = float(evals[np.argmin(np.abs(evals - E_t))])
@@ -211,6 +275,8 @@ def main():
     print("运行参数：")
     print(f"  method=fft_dvr:jdqmr, N={args.n}, n_levels={args.n_levels}, tol={args.tol}")
     print(f"  ncv={args.ncv}, maxBlockSize={args.maxBlockSize}")
+    if args.n_coarse is not None:
+        print(f"  双网格：n_coarse={args.n_coarse} → n={args.n}")
     if args.job_title:
         print(f"  job_title={args.job_title}")
 
