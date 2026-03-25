@@ -68,11 +68,14 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
                 label=f'Newton interp (nc={len(samp)})' if ie == 0 else "")
 
     # 在 x 轴底部标注 Newton 插值节点位置（rug plot 风格）
+    # 只显示落在当前 interval 内的节点，避免域外节点溢出图框
+    mask = (x_nodes >= interval[0]) & (x_nodes <= interval[1])
+    x_nodes_vis = x_nodes[mask]
     y_lo, y_hi = ax.get_ylim()
     rug_y = y_lo - 0.06 * (y_hi - y_lo)   # 略低于 y 轴下边界
-    ax.plot(x_nodes, np.full_like(x_nodes, rug_y),
+    ax.plot(x_nodes_vis, np.full_like(x_nodes_vis, rug_y),
             '|', color='darkorange', markersize=10, markeredgewidth=1.5,
-            label=f'Newton nodes (nc={len(samp)})', clip_on=False)
+            label=f'Newton nodes ({mask.sum()}/{len(samp)} in view)', clip_on=False)
     ax.set_ylim(y_lo, y_hi)               # 恢复 ylim，rug 用 clip_on=False 显示
 
     ax.set_xlabel('Energy (Hartree)')
