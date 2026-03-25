@@ -164,6 +164,66 @@ def _samp_points_chebyshev(min_val: float, max_val: float, nc: int) -> np.ndarra
     return 0.5 * (min_val + max_val) + 0.5 * (max_val - min_val) * nodes_unit
 
 
+def _samp_points_density_mapped(
+        min_val: float, max_val: float, nc: int,
+        enhance_lo: float, enhance_hi: float,
+        alpha: float = 10.0,
+) -> np.ndarray:
+    """坐标映射法：在 [enhance_lo, enhance_hi] 处生成密集 Chebyshev 节点。
+
+    数学原理
+    --------
+    1. 定义密度函数（高斯峰）：
+           ρ(x) = 1 + α · exp( −((x − m) / w)² )
+       其中 m = (a+b)/2，w = (b−a)/4，α 控制拉伸强度（推荐 5~20）。
+
+    2. 计算累积分布并归一化到 ξ ∈ [0, 1]：
+           Φ(x) = ∫_{min_val}^x ρ(t) dt
+           ξ(x) = Φ(x) / Φ(max_val)
+       由于 ρ 在 [a, b] 较大，Φ 在该区间上升更陡，
+       即小区间 [a, b] 被映射成更宽的 ξ 区间。
+
+    3. 在 ξ ∈ [-1, 1] 生成第一类 Chebyshev 节点（避免 Runge）：
+           ξ_i = cos( (2i + 1)π / (2N) )，i = 0, ..., N−1
+
+    4. 数值逆映射 ξ_i → x_i = Φ⁻¹(ξ_i)（np.interp）。
+
+    结果
+    ----
+    返回 nc 个 x 节点（在 [enhance_lo, enhance_hi] 处密集，其他区域稀疏）。
+    节点顺序与 Chebyshev 余弦公式一致（升序）。
+
+    参数
+    ----
+    min_val / max_val : 全域端点（缩放坐标，通常 -2.0 / 2.0）
+    nc                : 节点总数
+    enhance_lo/hi     : 密集化区间端点（与 min/max 相同坐标系）
+    alpha             : 密度增强强度（默认 10）；越大该区间节点越密
+    """
+    M = max(20_000, 100 * nc)          # 数值积分网格点数
+    x_grid = np.linspace(min_val, max_val, M)
+
+    # 密度函数（高斯形）
+    m   = 0.5 * (enhance_lo + enhance_hi)
+    w   = 0.25 * (enhance_hi - enhance_lo)
+    rho = 1.0 + alpha * np.exp(-((x_grid - m) / w) ** 2)
+
+    # 累积分布（梯形积分），归一化到 [0, 1]
+    dx  = x_grid[1] - x_grid[0]
+    Phi = np.empty(M)
+    Phi[0] = 0.0
+    Phi[1:] = np.cumsum(0.5 * (rho[:-1] + rho[1:]) * dx)
+    Phi /= Phi[-1]
+
+    # Chebyshev 节点在 ξ ∈ [-1, 1]，映射到 [0, 1]
+    i       = np.arange(nc)
+    xi      = np.cos((2 * (nc - 1 - i) + 1) * np.pi / (2 * nc))  # 升序
+    xi_norm = 0.5 * (xi + 1.0)                                     # [0, 1]
+
+    # 逆映射：ξ_norm → x
+    return np.interp(xi_norm, Phi, x_grid)
+
+
 def _samp_points_derivative_adapted(
         min_val: float, max_val: float, nc: int,
         El_list_phys: np.ndarray,
@@ -386,7 +446,13 @@ def build_filter_coefficients(
                               "ashkenazy"          — 贪心最大化 Vandermonde 行列式（默认）；
                               "chebyshev"          — 第一类 Chebyshev 节点，两端密、中间稀；
                               "derivative_adapted" — 基于带通窗导数 |dw/dx| 的反 CDF 自适应，
-                                                     在 EL=El-E1 和 ER=El+E1 过渡区密集放点。
+                                                     在 EL=El-E1 和 ER=El+E1 过渡区密集放点；
+                              "density_mapped"     — 坐标映射法：用高斯密度函数把目标子区间
+                                                     映射成更宽的 ξ 区间，在 ξ 空间取 Chebyshev
+                                                     节点后逆映射回物理空间，保证目标区间节点密集。
+                                                     需额外 samp_kw：
+                                                       density_lo, density_hi (float, 物理坐标 Hartree)
+                                                       density_alpha (float, 默认 10.0) — 密度增强强度
     interval_samp_enhance   : (lo, hi) 物理坐标（Hartree），指定需要加密插值节点的能量区间。
                               若为 None（默认），不做自适应增强。
                               启用后，若所有 El 窗函数的插值最大 MAE > interpolation_tolerance，
@@ -428,10 +494,25 @@ def build_filter_coefficients(
             dE=par.dE,
             bg_frac=samp_kw.get("bg_frac", 0.2),
         )
+    elif samp_method == "density_mapped":
+        # 物理坐标 → 缩放坐标 [-2, 2]
+        d_lo_phys = samp_kw.get("density_lo")
+        d_hi_phys = samp_kw.get("density_hi")
+        if d_lo_phys is None or d_hi_phys is None:
+            raise ValueError(
+                "samp_method='density_mapped' requires samp_kw keys "
+                "'density_lo' and 'density_hi' (physical coords, Hartree)."
+            )
+        d_lo = max(4.0 * (d_lo_phys - par.Vmin) / par.dE - 2.0, Smin)
+        d_hi = min(4.0 * (d_hi_phys - par.Vmin) / par.dE - 2.0, Smax)
+        samp = _samp_points_density_mapped(
+            Smin, Smax, nc, d_lo, d_hi,
+            alpha=samp_kw.get("density_alpha", 10.0),
+        )
     else:
         raise ValueError(
             f"Unknown samp_method={samp_method!r}. "
-            "Supported: 'ashkenazy', 'chebyshev', 'derivative_adapted'."
+            "Supported: 'ashkenazy', 'chebyshev', 'derivative_adapted', 'density_mapped'."
         )
 
     scale = (Smax - Smin) / par.dE

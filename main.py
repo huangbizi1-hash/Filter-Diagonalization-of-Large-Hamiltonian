@@ -146,9 +146,15 @@ CONFIG: Dict[str, Any] = {
     # "derivative_adapted" : 基于 |dw/dx| 的反 CDF 自适应（仅推荐与 bandpass 配合使用）
     #                        在 EL=El-E1 和 ER=El+E1 两个 tanh 过渡区密集放点，
     #                        通带顶部（≈1）和远端衰减区（≈0）少放点
-    "samp_method": "ashkenazy",  # "ashkenazy" | "chebyshev" | "derivative_adapted"
+    "samp_method": "ashkenazy",  # "ashkenazy" | "chebyshev" | "derivative_adapted" | "density_mapped"
     # 以下仅在 samp_method="derivative_adapted" 时生效：
     "deriv_bg_frac": 0.2,        # 均匀背景占比（0=纯自适应；0.2 = 20% 均匀，保证远端衰减区有节点）
+    # 以下仅在 samp_method="density_mapped" 时生效：
+    # density_lo / density_hi : 需要密集采样的物理能量区间（Hartree）
+    # density_alpha           : 密度增强强度 α（推荐 5~20；越大该区间节点越密，其他区域越稀）
+    "density_lo":    -0.22,      # 密集采样区间左端（Hartree）
+    "density_hi":    -0.13,      # 密集采样区间右端（Hartree）
+    "density_alpha": 10.0,       # 密度增强强度 α
 
     # ---------- 窗函数对比绘图 ----------
     # 若 plot_window_bands 非空，在 window_comparison.png 中标记目标频带和 gap
@@ -336,6 +342,10 @@ def run(cfg: Dict[str, Any]) -> None:
         samp_kw["E1"]      = E1
         samp_kw["beta"]    = beta
         samp_kw["bg_frac"] = cfg.get("deriv_bg_frac", 0.2)
+    if samp_method == "density_mapped":
+        samp_kw["density_lo"]    = cfg.get("density_lo",    -0.22)
+        samp_kw["density_hi"]    = cfg.get("density_hi",    -0.13)
+        samp_kw["density_alpha"] = cfg.get("density_alpha", 10.0)
     samp_kw["enhance_density_factor"] = cfg.get("enhance_density_factor", 16)
 
     enhance_interval = cfg.get("interval_samp_enhance", None)
@@ -363,8 +373,16 @@ def run(cfg: Dict[str, Any]) -> None:
     interval = tuple(cfg["plot_interval"])
 
     # 窗函数 vs Newton 插值对比图
+    # 当 density_mapped 时，额外生成一组普通 Chebyshev 节点作为参考，
+    # 在 rug plot 中叠加显示，方便直观确认密度是否增加
+    samp_ref_nodes = None
+    if samp_method == "density_mapped":
+        from fft_code.filter_coeff import _samp_points_chebyshev
+        samp_ref_nodes = _samp_points_chebyshev(-2.0, 2.0, nc_true)
     plot_filter_interpolation(El_list, an, samp, par, interval, out_dir,
-                              filter_func=filter_func, filter_label=filter_label)
+                              filter_func=filter_func, filter_label=filter_label,
+                              samp_ref=samp_ref_nodes,
+                              samp_ref_label=f"plain Chebyshev (nc={nc_true})")
 
     # 多种窗函数形状对比图（帮助直观比较 gaussian / gabor 宽度差异）
     bands     = cfg.get("plot_window_bands", {})

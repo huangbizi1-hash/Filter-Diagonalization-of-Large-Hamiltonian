@@ -27,15 +27,21 @@ def _savefig(fig, path: Path, close: bool = True) -> None:
 def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
                                interval, out_dir: Path,
                                filter_func: Optional[Callable] = None,
-                               filter_label: str = "Filter") -> None:
+                               filter_label: str = "Filter",
+                               samp_ref: Optional[np.ndarray] = None,
+                               samp_ref_label: str = "ref nodes") -> None:
     """
     真实窗函数 vs Newton 多项式插值。
 
     参数
     ----
-    filter_func : callable(x_arr, El) -> y_arr
+    filter_func    : callable(x_arr, El) -> y_arr
         若为 None，默认使用高斯公式 sqrt(dt/π)·exp(-(x-El)²·dt)。
-    filter_label : 图例中真实函数的名称。
+    filter_label   : 图例中真实函数的名称。
+    samp_ref       : 可选，第二组参考节点（缩放坐标 [-2, 2]）。
+        若给定，则在 rug plot 中用不同颜色和 y 偏移同时显示两组节点，
+        方便直观对比节点分布（如普通 Chebyshev vs density-mapped）。
+    samp_ref_label : samp_ref 的图例名称。
     """
     if filter_func is None:
         filter_func = lambda x, El: (
@@ -67,15 +73,34 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
         ax.plot(x_plot, y_interp, '--', color='red',
                 label=f'Newton interp (nc={len(samp)})' if ie == 0 else "")
 
-    # 在 x 轴底部标注 Newton 插值节点位置（rug plot 风格）
+    # ── Rug plot：节点分布可视化 ──────────────────────────────────────
     # 只显示落在当前 interval 内的节点，避免域外节点溢出图框
-    mask = (x_nodes >= interval[0]) & (x_nodes <= interval[1])
-    x_nodes_vis = x_nodes[mask]
     y_lo, y_hi = ax.get_ylim()
-    rug_y = y_lo - 0.06 * (y_hi - y_lo)   # 略低于 y 轴下边界
-    ax.plot(x_nodes_vis, np.full_like(x_nodes_vis, rug_y),
-            '|', color='darkorange', markersize=10, markeredgewidth=1.5,
-            label=f'Newton nodes ({mask.sum()}/{len(samp)} in view)', clip_on=False)
+    rug_span = 0.06 * (y_hi - y_lo)
+
+    if samp_ref is not None:
+        # 两组节点：samp_ref（参考）在下，samp（当前）在上，y 错开
+        x_ref = (samp_ref + 2.0) * par.dE / 4.0 + par.Vmin
+        mask_ref = (x_ref >= interval[0]) & (x_ref <= interval[1])
+        rug_y_ref = y_lo - rug_span           # 下层（参考节点）
+        ax.plot(x_ref[mask_ref], np.full(mask_ref.sum(), rug_y_ref),
+                '|', color='steelblue', markersize=10, markeredgewidth=1.5,
+                label=f'{samp_ref_label} ({mask_ref.sum()}/{len(samp_ref)} in view)',
+                clip_on=False)
+
+        mask = (x_nodes >= interval[0]) & (x_nodes <= interval[1])
+        rug_y = y_lo - 2.0 * rug_span         # 上层（密度映射节点）
+        ax.plot(x_nodes[mask], np.full(mask.sum(), rug_y),
+                '|', color='darkorange', markersize=10, markeredgewidth=1.5,
+                label=f'density-mapped nodes ({mask.sum()}/{len(samp)} in view)',
+                clip_on=False)
+    else:
+        mask = (x_nodes >= interval[0]) & (x_nodes <= interval[1])
+        rug_y = y_lo - rug_span
+        ax.plot(x_nodes[mask], np.full(mask.sum(), rug_y),
+                '|', color='darkorange', markersize=10, markeredgewidth=1.5,
+                label=f'Newton nodes ({mask.sum()}/{len(samp)} in view)', clip_on=False)
+
     ax.set_ylim(y_lo, y_hi)               # 恢复 ylim，rug 用 clip_on=False 显示
 
     ax.set_xlabel('Energy (Hartree)')
