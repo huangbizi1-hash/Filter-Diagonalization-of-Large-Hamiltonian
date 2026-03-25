@@ -88,6 +88,50 @@ def _samp_points_ashkenazy(min_val: float, max_val: float, nc: int) -> np.ndarra
     return point.real
 
 
+def _samp_points_ashkenazy_biased(
+        min_val: float, max_val: float, nc: int,
+        enhance_lo: float, enhance_hi: float,
+        enhance_density_factor: int = 16,
+) -> np.ndarray:
+    """偏置候选池的 Ashkenazy 采样：在 [enhance_lo, enhance_hi] 中放更多候选点。
+
+    原理
+    ----
+    标准 Ashkenazy 在 32*nc 个全域均匀候选点上运行贪心 Vandermonde 最大化。
+    本函数额外在 [enhance_lo, enhance_hi] 内叠加 enhance_density_factor*nc 个均匀候选点，
+    使贪心算法从这个加密区域中自然地多选节点——所选节点集仍由单次贪心优化产生，
+    全局 Lebesgue 常数保持 O(log nc) 量级，不会因拼接异质节点集而振荡。
+
+    参数
+    ----
+    enhance_lo / enhance_hi  : 需要加密的缩放坐标区间端点（[-2, 2] 内）
+    enhance_density_factor   : 加密区间内额外候选点数 = factor * nc（默认 16）
+    """
+    # 全域均匀候选点
+    nc_global = 32 * nc
+    cands_global = np.linspace(min_val, max_val, nc_global)
+    # 加密区间内的额外候选点
+    nc_extra  = enhance_density_factor * nc
+    cands_extra  = np.linspace(enhance_lo, enhance_hi, nc_extra + 2)[1:-1]
+    # 合并去重（以 1e-12 为阈值）
+    cands_all = np.sort(np.concatenate([cands_global, cands_extra]))
+    # 去掉过近的重复候选（两个相邻候选点之差 < 1e-12 时保留一个）
+    keep  = np.concatenate([[True], np.diff(cands_all) > 1e-12])
+    cands = cands_all[keep].astype(complex)
+
+    # 标准 Ashkenazy 贪心算法
+    point = np.zeros(nc, dtype=complex)
+    point[0] = cands[0]
+    dv   = (cands.real - point[0].real) ** 2 + (cands.imag - point[0].imag) ** 2
+    veca = np.where(dv < 1e-10, -1e30, np.log(dv))
+    for j in range(1, nc):
+        kmax     = np.argmax(veca)
+        point[j] = cands[kmax]
+        dv   = (cands.real - point[j].real) ** 2 + (cands.imag - point[j].imag) ** 2
+        veca = np.where(dv < 1e-10, -1e30, veca + np.log(dv))
+    return np.sort(point.real)
+
+
 def _samp_points_chebyshev(min_val: float, max_val: float, nc: int) -> np.ndarray:
     """第一类 Chebyshev 节点，映射到 [min_val, max_val]。
 
@@ -332,10 +376,13 @@ def build_filter_coefficients(
                               对所有 El 窗函数取最大 MAE，低于此值停止增强。
     enhance_step            : 每轮在 interval_samp_enhance 内新增的节点数（默认 10）。
     max_enhance_iters       : 最大增强轮数（默认 30），防止不收敛时无限循环。
-    **samp_kw               : 传给 derivative_adapted 的额外参数：
-                              E1       (float, 默认 0.05)  — 带通半宽（Hartree）
-                              beta     (float, 默认 10.0)  — tanh 陡峭系数
-                              bg_frac  (float, 默认 0.2)   — 均匀背景占比
+    **samp_kw               : 额外关键字参数：
+                              E1                    (float, 默认 0.05) — derivative_adapted 带通半宽
+                              beta                  (float, 默认 10.0) — derivative_adapted tanh 系数
+                              bg_frac               (float, 默认 0.2)  — derivative_adapted 均匀背景占比
+                              enhance_density_factor (int,  默认 16)   — interval_samp_enhance 生效时，
+                                                     加密区间内额外候选点数 = factor × nc_curr，
+                                                     值越大偏置越强（区间内选到的节点越多）
 
     返回
     ----
@@ -379,11 +426,15 @@ def build_filter_coefficients(
     an = _build_an(samp)
 
     # ── 自适应节点增强 ────────────────────────────────────────────────
+    # 关键设计：不拼接两套独立节点（会破坏全局 Lebesgue 最优性导致振荡），
+    # 而是用「偏置候选池 Ashkenazy」——在 interval_samp_enhance 内放更多候选点，
+    # 让贪心算法在全局优化中自然多选该区间，保持 O(log n) Lebesgue 常数。
     if interval_samp_enhance is not None:
         lo_phys, hi_phys = interval_samp_enhance
         # 物理坐标 → 缩放坐标 [-2, 2]
         s_lo = max(4.0 * (lo_phys - par.Vmin) / par.dE - 2.0, Smin)
         s_hi = min(4.0 * (hi_phys - par.Vmin) / par.dE - 2.0, Smax)
+        enhance_density_factor = samp_kw.get("enhance_density_factor", 16)
 
         # 用于误差评估的稠密网格（全域）
         s_eval = np.linspace(Smin, Smax, 2000)
@@ -397,23 +448,24 @@ def build_filter_coefficients(
                 worst    = max(worst, float(np.mean(np.abs(y_true - y_interp))))
             return worst
 
-        samp_base = samp.copy()   # 保留原始 Ashkenazy 节点
-        n_added   = 0
-        mae       = _max_mae(samp, an)
+        mae     = _max_mae(samp, an)
+        nc_curr = nc          # 当前总节点数（从初始 nc 开始逐步增大）
+        n_added = 0
 
         for _ in range(max_enhance_iters):
             if mae <= interpolation_tolerance:
                 break
+            nc_curr += enhance_step
             n_added += enhance_step
-            # 每轮用累计数量重新均匀布点（避免重复添加相同坐标）
-            extra = np.linspace(s_lo, s_hi, n_added + 2)[1:-1]   # n_added 个内部点
-            samp  = np.sort(np.concatenate([samp_base, extra]))
-            an    = _build_an(samp)
-            mae   = _max_mae(samp, an)
+            # 用偏置候选池重新运行 Ashkenazy：全局贪心优化，不拼接异质节点集
+            samp = _samp_points_ashkenazy_biased(
+                Smin, Smax, nc_curr, s_lo, s_hi, enhance_density_factor)
+            an   = _build_an(samp)
+            mae  = _max_mae(samp, an)
 
         if n_added > 0:
-            print(f"   [samp_enhance] added {n_added} nodes in "
-                  f"[{lo_phys}, {hi_phys}] Hartree "
+            print(f"   [samp_enhance] biased-Ashkenazy  +{n_added} nodes "
+                  f"(enhance region [{lo_phys}, {hi_phys}] Hartree) "
                   f"→ nc_true={len(samp)},  max_MAE={mae:.2e}"
                   + ("  ✓" if mae <= interpolation_tolerance
                      else f"  (tolerance {interpolation_tolerance:.1e} not reached)"))

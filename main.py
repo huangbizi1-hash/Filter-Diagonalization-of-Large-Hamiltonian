@@ -180,6 +180,7 @@ CONFIG: Dict[str, Any] = {
     "interpolation_tolerance":  1e-3,            # 插值 MAE 阈值；超过则继续追加节点
     "enhance_step":             10,              # 每轮追加节点数
     "max_enhance_iters":        30,              # 最大增强轮数（防止不收敛）
+    "enhance_density_factor":   16,              # 加密区间候选点密度系数（越大 → 偏置越强）
 
     # ---------- 画图 ----------
     "plot_interval": [-0.4, 0.1],   # 滤波函数绘图能量区间 [E_lo, E_hi]
@@ -335,6 +336,7 @@ def run(cfg: Dict[str, Any]) -> None:
         samp_kw["E1"]      = E1
         samp_kw["beta"]    = beta
         samp_kw["bg_frac"] = cfg.get("deriv_bg_frac", 0.2)
+    samp_kw["enhance_density_factor"] = cfg.get("enhance_density_factor", 16)
 
     enhance_interval = cfg.get("interval_samp_enhance", None)
     if enhance_interval is not None:
