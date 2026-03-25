@@ -180,7 +180,7 @@ CONFIG: Dict[str, Any] = {
     "interpolation_tolerance":  1e-3,            # 插值最大绝对误差阈值；超过则继续追加节点
     "enhance_step":             1,               # 每轮追加节点数
     "max_enhance_iters":        1,               # 最大增强轮数（防止不收敛）
-    "enhance_density_factor":   1,               # 候选点数 = max(factor×enhance_step, 512)，仅在 interval_samp_enhance 内采样（约束 Leja）
+    "enhance_density_factor":   1,               # 加密区间候选点密度系数（越大 → 偏置越强）
 
     # ---------- 画图 ----------
     "plot_interval": [-0.4, 0.1],   # 滤波函数绘图能量区间 [E_lo, E_hi]

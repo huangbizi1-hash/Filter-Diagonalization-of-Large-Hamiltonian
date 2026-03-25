@@ -114,24 +114,17 @@ def _leja_extend(
     ----
     existing_nodes        : 已有的 Ashkenazy/Leja 节点（一维，已排序）
     n_extra               : 需要追加的节点数
-    enhance_lo/enhance_hi : 若给定，候选点被限制在该区间内（约束 Leja），
-                            保证新节点一定落在目标区间里。
-                            （旧方案是全域候选+偏置，但全域 Leja 仍会在区间
-                            已有足够覆盖时选区间外的点，导致 factor 无效。）
-    enhance_density_factor: 区间内候选点数 = max(factor×n_extra, 512)
+    enhance_lo/enhance_hi : 若给定，则在该区间内放加密候选点（偏置 Leja）
+    enhance_density_factor: 加密区间候选点数 = factor * n_extra（默认 16）
     """
     nc_base = len(existing_nodes)
-
+    # 全域均匀候选点（排除已有节点附近）
+    nc_cands = 32 * (nc_base + n_extra)
+    cands = np.linspace(min_val, max_val, nc_cands)
     if enhance_lo is not None and enhance_hi is not None:
-        # 约束模式：候选点仅来自增强区间，保证新节点落在目标区间内。
-        # 全域 Leja 在该区间已有足够覆盖时会选区间外的点；
-        # 约束候选集则直接在目标区间内找 Leja 最优点。
-        nc_cands = max(enhance_density_factor * max(n_extra, 1), 512)
-        cands = np.linspace(enhance_lo, enhance_hi, nc_cands)
-    else:
-        # 无约束模式：全域均匀候选点
-        nc_cands = 32 * (nc_base + n_extra)
-        cands = np.linspace(min_val, max_val, nc_cands)
+        nc_extra_cands = enhance_density_factor * max(n_extra, 1)
+        cands_enh = np.linspace(enhance_lo, enhance_hi, nc_extra_cands + 2)[1:-1]
+        cands = np.sort(np.concatenate([cands, cands_enh]))
 
     # 去重
     cands = cands[np.concatenate([[True], np.diff(cands) > 1e-12])]
