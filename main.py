@@ -413,10 +413,21 @@ def run(cfg: Dict[str, Any]) -> None:
     if samp_method == "density_mapped":
         from fft_code.filter_coeff import _samp_points_chebyshev
         samp_ref_nodes = _samp_points_chebyshev(-2.0, 2.0, nc_true)
+
+    # 当 split_bandpass 时，把高通和低通分量各自的插值质量也画出来，
+    # 避免只画乘积函数导致图与 bandpass 看上去完全相同
+    extra_comps = None
+    if filter_type == "split_bandpass":
+        extra_comps = [
+            (an_hi, make_filter_func("highpass", beta=beta, E1=E1), "Highpass"),
+            (an_lo, make_filter_func("lowpass",  beta=beta, E1=E1), "Lowpass"),
+        ]
+
     plot_filter_interpolation(El_list, an, samp, par, interval, out_dir,
                               filter_func=filter_func, filter_label=filter_label,
                               samp_ref=samp_ref_nodes,
-                              samp_ref_label=f"plain Chebyshev (nc={nc_true})")
+                              samp_ref_label=f"plain Chebyshev (nc={nc_true})",
+                              extra_components=extra_comps)
 
     # 多种窗函数形状对比图（帮助直观比较 gaussian / gabor 宽度差异）
     bands     = cfg.get("plot_window_bands", {})

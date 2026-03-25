@@ -29,19 +29,24 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
                                filter_func: Optional[Callable] = None,
                                filter_label: str = "Filter",
                                samp_ref: Optional[np.ndarray] = None,
-                               samp_ref_label: str = "ref nodes") -> None:
+                               samp_ref_label: str = "ref nodes",
+                               extra_components: Optional[list] = None) -> None:
     """
     真实窗函数 vs Newton 多项式插值。
 
     参数
     ----
-    filter_func    : callable(x_arr, El) -> y_arr
+    filter_func      : callable(x_arr, El) -> y_arr
         若为 None，默认使用高斯公式 sqrt(dt/π)·exp(-(x-El)²·dt)。
-    filter_label   : 图例中真实函数的名称。
-    samp_ref       : 可选，第二组参考节点（缩放坐标 [-2, 2]）。
+    filter_label     : 图例中真实函数的名称。
+    samp_ref         : 可选，第二组参考节点（缩放坐标 [-2, 2]）。
         若给定，则在 rug plot 中用不同颜色和 y 偏移同时显示两组节点，
         方便直观对比节点分布（如普通 Chebyshev vs density-mapped）。
-    samp_ref_label : samp_ref 的图例名称。
+    samp_ref_label   : samp_ref 的图例名称。
+    extra_components : 可选，额外分量列表，每项为 (an_comp, func_comp, label_comp)。
+        用于 split_bandpass 等需要同时展示多个分量插值质量的场景。
+        每个分量用独立颜色对（实线=真实，虚线=Newton 插值）绘制。
+        extra_components 中的分量不参与 rug plot（共用主 samp）。
     """
     if filter_func is None:
         filter_func = lambda x, El: (
@@ -63,6 +68,8 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
 
     x_plot = np.linspace(interval[0], interval[1], 1000)
     fig, ax = plt.subplots(figsize=(10, 6))
+
+    # 主滤波分量（蓝/红）
     for ie, El in enumerate(El_list):
         y_true   = filter_func(x_plot, El)
         y_interp = np.array([_scaled_eval(x, samp, an[ie]) for x in x_plot])
@@ -72,6 +79,23 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
                 label=filter_label if ie == 0 else "")
         ax.plot(x_plot, y_interp, '--', color='red',
                 label=f'Newton interp (nc={len(samp)})' if ie == 0 else "")
+
+    # 额外分量（split_bandpass 的高通/低通等），每个分量用独立颜色对
+    _comp_colors = [('forestgreen', 'darkorange'),
+                    ('purple',      'gold'),
+                    ('teal',        'coral')]
+    if extra_components:
+        for k, (an_c, func_c, label_c) in enumerate(extra_components):
+            c_true, c_interp = _comp_colors[k % len(_comp_colors)]
+            for ie, El in enumerate(El_list):
+                y_true   = func_c(x_plot, El)
+                y_interp = np.array([_scaled_eval(x, samp, an_c[ie]) for x in x_plot])
+                mae = np.mean(np.abs(y_true - y_interp))
+                print(f"  [{label_c}] El={El:.4f}  MAE={mae:.6e}")
+                ax.plot(x_plot, y_true,   color=c_true,
+                        label=label_c if ie == 0 else "")
+                ax.plot(x_plot, y_interp, '--', color=c_interp,
+                        label=f'{label_c} Newton interp' if ie == 0 else "")
 
     # ── Rug plot：节点分布可视化 ──────────────────────────────────────
     # 只显示落在当前 interval 内的节点，避免域外节点溢出图框
