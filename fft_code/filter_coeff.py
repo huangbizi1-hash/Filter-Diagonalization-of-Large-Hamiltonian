@@ -169,7 +169,7 @@ def _samp_points_density_mapped(
         enhance_lo: float, enhance_hi: float,
         alpha: float = 10.0,
 ) -> np.ndarray:
-    """坐标映射法：在 [enhance_lo, enhance_hi] 处生成密集 Chebyshev 节点。
+    """坐标映射法：在 Ashkenazy 基础上于 [enhance_lo, enhance_hi] 处加密节点。
 
     数学原理
     --------
@@ -177,21 +177,20 @@ def _samp_points_density_mapped(
            ρ(x) = 1 + α · exp( −((x − m) / w)² )
        其中 m = (a+b)/2，w = (b−a)/4，α 控制拉伸强度（推荐 5~20）。
 
-    2. 计算累积分布并归一化到 ξ ∈ [0, 1]：
+    2. 计算累积分布并归一化到 ξ ∈ [min_val, max_val]（与 x 同域）：
            Φ(x) = ∫_{min_val}^x ρ(t) dt
-           ξ(x) = Φ(x) / Φ(max_val)
-       由于 ρ 在 [a, b] 较大，Φ 在该区间上升更陡，
-       即小区间 [a, b] 被映射成更宽的 ξ 区间。
+           ξ(x) = min_val + (max_val − min_val) · Φ(x) / Φ(max_val)
+       ρ 在 [a, b] 较大 → Φ 上升更陡 → 小区间 [a, b] 映射成更宽的 ξ 区间。
 
-    3. 在 ξ ∈ [-1, 1] 生成第一类 Chebyshev 节点（避免 Runge）：
-           ξ_i = cos( (2i + 1)π / (2N) )，i = 0, ..., N−1
+    3. 在 ξ 空间运行 Ashkenazy（贪心 Vandermonde 最大化），得到 ξ_i 节点。
+       由于 ξ 空间里 [a, b] 对应的区间更宽，Ashkenazy 会在那里放更多节点。
 
-    4. 数值逆映射 ξ_i → x_i = Φ⁻¹(ξ_i)（np.interp）。
+    4. 数值逆映射 ξ_i → x_i = Φ⁻¹(ξ_i)（np.interp，单调，保持 Ashkenazy 顺序）。
 
-    结果
+    特性
     ----
-    返回 nc 个 x 节点（在 [enhance_lo, enhance_hi] 处密集，其他区域稀疏）。
-    节点顺序与 Chebyshev 余弦公式一致（升序）。
+    - α = 0 时 ρ ≡ 1，ξ = x，退化为纯 Ashkenazy（恒等映射）。
+    - 节点顺序完全继承 Ashkenazy 贪心顺序，不做任何 sort。
 
     参数
     ----
@@ -200,28 +199,28 @@ def _samp_points_density_mapped(
     enhance_lo/hi     : 密集化区间端点（与 min/max 相同坐标系）
     alpha             : 密度增强强度（默认 10）；越大该区间节点越密
     """
-    M = max(20_000, 100 * nc)          # 数值积分网格点数
+    M = max(20_000, 100 * nc)
     x_grid = np.linspace(min_val, max_val, M)
 
-    # 密度函数（高斯形）
+    # 密度函数
     m   = 0.5 * (enhance_lo + enhance_hi)
     w   = 0.25 * (enhance_hi - enhance_lo)
     rho = 1.0 + alpha * np.exp(-((x_grid - m) / w) ** 2)
 
-    # 累积分布（梯形积分），归一化到 [0, 1]
+    # 累积分布（梯形积分），归一化到 [min_val, max_val]
     dx  = x_grid[1] - x_grid[0]
     Phi = np.empty(M)
     Phi[0] = 0.0
     Phi[1:] = np.cumsum(0.5 * (rho[:-1] + rho[1:]) * dx)
     Phi /= Phi[-1]
+    # xi_grid[i] = ξ(x_grid[i])，单调递增，范围 [min_val, max_val]
+    xi_grid = min_val + (max_val - min_val) * Phi
 
-    # Chebyshev 节点在 ξ ∈ [-1, 1]，映射到 [0, 1]
-    i       = np.arange(nc)
-    xi      = np.cos((2 * (nc - 1 - i) + 1) * np.pi / (2 * nc))  # 升序
-    xi_norm = 0.5 * (xi + 1.0)                                     # [0, 1]
+    # Ashkenazy 在 ξ 空间生成节点（贪心 Vandermonde 最大化）
+    xi_nodes = _samp_points_ashkenazy(min_val, max_val, nc)
 
-    # 逆映射：ξ_norm → x
-    return np.interp(xi_norm, Phi, x_grid)
+    # 逆映射 ξ_i → x_i（保持 Ashkenazy 贪心顺序，不 sort）
+    return np.interp(xi_nodes, xi_grid, x_grid)
 
 
 def _samp_points_derivative_adapted(
