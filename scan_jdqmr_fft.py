@@ -19,6 +19,7 @@ import argparse
 import json
 import sys
 import time
+from datetime import datetime
 import numpy as np
 
 import ho3d_solvers_v2 as solver
@@ -72,6 +73,8 @@ def parse_args():
 
     p.add_argument("--output", type=str, default=None,
                    help="JSON 输出路径（默认不保存）")
+    p.add_argument("--job_title", type=str, default="",
+                   help="任务标题，写入 JSON 便于后续识别（默认空）")
     return p.parse_args()
 
 
@@ -204,17 +207,23 @@ def run_scan_mode(args, pot_grid):
 
 def main():
     args = parse_args()
+    start_dt = datetime.now()
     print("运行参数：")
     print(f"  method=fft_dvr:jdqmr, N={args.n}, n_levels={args.n_levels}, tol={args.tol}")
     print(f"  ncv={args.ncv}, maxBlockSize={args.maxBlockSize}")
+    if args.job_title:
+        print(f"  job_title={args.job_title}")
 
     pot_grid = build_potential(args)
     output = run_direct_mode(args, pot_grid) if args.direct_below else run_scan_mode(args, pot_grid)
 
     if args.output:
         output_data = {
-            "params": vars(args),
-            "result": output,
+            "job_title":      args.job_title,
+            "start_datetime": start_dt.isoformat(),
+            "end_datetime":   datetime.now().isoformat(),
+            "params":         vars(args),
+            "result":         output,
         }
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(output_data, f, indent=2, ensure_ascii=False)
