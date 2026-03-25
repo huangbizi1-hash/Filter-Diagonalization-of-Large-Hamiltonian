@@ -146,7 +146,10 @@ def _leja_extend(
         dv            = (cands - cands[kmax]) ** 2
         veca         += np.where(dv < 1e-10, -1e30, np.log(dv))
 
-    return np.sort(np.concatenate([existing_nodes, new_nodes]))
+    # 保持 Leja 顺序：已有节点在前（原贪心顺序），新节点追加在后。
+    # 绝不做 np.sort——Newton 除差系数对节点顺序极为敏感，
+    # Leja/贪心顺序比按坐标排序稳定得多，排序会显著放大高阶系数病态。
+    return np.concatenate([existing_nodes, new_nodes])
 
 
 def _samp_points_chebyshev(min_val: float, max_val: float, nc: int) -> np.ndarray:

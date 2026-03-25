@@ -133,11 +133,11 @@ CONFIG: Dict[str, Any] = {
     #              w(x) = 0.5·[tanh(β(x-EL)) - tanh(β(x-ER))]
     #              EL = El - E1，ER = El + E1
     #              beta 越大截止越锐利；E1 为带通半宽（Hartree）
-    "filter_type": "gabor",   # "gaussian" | "gabor" | "bandpass"
+    "filter_type": "bandpass",   # "gaussian" | "gabor" | "bandpass"
     "alpha_f": 45.0,             # Gabor 包络衰减系数
     "k_f": 20.0,                 # Gabor 余弦调制频率（Hartree⁻¹）
     "n0": 4,                     # Gabor 包络指数（n0=2 普通高斯，n0=4 超高斯）
-    "beta": 10.0,                # 带通窗边沿陡峭系数（仅 bandpass 使用）
+    "beta": 45.0,                # 带通窗边沿陡峭系数（仅 bandpass 使用）
     "E1": 0.05,                  # 带通窗半宽（Hartree，仅 bandpass 使用）
 
     # ---------- Newton 插值节点选取方式 ----------
@@ -177,10 +177,10 @@ CONFIG: Dict[str, Any] = {
     # nc 作为初始估计，实际用到的 nc_true = len(samp) 会在运行时确定并记录。
     # 设为 null（Python None）可完全禁用自适应增强。
     "interval_samp_enhance":    [-0.22, -0.13],  # 需要加密的能量区间 [lo, hi]（Hartree）
-    "interpolation_tolerance":  1e-3,            # 插值 MAE 阈值；超过则继续追加节点
-    "enhance_step":             10,              # 每轮追加节点数
-    "max_enhance_iters":        30,              # 最大增强轮数（防止不收敛）
-    "enhance_density_factor":   16,              # 加密区间候选点密度系数（越大 → 偏置越强）
+    "interpolation_tolerance":  1e-3,            # 插值最大绝对误差阈值；超过则继续追加节点
+    "enhance_step":             1,               # 每轮追加节点数
+    "max_enhance_iters":        1,               # 最大增强轮数（防止不收敛）
+    "enhance_density_factor":   1,               # 加密区间候选点密度系数（越大 → 偏置越强）
 
     # ---------- 画图 ----------
     "plot_interval": [-0.4, 0.1],   # 滤波函数绘图能量区间 [E_lo, E_hi]
