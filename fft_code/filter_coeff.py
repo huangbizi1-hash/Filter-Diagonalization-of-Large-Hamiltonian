@@ -35,6 +35,15 @@ build_filter_coefficients — 构建 Newton 插值系数矩阵
     特点：在 [El-E1, El+E1] 内响应近似为 1，在 El±E1 处以 tanh 平滑过渡到 0；
     无余弦震荡，适合直接截取能量区间。
 
+"split_bandpass"
+    将带通分成高通和低通两个多项式分别拟合、依次作用：
+        w_hi(x) = 0.5·(1 + tanh(β·(x-EL)))   高通，截止 EL = El - E1
+        w_lo(x) = 0.5·(1 - tanh(β·(x-ER)))   低通，截止 ER = El + E1
+    作用顺序：先高通 φ₁ = w_hi(H)|ψ⟩，再低通 φ₂ = w_lo(H)|φ₁⟩。
+    w_hi 和 w_lo 都是 H 的函数（可交换），合力 = w_hi·w_lo ≈ 带通。
+    每个多项式阶数仍为 nc，而非乘积函数所需的 ~2nc，数值更稳定。
+    主要 API：make_filter_func("highpass"/"lowpass") + compute_newton_an。
+
     filter_func 签名：filter_func(x_phys: np.ndarray, El: float) -> np.ndarray
 """
 from typing import Callable, List, Optional, Tuple
@@ -65,6 +74,22 @@ def _filt_func_bandpass(x_phys: np.ndarray, El: float,
     EL = El - E1
     ER = El + E1
     return 0.5 * (np.tanh(beta * (x_phys - EL)) - np.tanh(beta * (x_phys - ER)))
+
+
+def _filt_func_highpass_band(x_phys: np.ndarray, El: float,
+                              beta: float, E1: float) -> np.ndarray:
+    """高通窗（带通左截止）：0.5·(1 + tanh(β(x-EL)))，EL=El-E1。
+    在 x >> EL 时趋向 1，在 x << EL 时趋向 0。"""
+    EL = El - E1
+    return 0.5 * (1.0 + np.tanh(beta * (x_phys - EL)))
+
+
+def _filt_func_lowpass_band(x_phys: np.ndarray, El: float,
+                             beta: float, E1: float) -> np.ndarray:
+    """低通窗（带通右截止）：0.5·(1 - tanh(β(x-ER)))，ER=El+E1。
+    在 x << ER 时趋向 1，在 x >> ER 时趋向 0。"""
+    ER = El + E1
+    return 0.5 * (1.0 - np.tanh(beta * (x_phys - ER)))
 
 
 def _samp_points_ashkenazy(min_val: float, max_val: float, nc: int) -> np.ndarray:
@@ -365,13 +390,16 @@ def make_filter_func(filter_type: str,
 
     参数
     ----
-    filter_type : "gaussian"、"gabor" 或 "bandpass"
+    filter_type : "gaussian"、"gabor"、"bandpass" 或 "split_bandpass"
     dt          : 高斯参数（仅 filter_type="gaussian" 使用）
     alpha_f     : Gabor 包络衰减系数（仅 filter_type="gabor" 使用）
     k_f         : Gabor 余弦调制频率（仅 filter_type="gabor" 使用）
     n0          : Gabor 包络指数（仅 filter_type="gabor" 使用，默认 4）
-    beta        : 带通窗边沿陡峭系数（仅 filter_type="bandpass" 使用，默认 10.0）
-    E1          : 带通窗半宽（仅 filter_type="bandpass" 使用，默认 0.05 Hartree）
+    beta        : 带通窗边沿陡峭系数（bandpass/split_bandpass，默认 10.0）
+    E1          : 带通窗半宽（bandpass/split_bandpass，默认 0.05 Hartree）
+
+    注意：filter_type="split_bandpass" 时返回高通×低通的乘积函数，
+    仅用于绘图对比；实际作用需配合 compute_newton_an 分别拟合两个分量。
     """
     if filter_type == "gaussian":
         return lambda x, El: _filt_func_gaussian(x, El, dt)
@@ -379,11 +407,48 @@ def make_filter_func(filter_type: str,
         return lambda x, El: _filt_func_gabor(x, El, alpha_f, k_f, n0)
     elif filter_type == "bandpass":
         return lambda x, El: _filt_func_bandpass(x, El, beta, E1)
+    elif filter_type == "split_bandpass":
+        # 乘积形式，供绘图/误差评估使用
+        return lambda x, El: (
+            _filt_func_highpass_band(x, El, beta, E1) *
+            _filt_func_lowpass_band(x, El, beta, E1)
+        )
+    elif filter_type == "highpass":
+        return lambda x, El: _filt_func_highpass_band(x, El, beta, E1)
+    elif filter_type == "lowpass":
+        return lambda x, El: _filt_func_lowpass_band(x, El, beta, E1)
     else:
         raise ValueError(
             f"Unknown filter_type={filter_type!r}. "
-            "Supported: 'gaussian', 'gabor', 'bandpass'."
+            "Supported: 'gaussian', 'gabor', 'bandpass', 'split_bandpass'."
         )
+
+
+def compute_newton_an(filter_func: Callable,
+                      El_list: List[float],
+                      samp: np.ndarray,
+                      par: PhysParams) -> np.ndarray:
+    """给定预构建节点 samp，计算 Newton 系数矩阵 an。
+
+    与 build_filter_coefficients 的区别：不重新生成节点，直接使用传入的 samp。
+    用于 split_bandpass 等需要对同一组节点拟合多个函数的场景。
+
+    参数
+    ----
+    filter_func : callable(x_phys, El) -> np.ndarray
+    El_list     : 滤波中心能量列表（物理单位，Hartree）
+    samp        : 已有节点（缩放坐标 [-2, 2]）
+    par         : PhysParams（提供 dE、Vmin）
+
+    返回
+    ----
+    an : (ms, nc) Newton 系数矩阵
+    """
+    xp = (samp + 2.0) * par.dE / 4.0 + par.Vmin   # 缩放坐标 → 物理坐标
+    an = np.zeros((len(El_list), len(samp)))
+    for ie, El in enumerate(El_list):
+        an[ie] = _newton_coefficients(samp, filter_func(xp, El))
+    return an
 
 
 # ──────────────────────────────────────────────

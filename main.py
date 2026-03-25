@@ -83,7 +83,7 @@ matplotlib.use("Agg")
 from fft_code.params       import IstParams, PhysParams
 from fft_code.grid         import build_k_diagonal
 from fft_code.wavefunction import random_sine_psi, normalize_psi
-from fft_code.hamiltonian  import apply_H, apply_filter_H_all
+from fft_code.hamiltonian  import apply_H, apply_filter_H, apply_filter_H_all
 from fft_code.filter_coeff import build_filter_coefficients, make_filter_func
 from fft_code.rayleigh_ritz import svd_rayleigh_ritz
 from fft_code.potentials   import build_potential_from_config
@@ -125,20 +125,27 @@ CONFIG: Dict[str, Any] = {
     "El_list": list(np.arange(-0.2, -0.1, 0.1).tolist()),
 
     # ---------- 窗函数类型 ----------
-    # "gaussian" : 经典高斯，宽度由 dt=(nc/(dE×2.5))² 决定（窄 → 高 nc）
-    # "gabor"    : 超高斯包络 × cos 调制，关于 El 对称，宽度由 alpha_f/n0 控制
-    #              f(x) = exp(-alpha_f*|x-El|**n0) · cos(k_f*(x-El))
-    #              n0=2 → 普通高斯包络；n0>2 → 超高斯（平顶更宽、边沿更陡）
-    # "bandpass" : 平滑带通窗（双 tanh 差分），关于 El 对称
-    #              w(x) = 0.5·[tanh(β(x-EL)) - tanh(β(x-ER))]
-    #              EL = El - E1，ER = El + E1
-    #              beta 越大截止越锐利；E1 为带通半宽（Hartree）
-    "filter_type": "bandpass",   # "gaussian" | "gabor" | "bandpass"
+    # "gaussian"       : 经典高斯，宽度由 dt=(nc/(dE×2.5))² 决定（窄 → 高 nc）
+    # "gabor"          : 超高斯包络 × cos 调制，关于 El 对称，宽度由 alpha_f/n0 控制
+    #                    f(x) = exp(-alpha_f*|x-El|**n0) · cos(k_f*(x-El))
+    #                    n0=2 → 普通高斯包络；n0>2 → 超高斯（平顶更宽、边沿更陡）
+    # "bandpass"       : 平滑带通窗（双 tanh 差分），关于 El 对称
+    #                    w(x) = 0.5·[tanh(β(x-EL)) - tanh(β(x-ER))]
+    #                    EL = El - E1，ER = El + E1
+    #                    beta 越大截止越锐利；E1 为带通半宽（Hartree）
+    # "split_bandpass" : 把带通分成高通和低通两次分别拟合后依次作用：
+    #                    w_hi(x) = 0.5·(1 + tanh(β(x-EL)))   高通（截止 EL=El-E1）
+    #                    w_lo(x) = 0.5·(1 - tanh(β(x-ER)))   低通（截止 ER=El+E1）
+    #                    先作用高通：φ₁ = w_hi(H)|ψ⟩
+    #                    再作用低通：φ₂ = w_lo(H)|φ₁⟩
+    #                    合力 ≈ w_hi·w_lo（两者都是 H 的函数故可交换），
+    #                    但每个多项式阶数为 nc 而非乘积 2nc，数值更稳定。
+    "filter_type": "bandpass",   # "gaussian" | "gabor" | "bandpass" | "split_bandpass"
     "alpha_f": 45.0,             # Gabor 包络衰减系数
     "k_f": 20.0,                 # Gabor 余弦调制频率（Hartree⁻¹）
     "n0": 4,                     # Gabor 包络指数（n0=2 普通高斯，n0=4 超高斯）
-    "beta": 45.0,                # 带通窗边沿陡峭系数（仅 bandpass 使用）
-    "E1": 0.05,                  # 带通窗半宽（Hartree，仅 bandpass 使用）
+    "beta": 45.0,                # 带通窗边沿陡峭系数（仅 bandpass/split_bandpass 使用）
+    "E1": 0.1,                   # 带通窗半宽（Hartree，仅 bandpass/split_bandpass 使用）
 
     # ---------- Newton 插值节点选取方式 ----------
     # "ashkenazy"          : 贪心最大化 Vandermonde 行列式（默认），近似 Chebyshev 分布
@@ -152,9 +159,9 @@ CONFIG: Dict[str, Any] = {
     # 以下仅在 samp_method="density_mapped" 时生效：
     # density_lo / density_hi : 需要密集采样的物理能量区间（Hartree）
     # density_alpha           : 密度增强强度 α（推荐 5~20；越大该区间节点越密，其他区域越稀）
-    "density_lo":    -0.22,      # 密集采样区间左端（Hartree）
-    "density_hi":    -0.13,      # 密集采样区间右端（Hartree）
-    "density_alpha": 10.0,       # 密度增强强度 α
+    "density_lo":    -0.3,       # 密集采样区间左端（Hartree）
+    "density_hi":    -0.0,       # 密集采样区间右端（Hartree）
+    "density_alpha": 0.00,       # 密度增强强度 α
 
     # ---------- 窗函数对比绘图 ----------
     # 若 plot_window_bands 非空，在 window_comparison.png 中标记目标频带和 gap
@@ -185,11 +192,11 @@ CONFIG: Dict[str, Any] = {
     "interval_samp_enhance":    [-0.22, -0.13],  # 需要加密的能量区间 [lo, hi]（Hartree）
     "interpolation_tolerance":  1e-3,            # 插值最大绝对误差阈值；超过则继续追加节点
     "enhance_step":             1,               # 每轮追加节点数
-    "max_enhance_iters":        1,               # 最大增强轮数（防止不收敛）
+    "max_enhance_iters":        0,               # 最大增强轮数（防止不收敛）
     "enhance_density_factor":   1,               # 加密区间候选点密度系数（越大 → 偏置越强）
 
     # ---------- 画图 ----------
-    "plot_interval": [-0.4, 0.1],   # 滤波函数绘图能量区间 [E_lo, E_hi]
+    "plot_interval": [-0.35, 0.0],  # 滤波函数绘图能量区间 [E_lo, E_hi]
 }
 CONFIG["dt"] = (CONFIG["nc"] / (CONFIG["dE"] * 2.5)) ** 2
 
@@ -328,9 +335,12 @@ def run(cfg: Dict[str, Any]) -> None:
     elif filter_type == "gabor":
         print(f"   alpha_f = {alpha_f},  k_f = {k_f},  n0 = {n0}")
         filter_label = f"Gabor (alpha_f={alpha_f}, k_f={k_f}, n0={n0})"
-    elif filter_type == "bandpass":
+    elif filter_type in ("bandpass", "split_bandpass"):
         print(f"   beta = {beta},  E1 = {E1}  →  半带宽 ±{E1} Hartree")
-        filter_label = f"Bandpass (beta={beta}, E1={E1})"
+        if filter_type == "split_bandpass":
+            filter_label = f"SplitBandpass hi×lo (beta={beta}, E1={E1})"
+        else:
+            filter_label = f"Bandpass (beta={beta}, E1={E1})"
     else:
         filter_label = filter_type
     print(f"   Sampling method : {samp_method}")
@@ -351,16 +361,40 @@ def run(cfg: Dict[str, Any]) -> None:
     enhance_interval = cfg.get("interval_samp_enhance", None)
     if enhance_interval is not None:
         enhance_interval = tuple(enhance_interval)
-    an, samp = build_filter_coefficients(
-        El_list, par, nc,
-        filter_func=filter_func,
-        samp_method=samp_method,
-        interval_samp_enhance=enhance_interval,
-        interpolation_tolerance=cfg.get("interpolation_tolerance", 1e-3),
-        enhance_step=cfg.get("enhance_step", 10),
-        max_enhance_iters=cfg.get("max_enhance_iters", 30),
-        **samp_kw,
-    )
+
+    # split_bandpass：拟合高通和低通两个独立多项式，共用同一套节点
+    an_hi = an_lo = None   # 仅 split_bandpass 使用
+    if filter_type == "split_bandpass":
+        from fft_code.filter_coeff import compute_newton_an
+        filter_func_hi = make_filter_func("highpass", beta=beta, E1=E1)
+        filter_func_lo = make_filter_func("lowpass",  beta=beta, E1=E1)
+        # 用高通函数构建节点（节点由 samp_method 决定，与函数形状无关）
+        _, samp = build_filter_coefficients(
+            El_list, par, nc,
+            filter_func=filter_func_hi,
+            samp_method=samp_method,
+            interval_samp_enhance=enhance_interval,
+            interpolation_tolerance=cfg.get("interpolation_tolerance", 1e-3),
+            enhance_step=cfg.get("enhance_step", 10),
+            max_enhance_iters=cfg.get("max_enhance_iters", 30),
+            **samp_kw,
+        )
+        an_hi = compute_newton_an(filter_func_hi, El_list, samp, par)
+        an_lo = compute_newton_an(filter_func_lo, El_list, samp, par)
+        # an 用乘积函数（供绘图）
+        an = compute_newton_an(filter_func, El_list, samp, par)
+        print(f"   split_bandpass: hi + lo 各 nc={len(samp)} 节点，共享同一套 samp")
+    else:
+        an, samp = build_filter_coefficients(
+            El_list, par, nc,
+            filter_func=filter_func,
+            samp_method=samp_method,
+            interval_samp_enhance=enhance_interval,
+            interpolation_tolerance=cfg.get("interpolation_tolerance", 1e-3),
+            enhance_step=cfg.get("enhance_step", 10),
+            max_enhance_iters=cfg.get("max_enhance_iters", 30),
+            **samp_kw,
+        )
 
     nc_true = len(samp)
     ist     = IstParams(nc=nc_true, ms=len(El_list))   # 用实际节点数覆盖初始估计
@@ -400,11 +434,18 @@ def run(cfg: Dict[str, Any]) -> None:
         cmp_funcs[f"Gaussian (sigma={1/np.sqrt(2*dt):.4f}) [参考]"] = (
             lambda x, El: _filt_func_gaussian(x, El, dt)
         )
-    elif filter_type == "bandpass":
+    elif filter_type in ("bandpass", "split_bandpass"):
         from fft_code.filter_coeff import _filt_func_gaussian
         cmp_funcs[f"Gaussian (sigma={1/np.sqrt(2*dt):.4f}) [参考]"] = (
             lambda x, El: _filt_func_gaussian(x, El, dt)
         )
+        if filter_type == "split_bandpass":
+            from fft_code.filter_coeff import (
+                _filt_func_highpass_band, _filt_func_lowpass_band)
+            cmp_funcs[f"Highpass (beta={beta}, E1={E1})"] = (
+                lambda x, El: _filt_func_highpass_band(x, El, beta, E1))
+            cmp_funcs[f"Lowpass (beta={beta}, E1={E1})"] = (
+                lambda x, El: _filt_func_lowpass_band(x, El, beta, E1))
     plot_window_comparison(El_list, par, interval, out_dir,
                            window_funcs=cmp_funcs,
                            highlight_band=target,
@@ -425,9 +466,20 @@ def run(cfg: Dict[str, Any]) -> None:
     print_every = cfg.get("print_every_filter", 1)
 
     for i in range(n_random):
-        psi_rand     = random_sine_psi(X, Y, Z, rng=rng)
-        psi_filt_all = apply_filter_H_all(
-            psi_rand, V, samp, an, par, T_k_diagonal)  # (ms, Nx, Ny, Nz)
+        psi_rand = random_sine_psi(X, Y, Z, rng=rng)
+
+        if filter_type == "split_bandpass":
+            # 两步：先高通（批量共享基底），再低通（每个 El 单独作用）
+            psi_hi_all = apply_filter_H_all(
+                psi_rand, V, samp, an_hi, par, T_k_diagonal)   # (ms, Nx, Ny, Nz)
+            psi_filt_all = np.zeros_like(psi_hi_all)
+            for ie in range(ist.ms):
+                psi_filt_all[ie] = apply_filter_H(
+                    psi_hi_all[ie], V, samp, an_lo[ie], par, T_k_diagonal)
+        else:
+            psi_filt_all = apply_filter_H_all(
+                psi_rand, V, samp, an, par, T_k_diagonal)       # (ms, Nx, Ny, Nz)
+
         for ie in range(ist.ms):
             psi_filt = normalize_psi(psi_filt_all[ie])
             H_psi    = apply_H(psi_filt, V, T_k_diagonal)
