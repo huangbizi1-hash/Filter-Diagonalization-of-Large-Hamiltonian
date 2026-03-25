@@ -37,7 +37,7 @@ build_filter_coefficients — 构建 Newton 插值系数矩阵
 
     filter_func 签名：filter_func(x_phys: np.ndarray, El: float) -> np.ndarray
 """
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 
@@ -264,6 +264,33 @@ def make_filter_func(filter_type: str,
 
 
 # ──────────────────────────────────────────────
+# 内部辅助：在稠密网格上批量求值 Newton 多项式
+# ──────────────────────────────────────────────
+
+def _eval_newton_grid(samp: np.ndarray,
+                      an_row: np.ndarray,
+                      s_eval: np.ndarray) -> np.ndarray:
+    """在 s_eval 上用前向 Newton Horner 公式对单行系数求值。
+
+    参数
+    ----
+    samp   : (nc,) 插值节点（缩放坐标）
+    an_row : (nc,) Newton 除差系数
+    s_eval : (m,)  求值点（缩放坐标）
+
+    返回
+    ----
+    (m,) 多项式在各 s_eval 处的值
+    """
+    result = np.full(len(s_eval), an_row[0])
+    basis  = np.ones(len(s_eval))
+    for j in range(1, len(samp)):
+        basis  *= (s_eval - samp[j - 1])
+        result += an_row[j] * basis
+    return result
+
+
+# ──────────────────────────────────────────────
 # 公开接口：构建 Newton 系数
 # ──────────────────────────────────────────────
 
@@ -273,6 +300,10 @@ def build_filter_coefficients(
         nc: int,
         filter_func: Optional[Callable] = None,
         samp_method: str = "ashkenazy",
+        interval_samp_enhance: Optional[Tuple[float, float]] = None,
+        interpolation_tolerance: float = 1e-3,
+        enhance_step: int = 10,
+        max_enhance_iters: int = 30,
         **samp_kw,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -280,26 +311,36 @@ def build_filter_coefficients(
 
     参数
     ----
-    El_list     : 滤波中心能量列表（物理单位，Hartree）
-    par         : PhysParams（提供 dE、Vmin、dt）
-    nc          : Newton 节点数
-    filter_func : callable(x_phys, El) -> np.ndarray，可选。
-                  若为 None，默认使用高斯滤波（由 par.dt 控制宽度）。
-                  可由 make_filter_func() 构造。
-    samp_method : 插值节点选取方式，可选：
-                  "ashkenazy"          — 贪心最大化 Vandermonde 行列式（默认）；
-                  "chebyshev"          — 第一类 Chebyshev 节点，两端密、中间稀；
-                  "derivative_adapted" — 基于带通窗导数 |dw/dx| 的反 CDF 自适应，
-                                         在 EL=El-E1 和 ER=El+E1 过渡区密集放点。
-    **samp_kw   : 传给 derivative_adapted 的额外参数：
-                  E1       (float, 默认 0.05)  — 带通半宽（Hartree）
-                  beta     (float, 默认 10.0)  — tanh 陡峭系数
-                  bg_frac  (float, 默认 0.2)   — 均匀背景占比
+    El_list                 : 滤波中心能量列表（物理单位，Hartree）
+    par                     : PhysParams（提供 dE、Vmin、dt）
+    nc                      : Newton 节点数（初始估计；启用自适应增强后
+                              实际节点数 nc_true = len(返回的 samp) 可能更大）
+    filter_func             : callable(x_phys, El) -> np.ndarray，可选。
+                              若为 None，默认使用高斯滤波（由 par.dt 控制宽度）。
+                              可由 make_filter_func() 构造。
+    samp_method             : 插值节点选取方式，可选：
+                              "ashkenazy"          — 贪心最大化 Vandermonde 行列式（默认）；
+                              "chebyshev"          — 第一类 Chebyshev 节点，两端密、中间稀；
+                              "derivative_adapted" — 基于带通窗导数 |dw/dx| 的反 CDF 自适应，
+                                                     在 EL=El-E1 和 ER=El+E1 过渡区密集放点。
+    interval_samp_enhance   : (lo, hi) 物理坐标（Hartree），指定需要加密插值节点的能量区间。
+                              若为 None（默认），不做自适应增强。
+                              启用后，若所有 El 窗函数的插值最大 MAE > interpolation_tolerance，
+                              则每次在该区间内追加 enhance_step 个均匀节点并重新拟合，
+                              直到误差达标或迭代次数超过 max_enhance_iters。
+    interpolation_tolerance : 插值 MAE 阈值（默认 1e-3）；在全域 [-2, 2] 稠密网格上
+                              对所有 El 窗函数取最大 MAE，低于此值停止增强。
+    enhance_step            : 每轮在 interval_samp_enhance 内新增的节点数（默认 10）。
+    max_enhance_iters       : 最大增强轮数（默认 30），防止不收敛时无限循环。
+    **samp_kw               : 传给 derivative_adapted 的额外参数：
+                              E1       (float, 默认 0.05)  — 带通半宽（Hartree）
+                              beta     (float, 默认 10.0)  — tanh 陡峭系数
+                              bg_frac  (float, 默认 0.2)   — 均匀背景占比
 
     返回
     ----
-    an   : (ms, nc) 系数矩阵
-    samp : (nc,)    [-2, 2] 区间的插值节点
+    an   : (ms, nc_true) 系数矩阵，nc_true = len(samp)
+    samp : (nc_true,)    [-2, 2] 区间的插值节点
     """
     if filter_func is None:
         filter_func = make_filter_func("gaussian", dt=par.dt)
@@ -326,11 +367,55 @@ def build_filter_coefficients(
             "Supported: 'ashkenazy', 'chebyshev', 'derivative_adapted'."
         )
 
-    scale  = (Smax - Smin) / par.dE
-    x_phys = (samp + 2.0) / scale + par.Vmin
+    scale = (Smax - Smin) / par.dE
 
-    an = np.zeros((len(El_list), nc))
-    for ie, El in enumerate(El_list):
-        y = filter_func(x_phys, El)
-        an[ie] = _newton_coefficients(samp, y)
+    def _build_an(s: np.ndarray) -> np.ndarray:
+        xp = (s + 2.0) / scale + par.Vmin
+        a  = np.zeros((len(El_list), len(s)))
+        for ie, El in enumerate(El_list):
+            a[ie] = _newton_coefficients(s, filter_func(xp, El))
+        return a
+
+    an = _build_an(samp)
+
+    # ── 自适应节点增强 ────────────────────────────────────────────────
+    if interval_samp_enhance is not None:
+        lo_phys, hi_phys = interval_samp_enhance
+        # 物理坐标 → 缩放坐标 [-2, 2]
+        s_lo = max(4.0 * (lo_phys - par.Vmin) / par.dE - 2.0, Smin)
+        s_hi = min(4.0 * (hi_phys - par.Vmin) / par.dE - 2.0, Smax)
+
+        # 用于误差评估的稠密网格（全域）
+        s_eval = np.linspace(Smin, Smax, 2000)
+        x_eval = (s_eval + 2.0) / scale + par.Vmin
+
+        def _max_mae(s: np.ndarray, a: np.ndarray) -> float:
+            worst = 0.0
+            for ie, El in enumerate(El_list):
+                y_true   = filter_func(x_eval, El)
+                y_interp = _eval_newton_grid(s, a[ie], s_eval)
+                worst    = max(worst, float(np.mean(np.abs(y_true - y_interp))))
+            return worst
+
+        samp_base = samp.copy()   # 保留原始 Ashkenazy 节点
+        n_added   = 0
+        mae       = _max_mae(samp, an)
+
+        for _ in range(max_enhance_iters):
+            if mae <= interpolation_tolerance:
+                break
+            n_added += enhance_step
+            # 每轮用累计数量重新均匀布点（避免重复添加相同坐标）
+            extra = np.linspace(s_lo, s_hi, n_added + 2)[1:-1]   # n_added 个内部点
+            samp  = np.sort(np.concatenate([samp_base, extra]))
+            an    = _build_an(samp)
+            mae   = _max_mae(samp, an)
+
+        if n_added > 0:
+            print(f"   [samp_enhance] added {n_added} nodes in "
+                  f"[{lo_phys}, {hi_phys}] Hartree "
+                  f"→ nc_true={len(samp)},  max_MAE={mae:.2e}"
+                  + ("  ✓" if mae <= interpolation_tolerance
+                     else f"  (tolerance {interpolation_tolerance:.1e} not reached)"))
+
     return an, samp

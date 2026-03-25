@@ -171,6 +171,16 @@ CONFIG: Dict[str, Any] = {
     # ---------- 杂项 ----------
     "print_every_filter": 1,
 
+    # ---------- Newton 节点自适应增强 ----------
+    # 在 samp_method 生成的基础节点之上，若插值 MAE 超过阈值，
+    # 则在 interval_samp_enhance（物理坐标，Hartree）内逐步追加节点。
+    # nc 作为初始估计，实际用到的 nc_true = len(samp) 会在运行时确定并记录。
+    # 设为 null（Python None）可完全禁用自适应增强。
+    "interval_samp_enhance":    [-0.22, -0.13],  # 需要加密的能量区间 [lo, hi]（Hartree）
+    "interpolation_tolerance":  1e-3,            # 插值 MAE 阈值；超过则继续追加节点
+    "enhance_step":             10,              # 每轮追加节点数
+    "max_enhance_iters":        30,              # 最大增强轮数（防止不收敛）
+
     # ---------- 画图 ----------
     "plot_interval": [-0.4, 0.1],   # 滤波函数绘图能量区间 [E_lo, E_hi]
 }
@@ -298,13 +308,12 @@ def run(cfg: Dict[str, Any]) -> None:
     E1          = cfg.get("E1", 0.05)
     samp_method = cfg.get("samp_method", "ashkenazy")
     par         = PhysParams(dE=cfg["dE"], Vmin=cfg["Vmin"], dt=dt)
-    ist         = IstParams(nc=nc, ms=len(El_list))
 
     # 构造窗函数
     filter_func = make_filter_func(
         filter_type, dt=dt, alpha_f=alpha_f, k_f=k_f, n0=n0, beta=beta, E1=E1)
 
-    print(f"   nc={nc},  dE={par.dE},  Vmin={par.Vmin},  dt={dt:.4f}")
+    print(f"   nc (initial)={nc},  dE={par.dE},  Vmin={par.Vmin},  dt={dt:.4f}")
     print(f"   Filter type : {filter_type}")
     if filter_type == "gaussian":
         print(f"   sigma (Gaussian) = {1/np.sqrt(2*dt):.6f} Hartree")
@@ -326,10 +335,27 @@ def run(cfg: Dict[str, Any]) -> None:
         samp_kw["E1"]      = E1
         samp_kw["beta"]    = beta
         samp_kw["bg_frac"] = cfg.get("deriv_bg_frac", 0.2)
-    an, samp = build_filter_coefficients(El_list, par, nc, filter_func=filter_func,
-                                          samp_method=samp_method, **samp_kw)
+
+    enhance_interval = cfg.get("interval_samp_enhance", None)
+    if enhance_interval is not None:
+        enhance_interval = tuple(enhance_interval)
+    an, samp = build_filter_coefficients(
+        El_list, par, nc,
+        filter_func=filter_func,
+        samp_method=samp_method,
+        interval_samp_enhance=enhance_interval,
+        interpolation_tolerance=cfg.get("interpolation_tolerance", 1e-3),
+        enhance_step=cfg.get("enhance_step", 10),
+        max_enhance_iters=cfg.get("max_enhance_iters", 30),
+        **samp_kw,
+    )
+
+    nc_true = len(samp)
+    ist     = IstParams(nc=nc_true, ms=len(El_list))   # 用实际节点数覆盖初始估计
 
     timings["build_filter"] = time.perf_counter() - t0
+    print(f"   nc (initial) = {nc},  nc_true = {nc_true}"
+          + (f"  (+{nc_true - nc} enhanced)" if nc_true != nc else ""))
     print(f"   Time: {timings['build_filter']:.3f} s")
 
     interval = tuple(cfg["plot_interval"])
@@ -455,7 +481,8 @@ def run(cfg: Dict[str, Any]) -> None:
         },
         "filter": {
             "filter_type": filter_type,
-            "nc":     nc,
+            "nc":      nc,
+            "nc_true": nc_true,
             "dt":     dt,
             "sigma_gaussian": float(1 / np.sqrt(2 * dt)),
             **({"alpha_f": alpha_f, "k_f": k_f, "n0": n0}
