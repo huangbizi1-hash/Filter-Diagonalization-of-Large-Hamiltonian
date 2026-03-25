@@ -88,48 +88,65 @@ def _samp_points_ashkenazy(min_val: float, max_val: float, nc: int) -> np.ndarra
     return point.real
 
 
-def _samp_points_ashkenazy_biased(
-        min_val: float, max_val: float, nc: int,
-        enhance_lo: float, enhance_hi: float,
+def _leja_extend(
+        existing_nodes: np.ndarray,
+        n_extra: int,
+        min_val: float = -2.0,
+        max_val: float =  2.0,
+        enhance_lo: Optional[float] = None,
+        enhance_hi: Optional[float] = None,
         enhance_density_factor: int = 16,
 ) -> np.ndarray:
-    """偏置候选池的 Ashkenazy 采样：在 [enhance_lo, enhance_hi] 中放更多候选点。
+    """在已有 Ashkenazy 节点基础上，用 Leja 延伸法追加 n_extra 个节点。
 
-    原理
-    ----
-    标准 Ashkenazy 在 32*nc 个全域均匀候选点上运行贪心 Vandermonde 最大化。
-    本函数额外在 [enhance_lo, enhance_hi] 内叠加 enhance_density_factor*nc 个均匀候选点，
-    使贪心算法从这个加密区域中自然地多选节点——所选节点集仍由单次贪心优化产生，
-    全局 Lebesgue 常数保持 O(log nc) 量级，不会因拼接异质节点集而振荡。
+    原理（为什么不重跑 Ashkenazy）
+    --------------------------------
+    重新以 nc+k 运行 Ashkenazy 会把**所有** nc+k 个节点重新选一遍——
+    已有的 nc 个节点会整体偏移（实测：100 个节点中 26 个偏移 >0.001），
+    这会完全改变多项式的结构，导致插值远处剧烈振荡。
+
+    Leja 延伸只向现有节点集追加新节点，不移动任何已有节点：
+        x_{nc+j} = argmax_{x ∈ candidates} Σ_i log|x − x_i|
+    新节点填入使 Vandermonde 行列式增量最大的位置，
+    现有多项式结构保持不变，不引入振荡。
 
     参数
     ----
-    enhance_lo / enhance_hi  : 需要加密的缩放坐标区间端点（[-2, 2] 内）
-    enhance_density_factor   : 加密区间内额外候选点数 = factor * nc（默认 16）
+    existing_nodes        : 已有的 Ashkenazy/Leja 节点（一维，已排序）
+    n_extra               : 需要追加的节点数
+    enhance_lo/enhance_hi : 若给定，则在该区间内放加密候选点（偏置 Leja）
+    enhance_density_factor: 加密区间候选点数 = factor * n_extra（默认 16）
     """
-    # 全域均匀候选点
-    nc_global = 32 * nc
-    cands_global = np.linspace(min_val, max_val, nc_global)
-    # 加密区间内的额外候选点
-    nc_extra  = enhance_density_factor * nc
-    cands_extra  = np.linspace(enhance_lo, enhance_hi, nc_extra + 2)[1:-1]
-    # 合并去重（以 1e-12 为阈值）
-    cands_all = np.sort(np.concatenate([cands_global, cands_extra]))
-    # 去掉过近的重复候选（两个相邻候选点之差 < 1e-12 时保留一个）
-    keep  = np.concatenate([[True], np.diff(cands_all) > 1e-12])
-    cands = cands_all[keep].astype(complex)
+    nc_base = len(existing_nodes)
+    # 全域均匀候选点（排除已有节点附近）
+    nc_cands = 32 * (nc_base + n_extra)
+    cands = np.linspace(min_val, max_val, nc_cands)
+    if enhance_lo is not None and enhance_hi is not None:
+        nc_extra_cands = enhance_density_factor * max(n_extra, 1)
+        cands_enh = np.linspace(enhance_lo, enhance_hi, nc_extra_cands + 2)[1:-1]
+        cands = np.sort(np.concatenate([cands, cands_enh]))
 
-    # 标准 Ashkenazy 贪心算法
-    point = np.zeros(nc, dtype=complex)
-    point[0] = cands[0]
-    dv   = (cands.real - point[0].real) ** 2 + (cands.imag - point[0].imag) ** 2
-    veca = np.where(dv < 1e-10, -1e30, np.log(dv))
-    for j in range(1, nc):
-        kmax     = np.argmax(veca)
-        point[j] = cands[kmax]
-        dv   = (cands.real - point[j].real) ** 2 + (cands.imag - point[j].imag) ** 2
-        veca = np.where(dv < 1e-10, -1e30, veca + np.log(dv))
-    return np.sort(point.real)
+    # 去重
+    cands = cands[np.concatenate([[True], np.diff(cands) > 1e-12])]
+
+    # 初始化 veca = Σ_i log|c − x_i| （对所有已有节点累加）
+    veca = np.zeros(len(cands))
+    for x in existing_nodes:
+        dv   = (cands - x) ** 2
+        veca += np.where(dv < 1e-10, -1e30, np.log(dv))
+    # 排除候选点与已有节点重合
+    for x in existing_nodes:
+        veca[np.abs(cands - x) < 1e-5] = -1e30
+
+    # Leja 贪心：逐个追加 n_extra 个节点
+    new_nodes = np.empty(n_extra)
+    for j in range(n_extra):
+        kmax          = int(np.argmax(veca))
+        new_nodes[j]  = cands[kmax]
+        dv            = (cands - cands[kmax]) ** 2
+        veca         += np.where(dv < 1e-10, -1e30, np.log(dv))
+
+    return np.sort(np.concatenate([existing_nodes, new_nodes]))
 
 
 def _samp_points_chebyshev(min_val: float, max_val: float, nc: int) -> np.ndarray:
@@ -380,9 +397,9 @@ def build_filter_coefficients(
                               E1                    (float, 默认 0.05) — derivative_adapted 带通半宽
                               beta                  (float, 默认 10.0) — derivative_adapted tanh 系数
                               bg_frac               (float, 默认 0.2)  — derivative_adapted 均匀背景占比
-                              enhance_density_factor (int,  默认 16)   — interval_samp_enhance 生效时，
-                                                     加密区间内额外候选点数 = factor × nc_curr，
-                                                     值越大偏置越强（区间内选到的节点越多）
+                              enhance_density_factor (int,  默认 16)   — Leja 延伸时在增强区间内放
+                                                     factor × enhance_step 个额外候选点，
+                                                     值越大 Leja 新节点越偏向该区间
 
     返回
     ----
@@ -425,10 +442,14 @@ def build_filter_coefficients(
 
     an = _build_an(samp)
 
-    # ── 自适应节点增强 ────────────────────────────────────────────────
-    # 关键设计：不拼接两套独立节点（会破坏全局 Lebesgue 最优性导致振荡），
-    # 而是用「偏置候选池 Ashkenazy」——在 interval_samp_enhance 内放更多候选点，
-    # 让贪心算法在全局优化中自然多选该区间，保持 O(log n) Lebesgue 常数。
+    # ── 自适应节点增强（Leja 延伸） ────────────────────────────────────
+    # 核心设计原则：
+    #   绝不重新运行 Ashkenazy(nc+k)——重跑会整体改变所有节点位置，
+    #   导致多项式远处剧烈振荡（实测：100 个节点中 26 个偏移 >0.001）。
+    #
+    #   正确做法：Leja 延伸（_leja_extend）——保持已有 nc 个节点不动，
+    #   通过贪心 Vandermonde 最大化依次追加 enhance_step 个新节点。
+    #   已有多项式结构完整保留，新节点只"填补"最需要的空隙。
     if interval_samp_enhance is not None:
         lo_phys, hi_phys = interval_samp_enhance
         # 物理坐标 → 缩放坐标 [-2, 2]
@@ -436,37 +457,36 @@ def build_filter_coefficients(
         s_hi = min(4.0 * (hi_phys - par.Vmin) / par.dE - 2.0, Smax)
         enhance_density_factor = samp_kw.get("enhance_density_factor", 16)
 
-        # 用于误差评估的稠密网格（全域）
-        s_eval = np.linspace(Smin, Smax, 2000)
-        x_eval = (s_eval + 2.0) / scale + par.Vmin
+        # 误差评估：仅在增强区间内取最大绝对误差（不用全域均值）
+        s_eval_enh = np.linspace(s_lo, s_hi, max(200, 20 * enhance_step))
+        x_eval_enh = (s_eval_enh + 2.0) / scale + par.Vmin
 
         def _max_mae(s: np.ndarray, a: np.ndarray) -> float:
             worst = 0.0
             for ie, El in enumerate(El_list):
-                y_true   = filter_func(x_eval, El)
-                y_interp = _eval_newton_grid(s, a[ie], s_eval)
-                worst    = max(worst, float(np.mean(np.abs(y_true - y_interp))))
+                y_true   = filter_func(x_eval_enh, El)
+                y_interp = _eval_newton_grid(s, a[ie], s_eval_enh)
+                worst    = max(worst, float(np.max(np.abs(y_true - y_interp))))
             return worst
 
         mae     = _max_mae(samp, an)
-        nc_curr = nc          # 当前总节点数（从初始 nc 开始逐步增大）
         n_added = 0
 
         for _ in range(max_enhance_iters):
             if mae <= interpolation_tolerance:
                 break
-            nc_curr += enhance_step
+            # Leja 延伸：保持现有节点不动，仅追加 enhance_step 个新节点
+            samp    = _leja_extend(samp, enhance_step,
+                                   Smin, Smax, s_lo, s_hi,
+                                   enhance_density_factor)
             n_added += enhance_step
-            # 用偏置候选池重新运行 Ashkenazy：全局贪心优化，不拼接异质节点集
-            samp = _samp_points_ashkenazy_biased(
-                Smin, Smax, nc_curr, s_lo, s_hi, enhance_density_factor)
-            an   = _build_an(samp)
-            mae  = _max_mae(samp, an)
+            an      = _build_an(samp)
+            mae     = _max_mae(samp, an)
 
         if n_added > 0:
-            print(f"   [samp_enhance] biased-Ashkenazy  +{n_added} nodes "
+            print(f"   [samp_enhance] Leja-extend  +{n_added} nodes "
                   f"(enhance region [{lo_phys}, {hi_phys}] Hartree) "
-                  f"→ nc_true={len(samp)},  max_MAE={mae:.2e}"
+                  f"→ nc_true={len(samp)},  max_MAE_in_region={mae:.2e}"
                   + ("  ✓" if mae <= interpolation_tolerance
                      else f"  (tolerance {interpolation_tolerance:.1e} not reached)"))
 
