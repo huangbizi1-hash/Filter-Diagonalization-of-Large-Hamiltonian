@@ -81,6 +81,9 @@ def parse_args():
                    help="高斯拟合参数文件（默认 gaussian_fit_params.json）")
     p.add_argument("--tol", type=float, default=1e-6,
                    help="PRIMME 收敛精度 tol（默认 1e-6）")
+    p.add_argument("--primme_verbose", type=int, default=0,
+                   help="PRIMME printLevel（0=静默，1=错误，2=基本，3=收敛过程，"
+                        "4=详细，5=最详细；默认 0）")
 
     p.add_argument("--output", type=str, default=None,
                    help="JSON 输出路径（默认不保存）")
@@ -164,6 +167,8 @@ def solve_once(pot_grid, args, target=None, v0=None):
         target=target,
         v0=v0,
         maxBlockSize=args.maxBlockSize,
+        primme_print_level=args.primme_verbose,
+        return_primme_stats=(args.primme_verbose > 0),
         **kwargs,
     )
 
@@ -274,7 +279,7 @@ def main():
     start_dt = datetime.now()
     print("运行参数：")
     print(f"  method=fft_dvr:jdqmr, N={args.n}, n_levels={args.n_levels}, tol={args.tol}")
-    print(f"  ncv={args.ncv}, maxBlockSize={args.maxBlockSize}")
+    print(f"  ncv={args.ncv}, maxBlockSize={args.maxBlockSize}, primme_verbose={args.primme_verbose}")
     if args.n_coarse is not None:
         print(f"  双网格：n_coarse={args.n_coarse} → n={args.n}")
     if args.job_title:

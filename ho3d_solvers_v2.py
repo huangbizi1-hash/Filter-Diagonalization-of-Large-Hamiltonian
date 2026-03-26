@@ -555,7 +555,10 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
                L: float = 5.0,
                target: Optional[float] = None,
                v0: Optional[np.ndarray] = None,
-               maxBlockSize: int = 1, **kwargs):
+               maxBlockSize: int = 1,
+               primme_print_level: int = 0,
+               return_primme_stats: bool = False,
+               **kwargs):
     """
     求解3D薛定谔方程（增强版，支持多网格）
     
@@ -710,30 +713,35 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
         default_ncv = max(80, 2*n_levels)
         ncv_value = kwargs.pop('ncv', default_ncv)  # 从kwargs中提取ncv，如果没有则使用默认值
         
+        _primme_common = dict(
+            OPinv=M_op if disc=="sinc_dvr" else None,
+            method=actual_method,
+            maxBlockSize=maxBlockSize,
+            ncv=ncv_value,
+            v0=v0,
+            printLevel=primme_print_level,
+            return_stats=return_primme_stats,
+            return_history=return_primme_stats,
+        )
+
         if target is not None:
             # 目标模式：求解最接近target的特征值
-            evals, evecs = primme.eigsh(
-                H_op,
-                k=n_levels,
-                which=target,   # 关键修改
-                OPinv=M_op if disc=="sinc_dvr" else None,
-                method=actual_method,
-                maxBlockSize=maxBlockSize,
-                ncv=ncv_value,
-                v0=v0,  # 初始猜测
-                **kwargs
+            _primme_result = primme.eigsh(
+                H_op, k=n_levels, which=target,
+                **_primme_common, **kwargs
             )
-
         else:
             # 标准模式：求解最小的特征值
-            evals, evecs = primme.eigsh(H_op, k=n_levels, 
-                                       which='SA',  # Smallest Algebraic
-                                       OPinv=M_op if disc=="sinc_dvr" else None,
-                                       method=actual_method,
-                                       maxBlockSize=maxBlockSize,
-                                       ncv=ncv_value,
-                                       v0=v0,  # 初始猜测
-                                       **kwargs)
+            _primme_result = primme.eigsh(
+                H_op, k=n_levels, which='SA',
+                **_primme_common, **kwargs
+            )
+
+        if return_primme_stats:
+            evals, evecs, _primme_stats = _primme_result
+        else:
+            evals, evecs = _primme_result
+            _primme_stats = {}
     
     t_eig = time.perf_counter() - t_eig_start
     evals, evecs = _sort_eigs(evals, evecs)
@@ -745,22 +753,25 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
     # 记录使用的空间范围
     x_min, x_max = _get_spatial_range(potential_grid, L)
     
-    return SolveResult(evals, evecs, {
-        "method": method_spec, 
-        "method_label": _label(disc, solver_method), 
-        "N": N, 
-        "total_nodes": N**3, 
-        "t_build": t_build, 
+    meta = {
+        "method": method_spec,
+        "method_label": _label(disc, solver_method),
+        "N": N,
+        "total_nodes": N**3,
+        "t_build": t_build,
         "t_eig": t_eig,
         "potential": pot_source,
         "mode": mode,
         "used_v0": used_v0,
-        "spatial_range": (x_min, x_max),  # 记录实际使用的空间范围
+        "spatial_range": (x_min, x_max),
         "n_levels": n_levels,
         "maxBlockSize": maxBlockSize,
         "target": target,
         "ncv": ncv_value if "ncv_value" in locals() else None,
-    })
+    }
+    if _primme_stats:
+        meta["primme_stats"] = _primme_stats
+    return SolveResult(evals, evecs, meta)
 
 # ---------------------------
 # Benchmark & Plot
