@@ -54,7 +54,58 @@ def apply_filter_H(psi: np.ndarray, V: np.ndarray,
     return result
 
 
-def apply_filter_H_all(psi: np.ndarray, V: np.ndarray,
+def apply_chebyshev_explosion(psi: np.ndarray, V: np.ndarray,
+                              T_k_diagonal: np.ndarray,
+                              m: int,
+                              E_lower: float, E_upper: float) -> np.ndarray:
+    """
+    T_m(H_scaled)|ψ⟩ — 用三项递推计算切比雪夫多项式滤波。
+
+    缩放变换：H_scaled = a·H + b，将 [E_lower, E_upper] 映射到 [-1, 1]。
+        a = 2 / (E_upper - E_lower)
+        b = -(E_upper + E_lower) / (E_upper - E_lower)
+
+    结果：
+        E ∈ [E_lower, E_upper]  →  x ∈ [-1, 1]  →  |T_m(x)| ≤ 1（抑制）
+        E <  E_lower             →  x < -1        →  |T_m(x)| ≫ 1（放大）
+        E >  E_upper             →  x >  1        →  |T_m(x)| ≫ 1（放大）
+
+    三项递推（数值稳定，每步一次 H-apply，共 m 次）：
+        y_0 = ψ               = T_0(H_s)ψ
+        y_1 = H_s ψ           = T_1(H_s)ψ
+        y_{k+1} = 2 H_s y_k - y_{k-1}   = T_{k+1}(H_s)ψ
+
+    参数
+    ----
+    psi          : (Nx, Ny, Nz)    输入波函数（实数）
+    V            : (Nx, Ny, Nz)    势能
+    T_k_diagonal : (Nx, Ny, Nz)    k 空间动能对角元
+    m            : int             切比雪夫多项式阶数
+    E_lower      : float           放大/抑制分界下沿（物理单位 Hartree）
+    E_upper      : float           放大/抑制分界上沿，应覆盖全谱高端
+
+    返回
+    ----
+    y : (Nx, Ny, Nz)   T_m(H_scaled)|ψ⟩
+    """
+    a = 2.0 / (E_upper - E_lower)
+    b = -(E_upper + E_lower) / (E_upper - E_lower)
+
+    def _apply_Hs(phi: np.ndarray) -> np.ndarray:
+        return a * apply_H(phi, V, T_k_diagonal) + b * phi
+
+    y_prev = psi.copy()          # T_0(H_s) ψ = ψ
+    if m == 0:
+        return y_prev
+
+    y_curr = _apply_Hs(psi)     # T_1(H_s) ψ = H_s ψ
+    for _ in range(2, m + 1):
+        y_next = 2.0 * _apply_Hs(y_curr) - y_prev
+        y_prev = y_curr
+        y_curr = y_next
+
+    return y_curr
+
                        nodes: np.ndarray, an: np.ndarray,
                        par: PhysParams,
                        T_k_diagonal: np.ndarray) -> np.ndarray:

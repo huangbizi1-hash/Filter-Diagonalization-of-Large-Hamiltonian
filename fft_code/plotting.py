@@ -39,6 +39,10 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
     filter_func      : callable(x_arr, El) -> y_arr
         若为 None，默认使用高斯公式 sqrt(dt/π)·exp(-(x-El)²·dt)。
     filter_label     : 图例中真实函数的名称。
+    samp             : Newton 节点数组（缩放坐标 [-2, 2]）。
+        传 None 时跳过插值曲线与 rug plot，仅绘制真实窗函数。
+        适用于 chebyshev_explosion 等无插值节点的滤波方式。
+    an               : Newton 系数矩阵。samp=None 时可同时为 None。
     samp_ref         : 可选，第二组参考节点（缩放坐标 [-2, 2]）。
         若给定，则在 rug plot 中用不同颜色和 y 偏移同时显示两组节点，
         方便直观对比节点分布（如普通 Chebyshev vs density-mapped）。
@@ -48,6 +52,8 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
         每个分量用独立颜色对（实线=真实，虚线=Newton 插值）绘制。
         extra_components 中的分量不参与 rug plot（共用主 samp）。
     """
+    has_nodes = samp is not None      # False → chebyshev_explosion 等无节点模式
+
     if filter_func is None:
         filter_func = lambda x, El: (
             np.sqrt(par.dt / np.pi) * np.exp(-(x - El) ** 2 * par.dt)
@@ -62,23 +68,25 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
             result += coeffs[j] * basis
         return result
 
-    # 将节点从缩放坐标 [-2, 2] 转换为物理坐标（Hartree）
-    # 转换关系：x_phys = (samp + 2) * dE/4 + Vmin
-    x_nodes = (samp + 2.0) * par.dE / 4.0 + par.Vmin
+    if has_nodes:
+        # 将节点从缩放坐标 [-2, 2] 转换为物理坐标（Hartree）
+        # 转换关系：x_phys = (samp + 2) * dE/4 + Vmin
+        x_nodes = (samp + 2.0) * par.dE / 4.0 + par.Vmin
 
     x_plot = np.linspace(interval[0], interval[1], 1000)
     fig, ax = plt.subplots(figsize=(10, 6))
 
-    # 主滤波分量（蓝/红）
+    # 主滤波分量（蓝色=真实，红色虚线=Newton 插值）
     for ie, El in enumerate(El_list):
-        y_true   = filter_func(x_plot, El)
-        y_interp = np.array([_scaled_eval(x, samp, an[ie]) for x in x_plot])
-        mae = np.mean(np.abs(y_true - y_interp))
-        print(f"  El={El:.4f}  MAE={mae:.6e}")
-        ax.plot(x_plot, y_true,   color='blue',
+        y_true = filter_func(x_plot, El)
+        ax.plot(x_plot, y_true, color='blue',
                 label=filter_label if ie == 0 else "")
-        ax.plot(x_plot, y_interp, '--', color='red',
-                label=f'Newton interp (nc={len(samp)})' if ie == 0 else "")
+        if has_nodes and an is not None:
+            y_interp = np.array([_scaled_eval(x, samp, an[ie]) for x in x_plot])
+            mae = np.mean(np.abs(y_true - y_interp))
+            print(f"  El={El:.4f}  MAE={mae:.6e}")
+            ax.plot(x_plot, y_interp, '--', color='red',
+                    label=f'Newton interp (nc={len(samp)})' if ie == 0 else "")
 
     # 额外分量（split_bandpass 的高通/低通等），每个分量用独立颜色对
     _comp_colors = [('forestgreen', 'darkorange'),
@@ -88,53 +96,126 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
         for k, (an_c, func_c, label_c) in enumerate(extra_components):
             c_true, c_interp = _comp_colors[k % len(_comp_colors)]
             for ie, El in enumerate(El_list):
-                y_true   = func_c(x_plot, El)
-                y_interp = np.array([_scaled_eval(x, samp, an_c[ie]) for x in x_plot])
-                mae = np.mean(np.abs(y_true - y_interp))
-                print(f"  [{label_c}] El={El:.4f}  MAE={mae:.6e}")
-                ax.plot(x_plot, y_true,   color=c_true,
+                y_true = func_c(x_plot, El)
+                ax.plot(x_plot, y_true, color=c_true,
                         label=label_c if ie == 0 else "")
-                ax.plot(x_plot, y_interp, '--', color=c_interp,
-                        label=f'{label_c} Newton interp' if ie == 0 else "")
+                if has_nodes and an_c is not None:
+                    y_interp = np.array([_scaled_eval(x, samp, an_c[ie]) for x in x_plot])
+                    mae = np.mean(np.abs(y_true - y_interp))
+                    print(f"  [{label_c}] El={El:.4f}  MAE={mae:.6e}")
+                    ax.plot(x_plot, y_interp, '--', color=c_interp,
+                            label=f'{label_c} Newton interp' if ie == 0 else "")
 
-    # ── Rug plot：节点分布可视化 ──────────────────────────────────────
-    # 只显示落在当前 interval 内的节点，避免域外节点溢出图框
-    y_lo, y_hi = ax.get_ylim()
-    rug_span = 0.06 * (y_hi - y_lo)
+    # ── Rug plot：节点分布可视化（仅 has_nodes 时）──────────────────
+    if has_nodes:
+        y_lo, y_hi = ax.get_ylim()
+        rug_span = 0.06 * (y_hi - y_lo)
 
-    if samp_ref is not None:
-        # 两组节点：samp_ref（参考）在下，samp（当前）在上，y 错开
-        x_ref = (samp_ref + 2.0) * par.dE / 4.0 + par.Vmin
-        mask_ref = (x_ref >= interval[0]) & (x_ref <= interval[1])
-        rug_y_ref = y_lo - rug_span           # 下层（参考节点）
-        ax.plot(x_ref[mask_ref], np.full(mask_ref.sum(), rug_y_ref),
-                '|', color='steelblue', markersize=10, markeredgewidth=1.5,
-                label=f'{samp_ref_label} ({mask_ref.sum()}/{len(samp_ref)} in view)',
-                clip_on=False)
-
-        mask = (x_nodes >= interval[0]) & (x_nodes <= interval[1])
-        rug_y = y_lo - 2.0 * rug_span         # 上层（密度映射节点）
-        ax.plot(x_nodes[mask], np.full(mask.sum(), rug_y),
-                '|', color='darkorange', markersize=10, markeredgewidth=1.5,
-                label=f'density-mapped nodes ({mask.sum()}/{len(samp)} in view)',
-                clip_on=False)
-    else:
-        mask = (x_nodes >= interval[0]) & (x_nodes <= interval[1])
-        rug_y = y_lo - rug_span
-        ax.plot(x_nodes[mask], np.full(mask.sum(), rug_y),
-                '|', color='darkorange', markersize=10, markeredgewidth=1.5,
-                label=f'Newton nodes ({mask.sum()}/{len(samp)} in view)', clip_on=False)
-
-    ax.set_ylim(y_lo, y_hi)               # 恢复 ylim，rug 用 clip_on=False 显示
+        if samp_ref is not None:
+            x_ref = (samp_ref + 2.0) * par.dE / 4.0 + par.Vmin
+            mask_ref = (x_ref >= interval[0]) & (x_ref <= interval[1])
+            rug_y_ref = y_lo - rug_span
+            ax.plot(x_ref[mask_ref], np.full(mask_ref.sum(), rug_y_ref),
+                    '|', color='steelblue', markersize=10, markeredgewidth=1.5,
+                    label=f'{samp_ref_label} ({mask_ref.sum()}/{len(samp_ref)} in view)',
+                    clip_on=False)
+            mask = (x_nodes >= interval[0]) & (x_nodes <= interval[1])
+            rug_y = y_lo - 2.0 * rug_span
+            ax.plot(x_nodes[mask], np.full(mask.sum(), rug_y),
+                    '|', color='darkorange', markersize=10, markeredgewidth=1.5,
+                    label=f'density-mapped nodes ({mask.sum()}/{len(samp)} in view)',
+                    clip_on=False)
+        else:
+            mask = (x_nodes >= interval[0]) & (x_nodes <= interval[1])
+            rug_y = y_lo - rug_span
+            ax.plot(x_nodes[mask], np.full(mask.sum(), rug_y),
+                    '|', color='darkorange', markersize=10, markeredgewidth=1.5,
+                    label=f'Newton nodes ({mask.sum()}/{len(samp)} in view)',
+                    clip_on=False)
+        ax.set_ylim(y_lo, y_hi)
 
     ax.set_xlabel('Energy (Hartree)')
-    ax.set_ylabel('f(x)')
-    ax.set_title(f'{filter_label} vs Newton Interpolation (nc={len(samp)})')
+    ax.set_ylabel('f(E)')
+    if has_nodes:
+        ax.set_title(f'{filter_label} vs Newton Interpolation (nc={len(samp)})')
+    else:
+        ax.set_title(f'{filter_label}')
     ax.set_xlim(interval[0], interval[1])
     ax.legend()
     ax.grid(True)
     fig.tight_layout()
     _savefig(fig, out_dir / "filter_interpolation.png")
+
+
+def plot_explosion_window(m: int, E_lower: float, E_upper: float,
+                          out_dir: Path,
+                          E_min_plot: Optional[float] = None,
+                          E_max_plot: Optional[float] = None,
+                          clip_val: float = 20.0) -> None:
+    """
+    绘制切比雪夫爆炸滤波器 T_m(aE+b) 的形状。
+
+    参数
+    ----
+    m            : 切比雪夫多项式阶数
+    E_lower      : 放大/抑制分界下沿
+    E_upper      : 放大/抑制分界上沿
+    out_dir      : 输出目录
+    E_min_plot   : 绘图左边界（默认 E_lower - 0.3*(E_upper-E_lower)）
+    E_max_plot   : 绘图右边界（默认 E_upper）
+    clip_val     : 纵轴截断值（T_m 在域外增长迅速，截断方便显示）
+    """
+    dE = E_upper - E_lower
+    if E_min_plot is None:
+        E_min_plot = E_lower - 0.3 * dE
+    if E_max_plot is None:
+        E_max_plot = E_upper
+
+    a = 2.0 / dE
+    b = -(E_upper + E_lower) / dE
+
+    E_arr = np.linspace(E_min_plot, E_max_plot, 2000)
+    x_arr = a * E_arr + b         # 映射到缩放坐标
+
+    # 用 numpy Chebyshev 精确求值
+    from numpy.polynomial.chebyshev import Chebyshev
+    coef = np.zeros(m + 1); coef[m] = 1.0
+    Tm_vals = Chebyshev(coef)(x_arr)
+    Tm_clipped = np.clip(Tm_vals, -clip_val, clip_val)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    # 左图：完整域，截断纵轴
+    ax = axes[0]
+    ax.plot(E_arr, Tm_clipped, color='steelblue', lw=1.5)
+    ax.axvline(E_lower, color='red',   ls='--', lw=1.2, label=f'E_lower={E_lower}')
+    ax.axvline(E_upper, color='green', ls='--', lw=1.2, label=f'E_upper={E_upper}')
+    ax.axhline(0,       color='k',     lw=0.5)
+    ax.axhline( 1,      color='gray',  ls=':',  lw=0.8)
+    ax.axhline(-1,      color='gray',  ls=':',  lw=0.8)
+    ax.fill_betweenx([-clip_val, clip_val], E_lower, E_upper,
+                     alpha=0.08, color='green', label='suppressed region')
+    ax.set_xlabel('Energy (Hartree)')
+    ax.set_ylabel(f'T_{m}(aE+b)  [clipped at ±{clip_val}]')
+    ax.set_title(f'Chebyshev Explosion Filter  m={m}')
+    ax.set_ylim(-clip_val, clip_val)
+    ax.legend(fontsize=9)
+    ax.grid(True)
+
+    # 右图：仅 [-1, 1] 范围内（抑制区）放大显示
+    mask_in = (E_arr >= E_lower) & (E_arr <= E_upper)
+    ax2 = axes[1]
+    ax2.plot(E_arr[mask_in], Tm_vals[mask_in], color='steelblue', lw=1.5)
+    ax2.axhline( 1, color='gray', ls=':', lw=0.8)
+    ax2.axhline(-1, color='gray', ls=':', lw=0.8)
+    ax2.axhline( 0, color='k',   lw=0.5)
+    ax2.set_xlabel('Energy (Hartree)')
+    ax2.set_ylabel(f'T_{m}(aE+b)  [suppressed zone]')
+    ax2.set_title(f'Suppressed region: E ∈ [{E_lower}, {E_upper}]')
+    ax2.grid(True)
+
+    fig.tight_layout()
+    _savefig(fig, out_dir / "explosion_window.png")
 
 
 # ──────────────────────────────────────────────
