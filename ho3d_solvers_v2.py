@@ -46,13 +46,16 @@ def _parse_method_spec(method_str: str) -> Tuple[str, str]:
     parts = method_str.split(":")
     if len(parts) == 1:
         m = parts[0].lower()
+        if m == "cgmin": return "fft_dvr", m
+        if m == "jdqmr": return "fft_dvr", m   # jdqmr 默认使用 FFT 离散化
         if m in ["gd", "lobpcg", "davidson", "jd"]: return "sinc_dvr", m
         return m, "lanczos"
     return parts[0].lower(), parts[1]
 
 def _label(disc: str, solver: str) -> str:
     """生成图表显示的专业标签"""
-    disc_map = {"numerov3d": "Numerov-3D", "chebyshev": "Chebyshev", "sinc_dvr": "Sinc-DVR"}
+    disc_map = {"numerov3d": "Numerov-3D", "chebyshev": "Chebyshev",
+                "sinc_dvr": "Sinc-DVR", "fft_dvr": "FFT-DVR"}
     
     s_clean = solver
     if s_clean.upper().startswith("PRIMME_"):
@@ -172,6 +175,184 @@ def interpolate_eigenvector(evec_coarse: np.ndarray, N_coarse: int, N_fine: int,
         return evec_fine
 
 # ---------------------------
+# CG 最小化法
+# ---------------------------
+
+def _golden_section_search(func, a: float, b: float, tol: float = 1e-4, maxit: int = 60) -> float:
+    """黄金分割法在 [a, b] 上极小化 func(theta)。"""
+    gr = (np.sqrt(5) - 1) / 2
+    c = b - gr * (b - a)
+    d = a + gr * (b - a)
+    fc, fd = func(c), func(d)
+    for _ in range(maxit):
+        if (b - a) <= tol:
+            break
+        if fc < fd:
+            b, d, fd = d, c, fc
+            c = b - gr * (b - a)
+            fc = func(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + gr * (b - a)
+            fd = func(d)
+    return 0.5 * (a + b)
+
+
+def cg_minimize_folded(
+    H_op,
+    E_target: float,
+    x0: np.ndarray,
+    maxiter: int = 2000,
+    gtol: float = 1e-8,
+    energy_tol: float = 5e-4,
+    theta_max: float = 0.8,
+    verbose: bool = True,
+) -> dict:
+    """
+    非线性 CG 法在单位球面上极小化 f(x) = ||(H - E_target)x||^2。
+
+    H_op 可以是 numpy ndarray、scipy 稀疏矩阵或 LinearOperator，
+    只需支持矩阵-向量乘法即可（不需要存储完整矩阵）。
+
+    收敛判据（满足其一即停止）：
+      1. 相邻迭代 Ritz 能量变化 |ΔE| < energy_tol  （主判据）
+      2. 切空间梯度范数 ||g|| < gtol                （辅助判据）
+
+    Parameters
+    ----------
+    H_op       : 哈密顿量算符（ndarray / sparse / LinearOperator）
+    E_target   : 目标能量
+    x0         : 初始向量（任意范数，函数内部归一化）
+    maxiter    : 最大迭代次数，默认 2000
+    gtol       : 切空间梯度范数收敛阈值，默认 1e-8
+    energy_tol : 相邻迭代 Ritz 能量变化收敛阈值，默认 5e-4
+    theta_max  : 测地线步长搜索上界（弧度）
+    verbose    : 是否打印迭代信息
+
+    Returns
+    -------
+    dict 包含
+      'x'          : 收敛的单位向量
+      'E_ritz'     : Ritz 能量 <x|H|x>
+      'history'    : {'f', 'gnorm', 'E_ritz'} 列表
+      'n_iter'     : 实际迭代次数
+      'converged'  : 是否满足收敛判据（True/False）
+      'conv_reason': 收敛原因字符串
+    """
+    # 统一 matvec 接口
+    if hasattr(H_op, "matvec"):
+        Hv = H_op.matvec
+    else:
+        Hv = lambda v: H_op @ v
+
+    def A(v):
+        return Hv(v) - E_target * v
+
+    x = x0.astype(float).ravel()
+    x /= np.linalg.norm(x)
+
+    def f_of(xvec):
+        y = A(xvec)
+        return float(np.dot(y, y))
+
+    def grad_tangent(xvec):
+        """返回切空间梯度 g_t 和 A(x)（后者供外部复用以省一次 matvec）。"""
+        y = A(xvec)          # 一次 matvec
+        z = A(y)             # 二次 matvec：(H-E)^2 x
+        g = 2.0 * z
+        g_t = g - np.dot(xvec, g) * xvec
+        return g_t, y
+
+    hist: dict = {"f": [], "gnorm": [], "E_ritz": []}
+
+    f0 = f_of(x)
+    g, _ = grad_tangent(x)
+    p = -g - np.dot(x, -g) * x   # 投影到切空间
+    g_prev = g.copy()
+    p_prev = p.copy()
+
+    if verbose:
+        print(f"  CG-min init: f={f0:.6e}, ||g||={np.linalg.norm(g):.3e}")
+
+    n_iter = 0
+    converged = False
+    conv_reason = "maxiter"
+    E_ritz_prev = None
+
+    for it in range(1, maxiter + 1):
+        n_iter = it
+        gnorm = np.linalg.norm(g)
+        E_ritz = float(np.dot(x, Hv(x)))
+        hist["f"].append(f0)
+        hist["gnorm"].append(gnorm)
+        hist["E_ritz"].append(E_ritz)
+
+        # 主判据：相邻迭代 Ritz 能量变化
+        if E_ritz_prev is not None and abs(E_ritz - E_ritz_prev) < energy_tol:
+            converged = True
+            conv_reason = f"ΔE={abs(E_ritz - E_ritz_prev):.2e}<{energy_tol:.2e}"
+            if verbose:
+                print(f"  Converged (ΔE) it={it}: ΔE={abs(E_ritz-E_ritz_prev):.3e}, "
+                      f"E≈{E_ritz:.10f}")
+            break
+
+        # 辅助判据：切空间梯度范数
+        if gnorm < gtol:
+            converged = True
+            conv_reason = f"||g||={gnorm:.2e}<{gtol:.2e}"
+            if verbose:
+                print(f"  Converged (||g||) it={it}: ||g||={gnorm:.3e}, E≈{E_ritz:.10f}")
+            break
+
+        E_ritz_prev = E_ritz
+
+        # 将搜索方向重新投影到切空间
+        p = p - np.dot(x, p) * x
+        pn = np.linalg.norm(p)
+        if pn == 0.0:
+            conv_reason = "direction_vanished"
+            if verbose:
+                print("  Direction vanished; stopping.")
+            break
+        p_hat = p / pn
+
+        # 沿测地线 x(θ) = x cosθ + p_hat sinθ 做黄金分割
+        def phi(theta: float) -> float:
+            xx = x * np.cos(theta) + p_hat * np.sin(theta)
+            return f_of(xx)
+
+        theta = _golden_section_search(phi, 0.0, theta_max)
+        x = x * np.cos(theta) + p_hat * np.sin(theta)
+        x /= np.linalg.norm(x)
+        f0 = f_of(x)
+
+        # 更新梯度
+        g, _ = grad_tangent(x)
+
+        # Polak–Ribière beta（带重启）
+        dg = g - g_prev
+        denom = np.dot(g_prev, g_prev) + 1e-30
+        beta = max(0.0, float(np.dot(g, dg) / denom))
+        p = -g + beta * p_prev
+        p = p - np.dot(x, p) * x
+
+        g_prev = g.copy()
+        p_prev = p.copy()
+
+        if verbose and (it % 50 == 0 or it == 1):
+            print(f"  it={it:4d}: f={f0:.6e}, ||g||={gnorm:.3e}, "
+                  f"theta={theta:.3e}, E≈{E_ritz:.10f}")
+
+    Hx = Hv(x)
+    E_final = float(np.dot(x, Hx))
+    eig_res  = float(np.linalg.norm(Hx - E_final * x))          # ||Hx - E_ritz x||
+    fold_res = float(np.linalg.norm(Hx - E_target * x))         # ||(H - target I)x||
+    return {"x": x, "E_ritz": E_final, "history": hist,
+            "n_iter": n_iter, "converged": converged, "conv_reason": conv_reason,
+            "eig_res": eig_res, "fold_res": fold_res}
+
+
+# ---------------------------
 # 离散化算子构造
 # ---------------------------
 
@@ -283,16 +464,101 @@ def build_3d_sinc_dvr_operator(N: int, potential_grid: Optional[PotentialGrid] =
         
     return spla.LinearOperator((N**3, N**3), matvec=matvec, dtype=float), N**3, V_flat
 
+
+def build_3d_fft_operator(N: int, potential_grid: Optional[PotentialGrid] = None,
+                           L: float = 5.0, kinetic_cut: float = 30.0):
+    """
+    构建基于 FFT 的 3D 哈密顿量算符（LinearOperator）。
+
+    每次 matvec 复杂度 O(N³ log N)，优于 Sinc-DVR 的 O(N⁴)。
+    动能通过三维 FFT 对角化：T̂|ψ⟩ = IFFT[ T(k)·FFT(ψ) ]。
+    使用周期边界条件，盒子足够大时近似等价于 Dirichlet BC。
+
+    参考 fft_code/hamiltonian.py 的 apply_H 实现，
+    区别在于预先规划 pyfftw 变换（降低重复调用开销），
+    并将结果封装为 LinearOperator 供 cgmin 等求解器使用。
+
+    Parameters
+    ----------
+    N            : 每轴网格点数
+    potential_grid : 自定义势能网格；为 None 时使用 3D 谐振子 V=½r²
+    L            : 谐振子盒子半长（仅当 potential_grid=None 时有效）
+    kinetic_cut  : k 空间动能截断值（Hartree）
+
+    Returns
+    -------
+    H_op  : LinearOperator  (N³, N³)
+    n_un  : int  总自由度 N³
+    V_flat: np.ndarray  势能展平向量 (N³,)
+    """
+    if potential_grid is None:
+        # 谐振子：周期盒长 2L，步长 d = 2L/N
+        d = 2.0 * L / N
+        x1d = (np.arange(N) - N / 2) * d
+        X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
+        V = 0.5 * (X ** 2 + Y ** 2 + Z ** 2)
+        d_use = d
+    else:
+        if potential_grid.Nx != N:
+            from grid_reader import resample_potential
+            potential_grid = resample_potential(potential_grid, N)
+        V = potential_grid.potential
+        d_use = potential_grid.x[1] - potential_grid.x[0]
+
+    # k 空间动能对角元 T(k) = |k|²/2，截断于 kinetic_cut
+    k1d = 2.0 * np.pi * np.fft.fftfreq(N, d=d_use)
+    K1d_sq = k1d ** 2
+    T_k = (K1d_sq[:, None, None] +
+           K1d_sq[None, :, None] +
+           K1d_sq[None, None, :]) / 2.0
+    T_k = np.minimum(T_k, kinetic_cut)
+
+    # 尝试使用 pyfftw 预规划变换（参考 fft_code/hamiltonian.py）
+    # pyfftw FFTW_BACKWARD 不归一化：IFFT_unnorm(FFT(x)) = N³·x
+    # 因此在 k 空间乘以 T_k/N³ 以补偿归一化
+    try:
+        import pyfftw
+        _buf  = pyfftw.empty_aligned((N, N, N), dtype='complex128')
+        _kbuf = pyfftw.empty_aligned((N, N, N), dtype='complex128')
+        _fwd  = pyfftw.FFTW(_buf,  _kbuf, axes=(0, 1, 2),
+                             direction='FFTW_FORWARD',  flags=('FFTW_MEASURE',))
+        _bwd  = pyfftw.FFTW(_kbuf, _buf,  axes=(0, 1, 2),
+                             direction='FFTW_BACKWARD', flags=('FFTW_MEASURE',))
+        # pyfftw 默认 normalise_idft=True，与 numpy.fft.ifftn 行为一致，无需额外除以 N³
+
+        def matvec(v: np.ndarray) -> np.ndarray:
+            psi = v.reshape(N, N, N)
+            _buf[:]  = psi
+            _fwd()              # _buf -> _kbuf  (FFT，无归一化)
+            _kbuf[:] *= T_k     # 乘 T(k)
+            _bwd()              # _kbuf -> _buf  (IFFT，pyfftw 自动除以 N³)
+            Tpsi = _buf.real.copy()
+            return (Tpsi + V * psi).ravel()
+
+    except ImportError:
+        # 回退到 numpy.fft（自动归一化，公式更简洁）
+        def matvec(v: np.ndarray) -> np.ndarray:
+            psi = v.reshape(N, N, N)
+            psi_k = np.fft.fftn(psi)
+            Tpsi  = np.fft.ifftn(T_k * psi_k).real
+            return (Tpsi + V * psi).ravel()
+
+    return spla.LinearOperator((N**3, N**3), matvec=matvec, dtype=float), N**3, V.ravel()
+
+
 # ---------------------------
 # 核心求解器（增强版）
 # ---------------------------
 
-def solve_ho3d(method_spec: str, N: int, n_levels: int, 
+def solve_ho3d(method_spec: str, N: int, n_levels: int,
                potential_grid: Optional[PotentialGrid] = None,
                L: float = 5.0,
                target: Optional[float] = None,
                v0: Optional[np.ndarray] = None,
-               maxBlockSize: int = 1, **kwargs):
+               maxBlockSize: int = 1,
+               primme_print_level: int = 0,
+               return_primme_stats: bool = False,
+               **kwargs):
     """
     求解3D薛定谔方程（增强版，支持多网格）
     
@@ -361,15 +627,18 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
             V_interior = potential_grid.potential[1:-1, 1:-1, 1:-1]
             H_op += sp.diags(V_interior.ravel(), 0, format="csc")
         n_un, M_op = n1**3, None
+    elif disc == "fft_dvr":
+        H_op, n_un, _ = build_3d_fft_operator(N, potential_grid, L)
+        M_op = None
     else:  # sinc_dvr
         H_op, n_un, V_diag = build_3d_sinc_dvr_operator(N, potential_grid, L)
-        
+
         # 获取正确的步长
         if potential_grid is None:
             h = (2.0*L)/(N-1)
         else:
             h = potential_grid.x[1] - potential_grid.x[0]
-        
+
         T_diag_val = (np.pi**2)/(2.0*h**2)
         shift = target if target is not None else 0.0
         M_vals = 1.0 / (T_diag_val + V_diag - shift + 1e-3)
@@ -401,13 +670,30 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
             X0 = v0[:, :n_levels]
         else:
             X0 = np.random.standard_normal((n_un, n_levels))
-        evals, evecs = spla.lobpcg(H_op, X0, 
+        evals, evecs = spla.lobpcg(H_op, X0,
                                   M=M_op if disc=="sinc_dvr" else None,
                                   largest=False, **kwargs)
         # LOBPCG不支持target模式，如果指定target会给出警告
         if target is not None:
             print("Warning: LOBPCG does not support target mode, computing smallest eigenvalues")
-    
+
+    elif solver_method.lower() == "cgmin":
+        # 非线性 CG 最小化 ||(H - E_target)x||^2，每次求一个态
+        if target is None:
+            raise ValueError("cgmin solver requires target energy (use target= parameter)")
+        rng = np.random.default_rng(42)
+        x0_cg = v0.ravel() if v0 is not None else rng.standard_normal(n_un)
+        cg_res = cg_minimize_folded(
+            H_op, target, x0_cg,
+            maxiter=kwargs.pop("cgmin_maxiter", 2000),
+            gtol=kwargs.pop("cgmin_gtol", 1e-8),
+            energy_tol=kwargs.pop("cgmin_energy_tol", 5e-4),
+            theta_max=kwargs.pop("cgmin_theta_max", 0.8),
+            verbose=kwargs.pop("cgmin_verbose", True),
+        )
+        evals = np.array([cg_res["E_ritz"]])
+        evecs = cg_res["x"].reshape(-1, 1)
+
     else:
         # PRIMME系列求解器
         if not HAS_PRIMME:
@@ -416,7 +702,8 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
         p_map = {
             "gd": "PRIMME_GD",
             "davidson": "PRIMME_DEFAULT_METHOD",
-            "jd": "PRIMME_JDQMR"
+            "jd": "PRIMME_JDQMR",
+            "jdqmr": "PRIMME_JDQMR",
         }
         
         actual_method = solver_method if solver_method.upper().startswith("PRIMME_") else \
@@ -426,30 +713,35 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
         default_ncv = max(80, 2*n_levels)
         ncv_value = kwargs.pop('ncv', default_ncv)  # 从kwargs中提取ncv，如果没有则使用默认值
         
+        _primme_common = dict(
+            OPinv=M_op if disc=="sinc_dvr" else None,
+            method=actual_method,
+            maxBlockSize=maxBlockSize,
+            ncv=ncv_value,
+            v0=v0,
+            printLevel=primme_print_level,
+            return_stats=return_primme_stats,
+            return_history=return_primme_stats,
+        )
+
         if target is not None:
             # 目标模式：求解最接近target的特征值
-            evals, evecs = primme.eigsh(
-                H_op,
-                k=n_levels,
-                which=target,   # 关键修改
-                OPinv=M_op if disc=="sinc_dvr" else None,
-                method=actual_method,
-                maxBlockSize=maxBlockSize,
-                ncv=ncv_value,
-                v0=v0,  # 初始猜测
-                **kwargs
+            _primme_result = primme.eigsh(
+                H_op, k=n_levels, which=target,
+                **_primme_common, **kwargs
             )
-
         else:
             # 标准模式：求解最小的特征值
-            evals, evecs = primme.eigsh(H_op, k=n_levels, 
-                                       which='SA',  # Smallest Algebraic
-                                       OPinv=M_op if disc=="sinc_dvr" else None,
-                                       method=actual_method,
-                                       maxBlockSize=maxBlockSize,
-                                       ncv=ncv_value,
-                                       v0=v0,  # 初始猜测
-                                       **kwargs)
+            _primme_result = primme.eigsh(
+                H_op, k=n_levels, which='SA',
+                **_primme_common, **kwargs
+            )
+
+        if return_primme_stats:
+            evals, evecs, _primme_stats = _primme_result
+        else:
+            evals, evecs = _primme_result
+            _primme_stats = {}
     
     t_eig = time.perf_counter() - t_eig_start
     evals, evecs = _sort_eigs(evals, evecs)
@@ -461,18 +753,25 @@ def solve_ho3d(method_spec: str, N: int, n_levels: int,
     # 记录使用的空间范围
     x_min, x_max = _get_spatial_range(potential_grid, L)
     
-    return SolveResult(evals, evecs, {
-        "method": method_spec, 
-        "method_label": _label(disc, solver_method), 
-        "N": N, 
-        "total_nodes": N**3, 
-        "t_build": t_build, 
+    meta = {
+        "method": method_spec,
+        "method_label": _label(disc, solver_method),
+        "N": N,
+        "total_nodes": N**3,
+        "t_build": t_build,
         "t_eig": t_eig,
         "potential": pot_source,
         "mode": mode,
         "used_v0": used_v0,
-        "spatial_range": (x_min, x_max),  # 记录实际使用的空间范围
-    })
+        "spatial_range": (x_min, x_max),
+        "n_levels": n_levels,
+        "maxBlockSize": maxBlockSize,
+        "target": target,
+        "ncv": ncv_value if "ncv_value" in locals() else None,
+    }
+    if _primme_stats:
+        meta["primme_stats"] = _primme_stats
+    return SolveResult(evals, evecs, meta)
 
 # ---------------------------
 # Benchmark & Plot

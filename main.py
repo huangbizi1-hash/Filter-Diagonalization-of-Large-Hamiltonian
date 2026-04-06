@@ -1,156 +1,233 @@
 """
 main.py
 =======
-Quantum eigenvalue solver via FFT-based Hamiltonian filter + Rayleigh-Ritz.
+FFT 滤波对角化（Filter Diagonalization Method）入口脚本。
 
-Usage:
-  python main.py                  # run with CONFIG below
-  python main.py --cfg my.json    # override CONFIG from a JSON file
+算法概述
+--------
+在三维均匀实空间网格上，通过以下流程求解定态薛定谔方程 H|ψ⟩ = E|ψ⟩ 的本征能级：
 
-All results (energies, timings, config snapshot) are saved to
-  results/<timestamp>_<tag>/res.json
-All figures are saved to the same folder.
+  1. 构建势能场 V(r)
+     支持四种类型：
+       - ho3d          : 三维谐振子  V = ½ω²r²
+       - harmonic_well : 截断谐振势阱（可多中心叠加）
+       - gaussian_blob : 单高斯凹坑  V = h·exp(-μr²)
+       - gaussian_files: 从 ab-initio 计算输出的 .cube 文件和
+                         高斯拟合参数 .json 文件重建原子势
+                         （调用 gaussian_potential_builder.GaussianPotentialBuilder）
+
+  2. 构建动能算符对角元 T(k) = |k|²/2，截断于 kinetic_cut
+
+  3. 计算 Newton 多项式滤波器系数（fft_code.filter_coeff）
+
+  4. 滤波随机态生成子空间基（fft_code.hamiltonian）
+
+  5. Rayleigh-Ritz 对角化（fft_code.rayleigh_ritz）
+
+  6. 保存结果与图像至 results/<timestamp>_<tag>/
+
+模块结构
+--------
+  fft_code/
+    params.py        — IstParams / PhysParams 数据类
+    grid.py          — 网格构建 / k 空间动能对角元
+    wavefunction.py  — 波函数归一化 / 随机初态
+    hamiltonian.py   — FFT 动能 / 哈密顿量 / 滤波器作用
+    filter_coeff.py  — Newton 插值滤波系数
+    rayleigh_ritz.py — SVD + Rayleigh-Ritz 对角化
+    potentials.py    — 测试势能 + build_potential_from_config 分派器
+    plotting.py      — 所有绘图函数
+
+关键参数说明
+-----------
+  N             : 每轴网格点数（总格点数 = N³）
+  nc            : Newton 插值节点数，越大越精确
+  dE            : 滤波窗口宽度，须满足 Vmin + dE ≥ V_max + kinetic_cut
+  Vmin          : 滤波窗口下界，须满足 Vmin ≤ V_min(grid)
+  dt            : 高斯滤波宽度，由 dt = (nc / (dE×2.5))² 自动推导
+  El_list       : 滤波中心能量列表
+  n_random      : 每个滤波中心的随机初态数量
+  svd_tol       : SVD 秩截断阈值
+  kinetic_cut   : k 空间动能截断上限（原子单位）
+
+使用方法
+--------
+  python main.py                  # 使用文件内 CONFIG 运行
+  python main.py --cfg my.json    # 从外部 JSON 文件覆盖 CONFIG 参数
+
+注意事项
+--------
+  ⚠️  更换势能类型时必须同步调整 Vmin 和 dE，使滤波窗口完整覆盖
+      哈密顿量谱范围。程序启动后会打印 "Spectrum check" 可据此调参。
 """
 
 # ============================================================
-# Imports
+# 标准库 / 第三方
 # ============================================================
 import argparse
 import copy
 import json
-import os
 import random
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")          # non-interactive backend for saving figures
-import matplotlib.pyplot as plt
-import pyfftw
-from scipy.linalg import eigh
+matplotlib.use("Agg")
+
+# ============================================================
+# fft_code 子包
+# ============================================================
+from fft_code.params       import IstParams, PhysParams
+from fft_code.grid         import build_k_diagonal
+from fft_code.wavefunction import random_sine_psi, normalize_psi
+from fft_code.hamiltonian  import apply_H, apply_filter_H, apply_filter_H_all
+from fft_code.filter_coeff import build_filter_coefficients, make_filter_func
+from fft_code.rayleigh_ritz import svd_rayleigh_ritz
+from fft_code.potentials   import build_potential_from_config
+from fft_code.plotting     import (
+    plot_filter_interpolation,
+    plot_window_comparison,
+    plot_filtered_energies,
+    plot_energy_levels,
+    plot_energy_errors,
+    plot_potential_slice,
+)
 
 
 # ============================================================
-# ✅  CONFIG  ― only change this block to run different setups
+# ✅  CONFIG  ― 仅修改此块以切换运行配置
 # ============================================================
-#cccc
 CONFIG: Dict[str, Any] = {
-    # ---------- output ----------
+    # ---------- 输出 ----------
     "out_root": "results",
     "tag": "gaussian_run",
 
-    # ---------- potential ----------
+    # ---------- 势能 ----------
     "potential": {
         "type": "gaussian_files",
-        "d": 0.5,                               # grid spacing for resampling
+        "d": 0.5,                               # 重采样网格步长
         "cube_file": "localPot.cube",
         "params_file": "gaussian_fit_params.json",
         "r_cut": 7.0,
     },
 
-    # ---------- grid ----------
+    # ---------- 网格 ----------
     "N": 64,
 
-    # ---------- filter ----------
+    # ---------- 滤波器 ----------
     # ⚠️  先用小参数跑一次，看启动时打印的 Spectrum check 里的 H_max，再调这两个值
     "nc": 1000,
     "dE": 50.0,             # 根据实际 H_max 调整
     "Vmin": -5.0,           # 根据实际 V_min 调整
-    "El_list": list(np.arange(-0.7, -0.6, 0.1).tolist()),   # 根据你关心的能级范围设置
+    "El_list": list(np.arange(-0.2, -0.1, 0.1).tolist()),
 
-    # ---------- random states ----------
-    "n_random": 40,
-    "seed": 42,
+    # ---------- 窗函数类型 ----------
+    # "gaussian"       : 经典高斯，宽度由 dt=(nc/(dE×2.5))² 决定（窄 → 高 nc）
+    # "gabor"          : 超高斯包络 × cos 调制，关于 El 对称，宽度由 alpha_f/n0 控制
+    #                    f(x) = exp(-alpha_f*|x-El|**n0) · cos(k_f*(x-El))
+    #                    n0=2 → 普通高斯包络；n0>2 → 超高斯（平顶更宽、边沿更陡）
+    # "bandpass"       : 平滑带通窗（双 tanh 差分），关于 El 对称
+    #                    w(x) = 0.5·[tanh(β(x-EL)) - tanh(β(x-ER))]
+    #                    EL = El - E1，ER = El + E1
+    #                    beta 越大截止越锐利；E1 为带通半宽（Hartree）
+    # "split_bandpass" : 把带通分成高通和低通两次分别拟合后依次作用：
+    #                    w_hi(x) = 0.5·(1 + tanh(β(x-EL)))   高通（截止 EL=El-E1）
+    #                    w_lo(x) = 0.5·(1 - tanh(β(x-ER)))   低通（截止 ER=El+E1）
+    #                    先作用高通：φ₁ = w_hi(H)|ψ⟩
+    #                    再作用低通：φ₂ = w_lo(H)|φ₁⟩
+    #                    合力 ≈ w_hi·w_lo（两者都是 H 的函数故可交换），
+    #                    但每个多项式阶数为 nc 而非乘积 2nc，数值更稳定。
+    "filter_type": "bandpass",   # "gaussian" | "gabor" | "bandpass" | "split_bandpass"
+    "alpha_f": 45.0,             # Gabor 包络衰减系数
+    "k_f": 20.0,                 # Gabor 余弦调制频率（Hartree⁻¹）
+    "n0": 4,                     # Gabor 包络指数（n0=2 普通高斯，n0=4 超高斯）
+    "beta": 45.0,                # 带通窗边沿陡峭系数（仅 bandpass/split_bandpass 使用）
+    "E1": 0.1,                   # 带通窗半宽（Hartree，仅 bandpass/split_bandpass 使用）
 
-    # ---------- SVD / Rayleigh-Ritz ----------
-    "svd_tol": 1e-3,
-    "max_energies": 200,
+    # ---------- Newton 插值节点选取方式 ----------
+    # "ashkenazy"          : 贪心最大化 Vandermonde 行列式（默认），近似 Chebyshev 分布
+    # "chebyshev"          : 第一类 Chebyshev 节点，两端密、中间稀
+    # "derivative_adapted" : 基于 |dw/dx| 的反 CDF 自适应（仅推荐与 bandpass 配合使用）
+    #                        在 EL=El-E1 和 ER=El+E1 两个 tanh 过渡区密集放点，
+    #                        通带顶部（≈1）和远端衰减区（≈0）少放点
+    "samp_method": "ashkenazy",  # "ashkenazy" | "chebyshev" | "derivative_adapted" | "density_mapped"
+    # 以下仅在 samp_method="derivative_adapted" 时生效：
+    "deriv_bg_frac": 0.2,        # 均匀背景占比（0=纯自适应；0.2 = 20% 均匀，保证远端衰减区有节点）
+    # 以下仅在 samp_method="density_mapped" 时生效：
+    # density_lo / density_hi : 需要密集采样的物理能量区间（Hartree）
+    # density_alpha           : 密度增强强度 α（推荐 5~20；越大该区间节点越密，其他区域越稀）
+    "density_lo":    -0.3,       # 密集采样区间左端（Hartree）
+    "density_hi":    -0.0,       # 密集采样区间右端（Hartree）
+    "density_alpha": 0.00,       # 密度增强强度 α
 
-    # ---------- kinetic cutoff ----------
-    "kinetic_cut": 30.0,
-
-    # ---------- misc ----------
-    "print_every_filter": 1,
-}
-CONFIG["dt"] = (CONFIG["nc"] / (CONFIG["dE"] * 2.5)) ** 2
-'''
-CONFIG: Dict[str, Any] = {
-    # ---------- output ----------
-    "out_root": "results",
-    "tag": "ho3d_test",
-
-    # ---------- potential ----------
-    # type = "ho3d"          : pure V = 0.5*omega^2*r^2 (unbounded)
-    # type = "harmonic_well" : truncated harmonic well (same as refactored_code)
-    # type = "gaussian_blob" : single Gaussian dip
-    # type = "gaussian_files": load from .cube + .json
-    #
-    # ⚠️  Vmin and dE MUST satisfy:
-    #       Vmin + dE  >=  V_max(grid) + kinetic_cut   (covers full spectrum)
-    #       Vmin       <=  V_min(grid)
-    #
-    #   harmonic_well (d=0.5, width=4): V in [0,8],  H_max~38  → Vmin=-5, dE=50  ✓
-    #   ho3d          (d=0.5, N=20)   : V in [0,34], H_max~64  → Vmin=-1, dE=70
-    "potential": {
-        "type": "harmonic_well",   # ← switch potential type here
-
-        # ── shared: grid spacing (used by all types) ──
-        "d": 0.5,
-
-        # ── ho3d ──
-        "omega": 1.0,
-
-        # ── harmonic_well ──
-        "center_locations": [[0.0, 0.0, 0.0]],
-        "width": 4.0,
-
-        # ── gaussian_blob ──
-        "h": -5.0,
-        "mu": 0.1,
-
-        # ── gaussian_files ──
-        "cube_file": "localPot.cube",
-        "params_file": "gaussian_fit_params.json",
-        "r_cut": 7.0,
+    # ---------- 窗函数对比绘图 ----------
+    # 若 plot_window_bands 非空，在 window_comparison.png 中标记目标频带和 gap
+    "plot_window_bands": {
+        "target": [-0.22, -0.13],   # 感兴趣的本征值区间（绿色阴影）
+        "gap":    [-0.20, -0.15],   # 无本征值的 gap（红色阴影）
     },
 
-    # ---------- grid ----------
-    "N": 20,                # grid points per axis
-
-    # ---------- filter ----------
-    # ⚠️  Adjust Vmin/dE when switching potential type (see note above)
-    "nc": 200,              # Newton interpolation nodes
-    "dE": 50.0,             # energy window width  (harmonic_well default)
-    "Vmin": -5.0,           # lower bound          (harmonic_well default)
-    # For ho3d use:  "dE": 70.0, "Vmin": -1.0
-    "El_list": list(np.arange(0.5, 5.5, 1.0).tolist()),  # filter centres
-
-    # ---------- random states ----------
-    "n_random": 50,
+    # ---------- 随机态 ----------
+    "n_random": 1,
     "seed": 42,
 
     # ---------- SVD / Rayleigh-Ritz ----------
     "svd_tol": 1e-3,
     "max_energies": 200,
 
-    # ---------- kinetic cutoff ----------
+    # ---------- 动能截断 ----------
     "kinetic_cut": 30.0,
 
-    # ---------- misc ----------
-    "print_every_filter": 1,   # print progress every N filter centres
+    # ---------- 杂项 ----------
+    "print_every_filter": 1,
+
+    # ---------- Newton 节点自适应增强 ----------
+    # 在 samp_method 生成的基础节点之上，若插值 MAE 超过阈值，
+    # 则在 interval_samp_enhance（物理坐标，Hartree）内逐步追加节点。
+    # nc 作为初始估计，实际用到的 nc_true = len(samp) 会在运行时确定并记录。
+    # 设为 null（Python None）可完全禁用自适应增强。
+    "interval_samp_enhance":    [-0.22, -0.13],  # 需要加密的能量区间 [lo, hi]（Hartree）
+    "interpolation_tolerance":  1e-3,            # 插值最大绝对误差阈值；超过则继续追加节点
+    "enhance_step":             1,               # 每轮追加节点数
+    "max_enhance_iters":        0,               # 最大增强轮数（防止不收敛）
+    "enhance_density_factor":   1,               # 加密区间候选点密度系数（越大 → 偏置越强）
+
+    # ---------- 画图 ----------
+    "plot_interval": [-0.35, 0.0],  # 滤波函数绘图能量区间 [E_lo, E_hi]
 }
-# dt is derived, not set manually
 CONFIG["dt"] = (CONFIG["nc"] / (CONFIG["dE"] * 2.5)) ** 2
 
-'''
+
 # ============================================================
-# JSON helper
+# ✅  SCAN  ― 参数扫描列表（留空则只跑一次 CONFIG）
+#
+# 用法：在列表中每加一个 dict，就多跑一次。
+# dict 里只写想要覆盖的键，其余键保持 CONFIG 默认值。
+# 支持嵌套 dict（如 "potential"）：会递归合并而非整体替换。
+#
+# 示例：
+#   SCAN = [
+#       {"nc": 100},                          # 第1次：nc=100
+#       {"nc": 200, "n_random": 10},          # 第2次：nc=200, n_random=10
+#       {"nc": 500, "dE": 60.0, "Vmin": -6}, # 第3次：同时改三个参数
+#   ]
+#
+# 若 SCAN = []，则退化为只跑一次 CONFIG，与原行为完全一致。
+# ============================================================
+SCAN = [
+    # {"nc": 100},
+    # {"nc": 200, "n_random": 10},
+]
+
+
+# ============================================================
+# JSON 辅助
 # ============================================================
 def _to_jsonable(obj: Any) -> Any:
-    """Recursively convert numpy types to plain Python for JSON."""
+    """递归将 numpy 类型转为 Python 原生类型以便 JSON 序列化。"""
     if isinstance(obj, (np.floating, np.complexfloating)):
         return float(obj.real)
     if isinstance(obj, np.integer):
@@ -171,523 +248,33 @@ def save_json(obj: Dict[str, Any], path: Path) -> None:
 
 
 # ============================================================
-# Data classes
-# ============================================================
-class IstParams:
-    """Discretisation parameters for the Newton interpolation."""
-    def __init__(self, nc: int, ms: int):
-        self.nc = nc   # number of Newton nodes
-        self.ms = ms   # number of filter energy centres
-
-
-class PhysParams:
-    """Physical / scaling parameters."""
-    def __init__(self, dE: float, Vmin: float, dt: float):
-        self.dE   = dE
-        self.Vmin = Vmin
-        self.dt   = dt
-
-
-# ============================================================
-# Grid utilities
-# ============================================================
-def grid_to_vec(y_grid: np.ndarray) -> np.ndarray:
-    """(n, Nx, Ny, Nz) → (Nx*Ny*Nz, n)"""
-    return y_grid.reshape(y_grid.shape[0], -1).T
-
-
-def vec_to_grid(y_vec: np.ndarray, Nx: int, Ny: int, Nz: int) -> np.ndarray:
-    """(Nx*Ny*Nz, n) → (n, Nx, Ny, Nz)"""
-    return y_vec.T.reshape(y_vec.shape[-1], Nx, Ny, Nz)
-
-
-def build_grid(N: int, d: float) -> Tuple:
-    """
-    Uniform grid: spacing *d*, *N* points per axis, centred at 0.
-    Returns x, y, z, X, Y, Z, x_grid=[x,y,z].
-    """
-    L = (N - 1) * d / 2
-    x = np.linspace(-L, L, N)
-    y = np.linspace(-L, L, N)
-    z = np.linspace(-L, L, N)
-    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
-    return x, y, z, X, Y, Z, [x, y, z]
-
-
-def build_grid_box(N: int, L: float) -> Tuple:
-    """
-    Uniform grid: N points per axis, x ∈ [-L/2, L/2).
-    Spacing d = L/N  (periodic-box convention).
-    Returns x, y, z, X, Y, Z, x_grid=[x,y,z].
-    """
-    d = L / N
-    x = (np.arange(N) - N / 2) * d
-    y = x.copy()
-    z = x.copy()
-    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
-    return x, y, z, X, Y, Z, [x, y, z]
-
-
-def build_k_diagonal(x_grid, kinetic_cut: float = 30.0) -> np.ndarray:
-    """T(k) = |k|²/2, capped at *kinetic_cut*."""
-    x, y, z = x_grid
-    d = x[1] - x[0]
-    kx = 2 * np.pi * np.fft.fftfreq(len(x), d=d)
-    ky = 2 * np.pi * np.fft.fftfreq(len(y), d=d)
-    kz = 2 * np.pi * np.fft.fftfreq(len(z), d=d)
-    Kx, Ky, Kz = np.meshgrid(kx, ky, kz, indexing='ij')
-    T_k = (Kx**2 + Ky**2 + Kz**2) / 2
-    return np.minimum(T_k, kinetic_cut)
-
-
-# ============================================================
-# Potential builders
-# ============================================================
-def build_ho3d(X, Y, Z, omega: float = 1.0) -> np.ndarray:
-    """V = ½ ω² r²   (3-D harmonic oscillator)."""
-    return 0.5 * omega**2 * (X**2 + Y**2 + Z**2)
-
-
-def build_harmonic_well(X, Y, Z, center_locations: List, width: float) -> np.ndarray:
-    """Truncated harmonic well(s)."""
-    V = np.zeros(X.shape)
-    V_max = 0.5 * width**2
-    for center in center_locations:
-        c = np.asarray(center)
-        r2 = (X - c[0])**2 + (Y - c[1])**2 + (Z - c[2])**2
-        inside = np.sqrt(r2) < width
-        V[inside] += 0.5 * r2[inside]
-    V[(V == 0) | (V >= V_max)] = V_max
-    return V
-
-
-def build_gaussian_blob(X, Y, Z, h: float = -5.0, mu: float = 0.1) -> np.ndarray:
-    """V = h * exp(-μ r²)."""
-    return h * np.exp(-mu * (X**2 + Y**2 + Z**2))
-
-
-def build_gaussian_files(X, Y, Z, cube_file: str, params_file: str,
-                          r_cut: float = 7.0) -> np.ndarray:
-    """
-    Reconstruct potential from ab-initio Gaussian fit parameters.
-    Reads atom positions from *cube_file* and fit coefficients from *params_file*.
-    """
-    # ---- read Gaussian fit parameters ----
-    with open(params_file, 'r') as f:
-        params = json.load(f)
-
-    # ---- read atom positions from cube file ----
-    atoms, atom_types = _read_cube_atoms(cube_file)
-
-    V = np.zeros(X.shape)
-    for atom, atype in zip(atoms, atom_types):
-        if atype == 'Unknown':
-            continue
-        atom_params = params['atoms'][atype]
-        amplitudes  = atom_params['amplitudes']
-        exponents   = atom_params['exponents']
-        pos = atom['position']
-        r2  = (X - pos[0])**2 + (Y - pos[1])**2 + (Z - pos[2])**2
-        r   = np.sqrt(r2)
-        mask = r <= r_cut
-        V_atom = np.zeros_like(r)
-        for A, alpha in zip(amplitudes, exponents):
-            V_atom[mask] += A * np.exp(-alpha * r2[mask])
-        V += V_atom
-    return V
-
-
-def _read_cube_atoms(filename: str) -> Tuple[List[Dict], List[str]]:
-    """Parse atom positions and types from a Gaussian cube file."""
-    with open(filename, 'r') as f:
-        lines = f.readlines()
-    idx = 2
-    parts    = lines[idx].split()
-    n_atoms  = int(parts[0])
-    idx += 1 + 3   # skip origin + 3 grid-vector lines
-
-    atoms      = []
-    atom_types = []
-    _atomic_number_to_type = {33: 'As', 49: 'In'}
-
-    for _ in range(n_atoms):
-        parts = lines[idx].split()
-        atomic_number = int(parts[0])
-        charge        = float(parts[1])
-        position      = np.array([float(parts[2]), float(parts[3]), float(parts[4])])
-        atoms.append({'atomic_number': atomic_number,
-                      'charge': charge,
-                      'position': position})
-        if atomic_number in _atomic_number_to_type:
-            atom_types.append(_atomic_number_to_type[atomic_number])
-        elif atomic_number == 1:
-            atom_types.append('P1' if charge > 0 else 'P2')
-        else:
-            atom_types.append('Unknown')
-        idx += 1
-
-    return atoms, atom_types
-
-
-def build_potential_from_config(cfg: Dict, N: int) -> Tuple[np.ndarray, ...]:
-    """
-    Dispatch to the correct potential builder based on cfg['potential']['type'].
-
-    Returns x, y, z, X, Y, Z, x_grid, V
-    """
-    pot  = cfg["potential"]
-    ptype = pot["type"]
-    kinetic_cut = cfg.get("kinetic_cut", 30.0)
-
-    if ptype == "ho3d":
-        x, y, z, X, Y, Z, x_grid = build_grid(N, pot["d"])
-        V = build_ho3d(X, Y, Z, omega=pot["omega"])
-
-    elif ptype == "harmonic_well":
-        x, y, z, X, Y, Z, x_grid = build_grid(N, pot["d"])
-        V = build_harmonic_well(X, Y, Z,
-                                center_locations=pot["center_locations"],
-                                width=pot["width"])
-
-    elif ptype == "gaussian_blob":
-        x, y, z, X, Y, Z, x_grid = build_grid(N, pot["d"])
-        V = build_gaussian_blob(X, Y, Z, h=pot["h"], mu=pot["mu"])
-
-    elif ptype == "gaussian_files":
-        # Grid is read from cube file dimensions; we re-sample to N
-        from gaussian_potential_builder import GaussianPotentialBuilder
-        builder = GaussianPotentialBuilder(
-            cube_file=pot["cube_file"],
-            params_file=pot["params_file"],
-            r_cut=pot["r_cut"],
-        )
-        x_raw, y_raw, z_raw, V = builder.build_potential(N)
-        x = x_raw; y = y_raw; z = z_raw
-        X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
-        x_grid  = [x, y, z]
-
-    else:
-        raise ValueError(f"Unknown potential type: '{ptype}'")
-
-    return x, y, z, X, Y, Z, x_grid, V
-
-
-# ============================================================
-# Wavefunction utilities
-# ============================================================
-def normalize_psi(psi: np.ndarray) -> np.ndarray:
-    return psi / np.sqrt(np.sum(np.abs(psi)**2))
-
-
-def random_sine_psi(X, Y, Z, rng: Optional[np.random.Generator] = None) -> np.ndarray:
-    """Random sinusoidal wavefunction."""
-    if rng is not None:
-        vals = rng.uniform(-1.0, 1.0, 4)
-        kx_val, ky_val, kz_val, b_val = vals
-    else:
-        kx_val = random.uniform(-1.0, 1.0)
-        ky_val = random.uniform(-1.0, 1.0)
-        kz_val = random.uniform(-1.0, 1.0)
-        b_val  = random.uniform(-1.0, 1.0)
-    psi = np.sin(kx_val * X + ky_val * Y + kz_val * Z + b_val) + 0.0j
-    return normalize_psi(psi)
-
-
-# ============================================================
-# Hamiltonian (FFT-based)
-# ============================================================
-def eval_kinetic(psi: np.ndarray, T_k_diagonal: np.ndarray) -> np.ndarray:
-    """T̂|ψ⟩ via pyfftw 3-D FFT."""
-    shape    = psi.shape
-    fft_in   = pyfftw.empty_aligned(shape, dtype='complex128')
-    fft_out  = pyfftw.empty_aligned(shape, dtype='complex128')
-    ifft_out = pyfftw.empty_aligned(shape, dtype='complex128')
-    fft1  = pyfftw.FFTW(fft_in,  fft_out,  axes=(0, 1, 2),
-                         direction='FFTW_FORWARD',  flags=('FFTW_MEASURE',))
-    ifft1 = pyfftw.FFTW(fft_out, ifft_out, axes=(0, 1, 2),
-                         direction='FFTW_BACKWARD', flags=('FFTW_MEASURE',))
-    fft_in[:] = psi
-    fft1()
-    fft_out[:] = T_k_diagonal * fft_out
-    ifft1()
-    return ifft_out.copy()
-
-
-def apply_H(psi: np.ndarray, V: np.ndarray,
-            T_k_diagonal: np.ndarray) -> np.ndarray:
-    """H|ψ⟩ = T̂|ψ⟩ + V|ψ⟩."""
-    return eval_kinetic(psi, T_k_diagonal) + V * psi
-
-
-def apply_filter_H(psi: np.ndarray, V: np.ndarray,
-                   nodes: np.ndarray, coeffs: np.ndarray,
-                   par: PhysParams,
-                   T_k_diagonal: np.ndarray) -> np.ndarray:
-    """
-    f(H)|ψ⟩  via Newton polynomial in scaled Hamiltonian.
-    Scaled variable:  x̃ = 4(H - Vmin)/dE - 2
-    """
-    n        = len(nodes)
-    psi_prev = psi.copy()
-    result   = coeffs[0] * psi
-
-    for j in range(1, n):
-        T_psi    = eval_kinetic(psi_prev, T_k_diagonal)
-        H_psi    = T_psi + V * psi_prev
-        psi_curr = ((4.0 / par.dE) * (H_psi - par.Vmin * psi_prev)
-                    - 2.0 * psi_prev
-                    - nodes[j - 1] * psi_prev)
-        result  += coeffs[j] * psi_curr
-        psi_prev = psi_curr
-
-    return result
-
-
-# ============================================================
-# Newton interpolation for filter coefficients
-# ============================================================
-def _filt_func_values(x: np.ndarray, dt: float) -> np.ndarray:
-    return np.sqrt(dt / np.pi) * np.exp(-x**2 * dt)
-
-
-def _samp_points_ashkenazy(min_val: float, max_val: float, nc: int) -> np.ndarray:
-    nc3  = 32 * nc
-    samp = (min_val + np.arange(nc3) * (max_val - min_val) / (nc3 - 1)).astype(complex)
-    point = np.zeros(nc, dtype=complex)
-    point[0] = samp[0]
-    dv = (samp.real - point[0].real)**2 + (samp.imag - point[0].imag)**2
-    veca = np.where(dv < 1e-10, -1e30, np.log(dv))
-    for j in range(1, nc):
-        kmax     = np.argmax(veca)
-        point[j] = samp[kmax]
-        dv   = (samp.real - point[j].real)**2 + (samp.imag - point[j].imag)**2
-        veca = np.where(dv < 1e-10, -1e30, veca + np.log(dv))
-    return point.real
-
-
-def _newton_coefficients(x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    n = len(x)
-    f = np.zeros((n, n))
-    f[:, 0] = y
-    for j in range(1, n):
-        for i in range(j, n):
-            f[i, j] = (f[i, j - 1] - f[i - 1, j - 1]) / (x[i] - x[i - j])
-    return f[np.arange(n), np.arange(n)]
-
-
-def build_filter_coefficients(El_list: np.ndarray, par: PhysParams,
-                               nc: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Build Newton interpolation coefficients for each filter centre in El_list.
-
-    Returns
-    -------
-    an   : (ms, nc) coefficient array
-    samp : (nc,)    Ashkenazy nodes in [-2, 2]
-    """
-    Smin, Smax = -2.0, 2.0
-    scale  = (Smax - Smin) / par.dE
-    samp   = _samp_points_ashkenazy(Smin, Smax, nc)
-    x_phys = (samp + 2.0) / scale + par.Vmin
-
-    an = np.zeros((len(El_list), nc))
-    for ie, El in enumerate(El_list):
-        y = _filt_func_values(x_phys - El, par.dt)
-        an[ie] = _newton_coefficients(samp, y)
-    return an, samp
-
-
-# ============================================================
-# SVD / Rayleigh-Ritz diagonalisation
-# ============================================================
-def svd_rayleigh_ritz(filtered_psi_matrix: np.ndarray,
-                      x_grid, V: np.ndarray,
-                      Nx: int, Ny: int, Nz: int,
-                      T_k_diagonal: np.ndarray,
-                      svd_tol: float = 1e-3,
-                      max_energies: int = 200) -> Tuple[np.ndarray, np.ndarray, int]:
-    """
-    Rayleigh-Ritz diagonalisation in the filtered subspace.
-
-    Returns energies, Ur, rank r.
-    """
-    C_f = grid_to_vec(filtered_psi_matrix)
-    C_f = C_f / np.linalg.norm(C_f, axis=0)
-    C_f = C_f[:, ~np.any(np.isinf(C_f), axis=0)]
-
-    print("  QR decomposition ...")
-    Q, R = np.linalg.qr(C_f, mode='reduced')
-
-    print("  SVD on R ...")
-    U1, sigma, _ = np.linalg.svd(R, full_matrices=False)
-    U = Q @ U1
-
-    r = int(np.sum(sigma > svd_tol))
-    print(f"  Selected rank r = {r}  (tol = {svd_tol})")
-    Ur = U[:, :r]
-
-    Ur_grid  = vec_to_grid(Ur, Nx, Ny, Nz)
-    HUr_grid = np.zeros_like(Ur_grid, dtype='complex128')
-    for i in range(r):
-        HUr_grid[i] = apply_H(Ur_grid[i], V, T_k_diagonal)
-
-    H_tilde       = Ur.T.conj() @ grid_to_vec(HUr_grid)
-    energies, _   = eigh(H_tilde)
-    energies      = np.sort(energies.real)[:max_energies]
-    return energies, Ur, r
-
-
-# ============================================================
-# Plotting  (all functions save to file; show() is never called)
-# ============================================================
-def _savefig(fig, path: Path, close: bool = True) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=150, bbox_inches='tight')
-    print(f"  Figure saved: {path}")
-    if close:
-        plt.close(fig)
-
-
-def plot_filter_interpolation(El_list, an, samp, par, interval,
-                               out_dir: Path) -> None:
-    """True filter vs Newton interpolant."""
-    def _scaled_eval(x_eval, nodes, coeffs):
-        x = 4.0 * (x_eval - par.Vmin) / par.dE - 2.0
-        result = coeffs[0]
-        basis  = 1.0
-        for j in range(1, len(nodes)):
-            basis  *= (x - nodes[j - 1])
-            result += coeffs[j] * basis
-        return result
-
-    x_plot = np.linspace(interval[0], interval[1], 1000)
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for ie, El in enumerate(El_list):
-        y_true   = _filt_func_values(x_plot - El, par.dt)
-        y_interp = np.array([_scaled_eval(x, samp, an[ie]) for x in x_plot])
-        mae = np.mean(np.abs(y_true - y_interp))
-        print(f"  El={El:.2f}  MAE={mae:.6e}")
-        ax.plot(x_plot, y_true,   color='blue',
-                label='True filter' if ie == 0 else "")
-        ax.plot(x_plot, y_interp, '--', color='red',
-                label=f'Newton interp (nc={len(samp)})' if ie == 0 else "")
-    ax.set_xlabel('x')
-    ax.set_ylabel('f(x)')
-    ax.set_title(f'Filter Function vs Newton Interpolation (nc={len(samp)})')
-    ax.set_xlim(interval[0], interval[1])
-    ax.legend()
-    ax.grid(True)
-    fig.tight_layout()
-    _savefig(fig, out_dir / "filter_interpolation.png")
-
-
-def plot_filtered_energies(El_list, E_mean_all, E_std_all, N_values,
-                            error_mean_all, n_random: int,
-                            out_dir: Path) -> None:
-    """Errorbar: filtered energy expectation vs filter centre El."""
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for i, N in enumerate(N_values):
-        ax.errorbar(El_list, E_mean_all[i], yerr=E_std_all[i],
-                    fmt='o-', capsize=5,
-                    label=f'N={N}, MeanErr={error_mean_all[i]:.4f}')
-    ax.set_xlabel('El')
-    ax.set_ylabel('E_filtered')
-    ax.set_title(f'Filtered Energy by FFT (Averaged over {n_random} Random States)')
-    ax.legend()
-    ax.grid(True)
-    fig.tight_layout()
-    _savefig(fig, out_dir / "filtered_energies.png")
-
-
-def plot_energy_levels(energies_filtered: np.ndarray,
-                       exact_energies: np.ndarray,
-                       out_dir: Path) -> None:
-    """Side-by-side horizontal energy-level diagram."""
-    energies_filtered = np.sort(energies_filtered)
-    fig, ax = plt.subplots(figsize=(5, 6))
-    for i, e in enumerate(energies_filtered):
-        ax.hlines(e, 0, 0.45, color='blue', linestyle='-',
-                  label='FD Energies' if i == 0 else "")
-    for i, e in enumerate(exact_energies):
-        ax.hlines(e, 0.55, 1.0, color='red', linestyle='-',
-                  label='Exact Energies' if i == 0 else "")
-    ax.set_xlabel('Category')
-    ax.set_ylabel('Energy')
-    ax.set_xticks([0.225, 0.775])
-    ax.set_xticklabels(['FD Energies', 'Exact Energies'])
-    ax.grid(True, axis='y')
-    ax.legend()
-    fig.tight_layout()
-    _savefig(fig, out_dir / "energy_levels.png")
-
-
-def plot_energy_errors(energies_dict: Dict[str, np.ndarray],
-                       exact_energies: np.ndarray,
-                       out_dir: Path) -> None:
-    """Log-scale scatter: |E_FD - E_exact| vs nearest exact level."""
-    fig, ax = plt.subplots(figsize=(6, 5))
-    colors = plt.cm.tab10(np.linspace(0, 1, len(energies_dict)))
-    for (label, energies), color in zip(energies_dict.items(), colors):
-        energies = np.sort(energies)
-        nearest  = exact_energies[
-            np.argmin(np.abs(energies[:, None] - exact_energies[None, :]), axis=1)]
-        errors   = np.abs(energies - nearest)
-        ax.scatter(nearest, errors, color=color, alpha=0.5, s=30, label=label)
-    ax.axhline(0, color='black', linestyle='--', linewidth=1)
-    ax.set_yscale('log')
-    ax.set_xlabel('Nearest Exact Energy Level')
-    ax.set_ylabel('|FD - Exact|')
-    ax.set_title('Energy Error per FD Level')
-    ax.grid(True)
-    ax.legend()
-    fig.tight_layout()
-    _savefig(fig, out_dir / "energy_errors.png")
-
-
-def plot_potential_slice(V: np.ndarray, x: np.ndarray, z: np.ndarray,
-                          out_dir: Path) -> None:
-    """2-D slice of potential at y = 0 (midplane)."""
-    Ny  = V.shape[1]
-    mid = Ny // 2
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.pcolormesh(x, z, V[:, mid, :].T, shading='auto', cmap='viridis')
-    fig.colorbar(im, ax=ax, label='V (a.u.)')
-    ax.set_xlabel('x (a.u.)')
-    ax.set_ylabel('z (a.u.)')
-    ax.set_title('Potential slice at y = 0')
-    fig.tight_layout()
-    _savefig(fig, out_dir / "potential_slice.png")
-
-
-# ============================================================
-# Main
+# 主运行函数
 # ============================================================
 def run(cfg: Dict[str, Any]) -> None:
-    # ---- output directory ----
+    # ---- 输出目录 ----
     stamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag     = cfg.get("tag", "")
     out_dir = Path(cfg["out_root"]) / (stamp + (f"_{tag}" if tag else ""))
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nOutput directory: {out_dir}\n")
 
-    # ---- seeding ----
+    # ---- 随机种子 ----
     seed = cfg.get("seed", 0)
     np.random.seed(seed)
     random.seed(seed)
     rng = np.random.default_rng(seed)
 
-    # ---- timers ----
     timings: Dict[str, float] = {}
     t_total_start = time.perf_counter()
 
     # ================================================================
-    # 1. Build potential
+    # 1. 构建势能
     # ================================================================
     print("=" * 60)
     print("1. Building potential ...")
     t0 = time.perf_counter()
 
-    N   = cfg["N"]
+    N = cfg["N"]
     x, y, z, X, Y, Z, x_grid, V = build_potential_from_config(cfg, N)
     Nx = Ny = Nz = N
 
@@ -696,7 +283,7 @@ def run(cfg: Dict[str, Any]) -> None:
     print(f"   Grid spacing: {x[1]-x[0]:.4f} a.u.")
     print(f"   Time: {timings['build_potential']:.3f} s")
 
-    # ---- sanity check: filter window must cover the full spectrum ----
+    # ---- 频谱覆盖检查 ----
     H_max_est = float(V.max()) + cfg.get("kinetic_cut", 30.0)
     H_min_est = float(V.min())
     win_lo    = cfg["Vmin"]
@@ -710,73 +297,214 @@ def run(cfg: Dict[str, Any]) -> None:
         print(f"   Spectrum check OK: [{H_min_est:.2f}, {H_max_est:.2f}] "
               f"⊆ window [{win_lo}, {win_hi}]")
 
-    # potential slice plot
     plot_potential_slice(V, x, z, out_dir)
 
     # ================================================================
-    # 2. Build kinetic diagonal
+    # 2. 构建动能对角元
     # ================================================================
     kinetic_cut  = cfg.get("kinetic_cut", 30.0)
     T_k_diagonal = build_k_diagonal(x_grid, kinetic_cut=kinetic_cut)
 
     # ================================================================
-    # 3. Build filter coefficients
+    # 3. 构建滤波系数
     # ================================================================
     print("\n2. Building filter coefficients ...")
     t0 = time.perf_counter()
 
-    El_list = np.array(cfg["El_list"], dtype=float)
-    nc      = cfg["nc"]
-    dt      = cfg["dt"]
-    par     = PhysParams(dE=cfg["dE"], Vmin=cfg["Vmin"], dt=dt)
-    ist     = IstParams(nc=nc, ms=len(El_list))
+    El_list     = np.array(cfg["El_list"], dtype=float)
+    nc          = cfg["nc"]
+    dt          = cfg["dt"]
+    filter_type = cfg.get("filter_type", "gaussian")
+    alpha_f     = cfg.get("alpha_f", 0.5)
+    k_f         = cfg.get("k_f", 1.0)
+    n0          = cfg.get("n0", 4)
+    beta        = cfg.get("beta", 10.0)
+    E1          = cfg.get("E1", 0.05)
+    samp_method = cfg.get("samp_method", "ashkenazy")
+    par         = PhysParams(dE=cfg["dE"], Vmin=cfg["Vmin"], dt=dt)
 
-    print(f"   nc={nc},  dE={par.dE},  Vmin={par.Vmin},  dt={dt:.4f}")
-    print(f"   sigma = {1/np.sqrt(2*dt):.4f}")
+    # 构造窗函数
+    filter_func = make_filter_func(
+        filter_type, dt=dt, alpha_f=alpha_f, k_f=k_f, n0=n0, beta=beta, E1=E1)
+
+    print(f"   nc (initial)={nc},  dE={par.dE},  Vmin={par.Vmin},  dt={dt:.4f}")
+    print(f"   Filter type : {filter_type}")
+    if filter_type == "gaussian":
+        print(f"   sigma (Gaussian) = {1/np.sqrt(2*dt):.6f} Hartree")
+        filter_label = f"Gaussian (sigma={1/np.sqrt(2*dt):.4f})"
+    elif filter_type == "gabor":
+        print(f"   alpha_f = {alpha_f},  k_f = {k_f},  n0 = {n0}")
+        filter_label = f"Gabor (alpha_f={alpha_f}, k_f={k_f}, n0={n0})"
+    elif filter_type in ("bandpass", "split_bandpass"):
+        print(f"   beta = {beta},  E1 = {E1}  →  半带宽 ±{E1} Hartree")
+        if filter_type == "split_bandpass":
+            filter_label = f"SplitBandpass hi×lo (beta={beta}, E1={E1})"
+        else:
+            filter_label = f"Bandpass (beta={beta}, E1={E1})"
+    else:
+        filter_label = filter_type
+    print(f"   Sampling method : {samp_method}")
     print(f"   Number of filter centres: {len(El_list)}")
 
-    an, samp = build_filter_coefficients(El_list, par, nc)
+    # 构建 Newton 插值节点和系数
+    samp_kw = {}
+    if samp_method == "derivative_adapted":
+        samp_kw["E1"]      = E1
+        samp_kw["beta"]    = beta
+        samp_kw["bg_frac"] = cfg.get("deriv_bg_frac", 0.2)
+    if samp_method == "density_mapped":
+        samp_kw["density_lo"]    = cfg.get("density_lo",    -0.22)
+        samp_kw["density_hi"]    = cfg.get("density_hi",    -0.13)
+        samp_kw["density_alpha"] = cfg.get("density_alpha", 10.0)
+    samp_kw["enhance_density_factor"] = cfg.get("enhance_density_factor", 16)
+
+    enhance_interval = cfg.get("interval_samp_enhance", None)
+    if enhance_interval is not None:
+        enhance_interval = tuple(enhance_interval)
+
+    # split_bandpass：拟合高通和低通两个独立多项式，共用同一套节点
+    an_hi = an_lo = None   # 仅 split_bandpass 使用
+    if filter_type == "split_bandpass":
+        from fft_code.filter_coeff import compute_newton_an
+        filter_func_hi = make_filter_func("highpass", beta=beta, E1=E1)
+        filter_func_lo = make_filter_func("lowpass",  beta=beta, E1=E1)
+        # 用高通函数构建节点（节点由 samp_method 决定，与函数形状无关）
+        _, samp = build_filter_coefficients(
+            El_list, par, nc,
+            filter_func=filter_func_hi,
+            samp_method=samp_method,
+            interval_samp_enhance=enhance_interval,
+            interpolation_tolerance=cfg.get("interpolation_tolerance", 1e-3),
+            enhance_step=cfg.get("enhance_step", 10),
+            max_enhance_iters=cfg.get("max_enhance_iters", 30),
+            **samp_kw,
+        )
+        an_hi = compute_newton_an(filter_func_hi, El_list, samp, par)
+        an_lo = compute_newton_an(filter_func_lo, El_list, samp, par)
+        # an 用乘积函数（供绘图）
+        an = compute_newton_an(filter_func, El_list, samp, par)
+        print(f"   split_bandpass: hi + lo 各 nc={len(samp)} 节点，共享同一套 samp")
+    else:
+        an, samp = build_filter_coefficients(
+            El_list, par, nc,
+            filter_func=filter_func,
+            samp_method=samp_method,
+            interval_samp_enhance=enhance_interval,
+            interpolation_tolerance=cfg.get("interpolation_tolerance", 1e-3),
+            enhance_step=cfg.get("enhance_step", 10),
+            max_enhance_iters=cfg.get("max_enhance_iters", 30),
+            **samp_kw,
+        )
+
+    nc_true = len(samp)
+    ist     = IstParams(nc=nc_true, ms=len(El_list))   # 用实际节点数覆盖初始估计
 
     timings["build_filter"] = time.perf_counter() - t0
+    print(f"   nc (initial) = {nc},  nc_true = {nc_true}"
+          + (f"  (+{nc_true - nc} enhanced)" if nc_true != nc else ""))
     print(f"   Time: {timings['build_filter']:.3f} s")
 
-    # filter interpolation plot
-    interval = (float(El_list[0]) - 0.5, float(El_list[-1]) + 0.5)
-    interval = (-4.5,3.0)
-    if interval[0] < interval[1]:
-        plot_filter_interpolation(El_list, an, samp, par, interval, out_dir)
-        #print('\nplot_filter_interpolation\n')
+    interval = tuple(cfg["plot_interval"])
+
+    # 窗函数 vs Newton 插值对比图
+    # 当 density_mapped 时，额外生成一组普通 Chebyshev 节点作为参考，
+    # 在 rug plot 中叠加显示，方便直观确认密度是否增加
+    samp_ref_nodes = None
+    if samp_method == "density_mapped":
+        from fft_code.filter_coeff import _samp_points_chebyshev
+        samp_ref_nodes = _samp_points_chebyshev(-2.0, 2.0, nc_true)
+
+    # 当 split_bandpass 时，把高通和低通分量各自的插值质量也画出来，
+    # 避免只画乘积函数导致图与 bandpass 看上去完全相同
+    extra_comps = None
+    if filter_type == "split_bandpass":
+        extra_comps = [
+            (an_hi, make_filter_func("highpass", beta=beta, E1=E1), "Highpass"),
+            (an_lo, make_filter_func("lowpass",  beta=beta, E1=E1), "Lowpass"),
+        ]
+
+    plot_filter_interpolation(El_list, an, samp, par, interval, out_dir,
+                              filter_func=filter_func, filter_label=filter_label,
+                              samp_ref=samp_ref_nodes,
+                              samp_ref_label=f"plain Chebyshev (nc={nc_true})",
+                              extra_components=extra_comps)
+
+    # 多种窗函数形状对比图（帮助直观比较 gaussian / gabor 宽度差异）
+    bands     = cfg.get("plot_window_bands", {})
+    target    = bands.get("target", None)
+    gap       = bands.get("gap",    None)
+    # 构造对比所用的两条曲线：当前使用的窗 + 另一种窗（仅当两者不同时才添加对比）
+    cmp_funcs: Dict[str, Any] = {filter_label: filter_func}
+    if filter_type == "gaussian":
+        from fft_code.filter_coeff import _filt_func_gabor
+        cmp_funcs["Gabor (alpha_f=0.5, k_f=1.0, n0=4) [参考]"] = (
+            lambda x, El: _filt_func_gabor(x, El, 0.5, 1.0, 4)
+        )
+    elif filter_type == "gabor":
+        from fft_code.filter_coeff import _filt_func_gaussian
+        cmp_funcs[f"Gaussian (sigma={1/np.sqrt(2*dt):.4f}) [参考]"] = (
+            lambda x, El: _filt_func_gaussian(x, El, dt)
+        )
+    elif filter_type in ("bandpass", "split_bandpass"):
+        from fft_code.filter_coeff import _filt_func_gaussian
+        cmp_funcs[f"Gaussian (sigma={1/np.sqrt(2*dt):.4f}) [参考]"] = (
+            lambda x, El: _filt_func_gaussian(x, El, dt)
+        )
+        if filter_type == "split_bandpass":
+            from fft_code.filter_coeff import (
+                _filt_func_highpass_band, _filt_func_lowpass_band)
+            cmp_funcs[f"Highpass (beta={beta}, E1={E1})"] = (
+                lambda x, El: _filt_func_highpass_band(x, El, beta, E1))
+            cmp_funcs[f"Lowpass (beta={beta}, E1={E1})"] = (
+                lambda x, El: _filt_func_lowpass_band(x, El, beta, E1))
+    plot_window_comparison(El_list, par, interval, out_dir,
+                           window_funcs=cmp_funcs,
+                           highlight_band=target,
+                           gap_band=gap)
 
     # ================================================================
-    # 4. Filter random states
+    # 4. 滤波随机态
     # ================================================================
+    # 使用 apply_filter_H_all：所有 El 共享 Newton 基底向量，
+    # H 作用次数从 ms*nc 降至 nc。
     print("\n3. Filtering random states ...")
     t0 = time.perf_counter()
 
-    n_random           = cfg["n_random"]
+    n_random            = cfg["n_random"]
     filtered_psi_matrix = np.zeros(
         (ist.ms * n_random, Nx, Ny, Nz), dtype='complex128')
-    E_mean = []
-    E_std  = []
+    E_temp_all  = [[] for _ in range(ist.ms)]
     print_every = cfg.get("print_every_filter", 1)
 
-    for ie in range(ist.ms):
-        E_temp = []
-        for i in range(n_random):
-            psi_rand = random_sine_psi(X, Y, Z, rng=rng)
-            psi_filt = apply_filter_H(psi_rand, V, samp, an[ie], par, T_k_diagonal)
-            psi_filt = normalize_psi(psi_filt)
+    for i in range(n_random):
+        psi_rand = random_sine_psi(X, Y, Z, rng=rng)
 
-            H_psi  = apply_H(psi_filt, V, T_k_diagonal)
-            E_exp  = float(np.sum(psi_filt.conj() * H_psi).real)
-            E_temp.append(E_exp)
+        if filter_type == "split_bandpass":
+            # 两步：先高通（批量共享基底），再低通（每个 El 单独作用）
+            psi_hi_all = apply_filter_H_all(
+                psi_rand, V, samp, an_hi, par, T_k_diagonal)   # (ms, Nx, Ny, Nz)
+            psi_filt_all = np.zeros_like(psi_hi_all)
+            for ie in range(ist.ms):
+                psi_filt_all[ie] = apply_filter_H(
+                    psi_hi_all[ie], V, samp, an_lo[ie], par, T_k_diagonal)
+        else:
+            psi_filt_all = apply_filter_H_all(
+                psi_rand, V, samp, an, par, T_k_diagonal)       # (ms, Nx, Ny, Nz)
+
+        for ie in range(ist.ms):
+            psi_filt = normalize_psi(psi_filt_all[ie])
+            H_psi    = apply_H(psi_filt, V, T_k_diagonal)
+            E_exp    = float(np.sum(psi_filt.conj() * H_psi).real)
+            E_temp_all[ie].append(E_exp)
             filtered_psi_matrix[ie * n_random + i] = psi_filt
 
-        mean_e = float(np.mean(E_temp))
-        std_e  = float(np.std(E_temp))
+    E_mean = []
+    E_std  = []
+    for ie in range(ist.ms):
+        mean_e = float(np.mean(E_temp_all[ie]))
+        std_e  = float(np.std(E_temp_all[ie]))
         E_mean.append(mean_e)
         E_std.append(std_e)
-
         if ie % print_every == 0:
             print(f"   El={El_list[ie]:.2f}  mean={mean_e:.4f}  std={std_e:.4f}")
 
@@ -789,7 +517,7 @@ def run(cfg: Dict[str, Any]) -> None:
                             n_random, out_dir)
 
     # ================================================================
-    # 5. Rayleigh-Ritz diagonalisation
+    # 5. Rayleigh-Ritz 对角化
     # ================================================================
     print("\n4. Rayleigh-Ritz diagonalisation ...")
     t0 = time.perf_counter()
@@ -810,27 +538,24 @@ def run(cfg: Dict[str, Any]) -> None:
     print(f"\n   Total wall time: {timings['total']:.3f} s")
 
     # ================================================================
-    # 6. Plots for eigenvalues
+    # 6. 能级图（参考精确能级仅对 ho3d 有意义）
     # ================================================================
-    # exact energies for 3-D HO (only meaningful for ho3d potential)
     exact_energies = np.arange(1.5, 18.5, 1.0)
-
     plot_energy_levels(energies, exact_energies, out_dir)
     plot_energy_errors({f"N={N}": energies}, exact_energies, out_dir)
 
     # ================================================================
-    # 7. Save results to JSON
+    # 7. 保存 JSON 结果
     # ================================================================
     print("\n5. Saving results ...")
     results = {
-        "timestamp":        datetime.now().isoformat(timespec="seconds"),
-        "config":           cfg,
-        "timings_seconds":  timings,
+        "timestamp":       datetime.now().isoformat(timespec="seconds"),
+        "config":          cfg,
+        "timings_seconds": timings,
         "grid": {
-            "N":      N,
-            "Nx":     Nx, "Ny": Ny, "Nz": Nz,
-            "x_min":  float(x[0]), "x_max": float(x[-1]),
-            "dx":     float(x[1] - x[0]),
+            "N": N, "Nx": Nx, "Ny": Ny, "Nz": Nz,
+            "x_min": float(x[0]), "x_max": float(x[-1]),
+            "dx":    float(x[1] - x[0]),
         },
         "potential": {
             "V_min":  float(V.min()),
@@ -838,19 +563,25 @@ def run(cfg: Dict[str, Any]) -> None:
             "V_mean": float(V.mean()),
         },
         "filter": {
-            "nc":     nc,
+            "filter_type": filter_type,
+            "nc":      nc,
+            "nc_true": nc_true,
             "dt":     dt,
-            "sigma":  float(1 / np.sqrt(2 * dt)),
+            "sigma_gaussian": float(1 / np.sqrt(2 * dt)),
+            **({"alpha_f": alpha_f, "k_f": k_f, "n0": n0}
+               if filter_type == "gabor" else {}),
+            **({"beta": beta, "E1": E1}
+               if filter_type == "bandpass" else {}),
             "El_list": El_list.tolist(),
             "E_mean": E_mean,
             "E_std":  E_std,
             "error_mean_vs_El": error_mean,
         },
         "rayleigh_ritz": {
-            "rank":      rank,
-            "svd_tol":   cfg.get("svd_tol", 1e-3),
+            "rank":       rank,
+            "svd_tol":    cfg.get("svd_tol", 1e-3),
             "n_energies": len(energies),
-            "energies":  energies.tolist(),
+            "energies":   energies.tolist(),
         },
     }
     save_json(results, out_dir / "res.json")
@@ -859,29 +590,152 @@ def run(cfg: Dict[str, Any]) -> None:
 
 
 # ============================================================
-# CLI entry point
+# 辅助：将 override dict 深度合并到 base dict（原地修改 base）
+# ============================================================
+def _merge_override(base: Dict[str, Any], override: Dict[str, Any]) -> None:
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _merge_override(base[k], v)
+        else:
+            base[k] = v
+    # 若 nc 或 dE 被覆盖，重新推导 dt
+    if "nc" in override or "dE" in override:
+        base["dt"] = (base["nc"] / (base["dE"] * 2.5)) ** 2
+
+
+def _set_nested(cfg: Dict[str, Any], key_path: str, value: Any) -> None:
+    """将点号分隔的键路径写入 cfg，支持嵌套 dict。
+
+    示例：
+        _set_nested(cfg, "potential.d", 0.6)   → cfg["potential"]["d"] = 0.6
+        _set_nested(cfg, "nc", 500)             → cfg["nc"] = 500
+    """
+    parts = key_path.split(".", 1)
+    if len(parts) == 1:
+        cfg[key_path] = value
+    else:
+        parent, rest = parts
+        if not isinstance(cfg.get(parent), dict):
+            cfg[parent] = {}
+        _set_nested(cfg[parent], rest, value)
+
+
+def _parse_val(s: str) -> Any:
+    """将 --set VALUE 字符串转为 Python 对象。
+
+    优先尝试 JSON 解析（覆盖数字、布尔、列表、dict、null）；
+    若失败则按原始字符串返回，方便传 filter_type=bandpass 这类值。
+    """
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        return s
+
+
+# ============================================================
+# CLI 入口
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="FFT filter-diagonalise solver")
-    parser.add_argument("--cfg", type=str, default=None,
-                        help="Path to a JSON file that overrides CONFIG")
+    parser = argparse.ArgumentParser(
+        description="FFT filter-diagonalise solver",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例（shell 脚本中调参）：
+  # 单次运行，覆盖若干参数
+  python main.py --set nc=500 --set filter_type=bandpass --set "El_list=[-0.2,-0.15,-0.1]"
+
+  # 嵌套键（势能子字典）
+  python main.py --set potential.d=0.6 --set potential.r_cut=8.0
+
+  # 传入外部 JSON 覆盖文件，再额外覆盖单个参数
+  python main.py --cfg base.json --set nc=800
+
+  # 内联 SCAN 列表（无需单独 JSON 文件）
+  python main.py --scan_json '[{"nc":500},{"nc":1000}]'
+
+  # 从外部文件读取 SCAN 列表
+  python main.py --scan my_scan.json
+""",
+    )
+    parser.add_argument(
+        "--cfg", type=str, default=None,
+        help="JSON 文件路径，其内容深度合并覆盖 CONFIG",
+    )
+    parser.add_argument(
+        "--scan", type=str, default=None,
+        help="JSON 文件路径，包含 SCAN 列表（每项为 override dict）",
+    )
+    parser.add_argument(
+        "--scan_json", type=str, default=None,
+        help="内联 JSON 字符串形式的 SCAN 列表，无需单独文件。"
+             "例：'[{\"nc\":500},{\"nc\":1000}]'",
+    )
+    parser.add_argument(
+        "--set", action="append", default=[], metavar="KEY=VALUE",
+        help=(
+            "覆盖单个 CONFIG 键，可重复使用。"
+            "VALUE 先按 JSON 解析（数字/bool/列表/null），失败则当字符串。"
+            "支持点号嵌套键，如 potential.d=0.6。"
+            "示例：--set nc=500  --set filter_type=bandpass  "
+            "--set \"El_list=[-0.2,-0.15]\"  --set potential.d=0.6"
+        ),
+    )
     args = parser.parse_args()
 
-    cfg = copy.deepcopy(CONFIG)
-
+    # ---- 加载基础 cfg ----
+    base_cfg = copy.deepcopy(CONFIG)
     if args.cfg:
         with open(args.cfg, "r") as f:
-            override = json.load(f)
-        # deep-merge: top-level keys override, nested dicts are merged
-        for k, v in override.items():
-            if isinstance(v, dict) and isinstance(cfg.get(k), dict):
-                cfg[k].update(v)
-            else:
-                cfg[k] = v
-        # recompute derived dt if nc/dE were overridden
-        cfg["dt"] = (cfg["nc"] / (cfg["dE"] * 2.5)) ** 2
+            _merge_override(base_cfg, json.load(f))
 
-    run(cfg)
+    # ---- 应用 --set 覆盖 ----
+    for kv in args.set:
+        if "=" not in kv:
+            parser.error(f"--set 需要 KEY=VALUE 格式，收到：{kv!r}")
+        key, val_str = kv.split("=", 1)
+        _set_nested(base_cfg, key, _parse_val(val_str))
+    # --set 可能改了 nc/dE，统一重算 dt
+    if args.set:
+        base_cfg["dt"] = (base_cfg["nc"] / (base_cfg["dE"] * 2.5)) ** 2
+
+    # ---- 确定 scan 列表 ----
+    if args.scan_json:
+        scan_list = json.loads(args.scan_json)
+    elif args.scan:
+        with open(args.scan, "r") as f:
+            scan_list = json.load(f)
+    else:
+        scan_list = SCAN  # 使用文件内定义的 SCAN
+
+    # ---- 无扫描：单次运行 ----
+    if not scan_list:
+        run(base_cfg)
+        return
+
+    # ---- 有扫描：遍历每个 override ----
+    n = len(scan_list)
+    print(f"\n{'='*60}")
+    print(f"  SCAN 模式：共 {n} 组配置")
+    print(f"{'='*60}")
+
+    for i, override in enumerate(scan_list, start=1):
+        cfg = copy.deepcopy(base_cfg)
+        _merge_override(cfg, override)
+
+        changed = ", ".join(
+            f"{k}={v}" for k, v in override.items() if k != "tag"
+        )
+        base_tag = cfg.get("tag", "")
+        cfg["tag"] = f"{base_tag}_scan{i}" if base_tag else f"scan{i}"
+
+        print(f"\n{'─'*60}")
+        print(f"  运行 {i}/{n}：{changed}")
+        print(f"{'─'*60}")
+        run(cfg)
+
+    print(f"\n{'='*60}")
+    print(f"  SCAN 完成：共 {n} 组配置均已运行")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
