@@ -106,6 +106,8 @@ def apply_chebyshev_explosion(psi: np.ndarray, V: np.ndarray,
 
     return y_curr
 
+
+def apply_filter_H_all(psi: np.ndarray, V: np.ndarray,
                        nodes: np.ndarray, an: np.ndarray,
                        par: PhysParams,
                        T_k_diagonal: np.ndarray) -> np.ndarray:
