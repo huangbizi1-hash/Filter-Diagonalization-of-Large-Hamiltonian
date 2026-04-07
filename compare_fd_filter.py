@@ -2,7 +2,7 @@
 compare_fd_filter.py
 比较不同阶数有限差分动能算符对滤波对角化（Filter Diagonalization）性能的影响。
 
-配置：N=64，高斯窗，nc=5000，El=-0.17，使用 localPot.cube 势能。
+配置：N=64，高斯窗，nc=5000，El_list=[-0.17,-0.20,-0.22,-0.25]，使用 localPot.cube 势能。
 
 有限差分阶数：2, 4, 6, 8, 10, 12, 14, 16, 18, 20
 参考基准：FFT 算符（精确动能）
@@ -18,6 +18,7 @@ Newton 多项式滤波器作用于任意 LinearOperator（H_op.matvec），
 
 import time
 import json
+import argparse
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +27,7 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import scipy.sparse.linalg as spla
 from scipy.linalg import eigh
+from scipy.interpolate import RegularGridInterpolator
 
 from ho3d_solvers_v2 import (
     build_3d_fft_operator,
@@ -40,12 +42,12 @@ from fft_code.filter_coeff import _filt_func_gaussian  # noqa: F401 (用于构�
 # ──────────────────────────────────────────────
 # 配置
 # ──────────────────────────────────────────────
-N           = 64
-EL          = -0.17       # 滤波中心（物理单位，Hartree）
+DEFAULT_N   = 64
+EL_LIST     = np.array([-0.17, -0.20, -0.22, -0.25], dtype=float)
 NC          = 5000        # Newton 节点数
 DE          = 50.0        # 滤波窗口宽度
 VMIN        = -5.0        # 窗口下界
-N_RANDOM    = 3           # 每个 El 的随机初态数量
+N_RANDOM    = 64          # 每个 El 的随机初态数量
 SVD_TOL     = 1e-3        # Rayleigh-Ritz SVD 秩截断
 MAX_ENERGIES= 20          # 输出能级数上限
 R_CUT       = 7.0
@@ -60,27 +62,65 @@ FD_ORDERS = sorted(FD_STENCILS.keys())   # [2, 4, 6, ..., 20]
 # dt 自动推导：sigma ≈ dE/(2.5*nc)，dt = 1/(2*sigma²)
 dt = (NC / (DE * 2.5)) ** 2
 par = PhysParams(dE=DE, Vmin=VMIN, dt=dt)
-print(f"参数：N={N}, El={EL}, nc={NC}, dE={DE}, Vmin={VMIN}")
+parser = argparse.ArgumentParser()
+parser.add_argument("--qd-radius", type=int, default=None,
+                    help="指定 QD 半径 R（读取 QD_Outputs/QD_R{R}.cube）")
+args = parser.parse_args()
+
+if args.qd_radius is None:
+    N = DEFAULT_N
+    run_tag = "bulk"
+else:
+    qd_cube = Path("QD_Outputs") / f"QD_R{args.qd_radius}.cube"
+    if not qd_cube.exists():
+        raise FileNotFoundError(f"未找到 {qd_cube}，请先生成对应 QD cube")
+    run_tag = f"QD_R{args.qd_radius}"
+
+print(f"参数：run_tag={run_tag}, El_list={EL_LIST.tolist()}, nc={NC}, dE={DE}, Vmin={VMIN}")
 print(f"  dt={dt:.4f},  sigma={1/np.sqrt(2*dt):.6f} Hartree")
+
+
+def read_cube_header(cube_path: str):
+    with open(cube_path) as f:
+        f.readline(); f.readline()
+        parts = f.readline().split()
+        origin = float(parts[1])
+        line4  = f.readline().split()
+        n      = int(line4[0])
+        d      = float(line4[1])
+    return n, d, origin
 
 # ──────────────────────────────────────────────
 # 构建势能
 # ──────────────────────────────────────────────
-print(f"\n加载势能（N={N}）...")
+print(f"\n加载势能（run_tag={run_tag}）...")
 builder = GaussianPotentialBuilder(CUBE_FILE, PARAMS_FILE, R_CUT)
-x0, y0, z0, V0 = builder.build_potential(N)
-pot = PotentialGrid(x0, y0, z0, V0, source=f"N{N}")
+
+if args.qd_radius is None:
+    x0, y0, z0, V0 = builder.build_potential(N)
+    pot = PotentialGrid(x0, y0, z0, V0, source=f"N{N}")
+else:
+    n_qd, d_qd, origin_qd = read_cube_header(str(qd_cube))
+    N = n_qd
+    x_ref, y_ref, z_ref, V_ref = builder.build_potential(DEFAULT_N)
+    interp_V = RegularGridInterpolator(
+        (x_ref, y_ref, z_ref), V_ref.astype(float),
+        method="linear", bounds_error=False, fill_value=0.0)
+    x_new = origin_qd + np.arange(N) * d_qd
+    X, Y, Z = np.meshgrid(x_new, x_new, x_new, indexing='ij')
+    pts = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+    V_qd = interp_V(pts).reshape(N, N, N)
+    pot = PotentialGrid(x_new, x_new, x_new, V_qd, source=f"QD_R{args.qd_radius}_N{N}")
 
 # ──────────────────────────────────────────────
 # 构建 Newton 插值节点和系数（共用一套，与 H 无关）
 # ──────────────────────────────────────────────
-El_list = np.array([EL])
 filter_func = lambda x, el: _filt_func_gaussian(x, el, dt)
 
 print("\n构建 Newton 滤波系数...")
 t_coef0 = time.perf_counter()
 an, samp = build_filter_coefficients(
-    El_list, par, NC,
+    EL_LIST, par, NC,
     filter_func=filter_func,
     samp_method="ashkenazy",
     interpolation_tolerance=1e-6,
@@ -90,34 +130,30 @@ an, samp = build_filter_coefficients(
 t_coef = time.perf_counter() - t_coef0
 nc_true = len(samp)
 print(f"  nc_true={nc_true}  (构建耗时 {t_coef:.2f}s)")
-# an: (1, nc_true)，取第 0 个 El 的系数
-coeffs = an[0]   # (nc_true,)
-
 # ──────────────────────────────────────────────
-# Newton 滤波器作用（与 H_op 无关的通用实现）
+# apply_filter_H_all（通用 H_op 版本）：所有 El 共享 Newton 基底
 # ──────────────────────────────────────────────
-def apply_newton_filter(H_op, psi_flat, nodes, coeffs, par_):
+def apply_filter_H_all_op(H_op, psi_flat, nodes, an_all, par_):
     """
-    f(H)|ψ⟩ — Newton 多项式求值，使用通用 H_op.matvec。
-
-    缩放变量：x̃ = 4(H - Vmin)/dE - 2
-    Newton 递推：
-        basis_0 = ψ
-        basis_j = (H̃ - nodes[j-1]) * basis_{j-1}，其中 H̃ = 4/dE*(H-Vmin) - 2
-        f(H)ψ  = Σ_j coeffs[j] * basis_j
+    对所有 El 同时求 f_i(H)|ψ⟩，共享 Newton 基底向量。
+    返回：
+      filt_all : (ms, n_grid)
+      n_H      : 本次滤波里 H_op.matvec 的调用次数（=len(nodes)-1）
     """
-    result   = coeffs[0] * psi_flat.copy()
+    ms, nc = an_all.shape
+    filt_all = an_all[:, 0, None] * psi_flat[None, :]
     psi_prev = psi_flat.copy()
+    n_H = 0
 
-    for j in range(1, len(nodes)):
-        H_psi    = H_op.matvec(psi_prev)
-        # 缩放：H̃ ψ = 4/dE * (H ψ - Vmin ψ) - 2 ψ
-        Hs_psi   = (4.0 / par_.dE) * (H_psi - par_.Vmin * psi_prev) - 2.0 * psi_prev
+    for j in range(1, nc):
+        H_psi = H_op.matvec(psi_prev)
+        n_H += 1
+        Hs_psi = (4.0 / par_.dE) * (H_psi - par_.Vmin * psi_prev) - 2.0 * psi_prev
         psi_curr = Hs_psi - nodes[j - 1] * psi_prev
-        result  += coeffs[j] * psi_curr
+        filt_all += an_all[:, j, None] * psi_curr[None, :]
         psi_prev = psi_curr
 
-    return result
+    return filt_all, n_H
 
 
 # ──────────────────────────────────────────────
@@ -168,44 +204,52 @@ def random_psi(n_grid):
 # ──────────────────────────────────────────────
 def run_filter(H_op, label):
     n_grid = N ** 3
-    print(f"\n  [{label}]  El={EL}, nc={nc_true}, n_random={N_RANDOM}")
+    print(f"\n  [{label}]  El_list={EL_LIST.tolist()}, nc={nc_true}, n_random={N_RANDOM}")
     t0 = time.perf_counter()
     try:
-        # 滤波随机态 → 子空间基
-        basis_list = []
+        # 滤波随机态 → 每个 El 各自子空间基
+        ms = len(EL_LIST)
+        basis_lists = [[] for _ in range(ms)]
         n_H = 0
         for _ in range(N_RANDOM):
             psi0 = random_psi(n_grid)
-            filt = apply_newton_filter(H_op, psi0, samp, coeffs, par)
-            norm = np.linalg.norm(filt)
-            if norm > 0:
-                basis_list.append(filt / norm)
-            n_H += nc_true
+            filt_all, n_h_i = apply_filter_H_all_op(H_op, psi0, samp, an, par)
+            n_H += n_h_i
+            for ie in range(ms):
+                vec = filt_all[ie]
+                norm = np.linalg.norm(vec)
+                if norm > 0:
+                    basis_lists[ie].append(vec / norm)
 
-        if not basis_list:
-            raise RuntimeError("所有随机态滤波后范数为零")
-
-        basis_mat = np.column_stack(basis_list)   # (n_grid, n_basis)
-
-        # Rayleigh-Ritz
-        energies = rayleigh_ritz_generic(basis_mat, H_op, SVD_TOL, MAX_ENERGIES)
+        energies_by_el = []
+        eval0_by_el = []
+        for ie, el in enumerate(EL_LIST):
+            if not basis_lists[ie]:
+                raise RuntimeError(f"El={el}: 所有随机态滤波后范数为零")
+            basis_mat = np.column_stack(basis_lists[ie])
+            energies = rayleigh_ritz_generic(basis_mat, H_op, SVD_TOL, MAX_ENERGIES)
+            energies_by_el.append(energies.tolist())
+            eval0_by_el.append(float(energies[0]) if len(energies) > 0 else float("nan"))
 
         t_wall = time.perf_counter() - t0
-        eval0  = float(energies[0]) if len(energies) > 0 else float("nan")
+        eval0  = float(eval0_by_el[0]) if len(eval0_by_el) > 0 else float("nan")
         success = True
         err_msg = ""
-        print(f"    E[0]={eval0:.8f}  T={t_wall:.2f}s  N_H(filter)={n_H}")
+        print(f"    E0(El={EL_LIST[0]:.2f})={eval0:.8f}  T={t_wall:.2f}s  N_H(filter)={n_H}")
     except Exception as exc:
         t_wall  = time.perf_counter() - t0
         eval0   = float("nan")
         n_H     = -1
         success = False
         err_msg = str(exc)
-        energies = []
+        eval0_by_el = []
+        energies_by_el = []
         print(f"    FAILED: {err_msg}")
 
     return dict(label=label, eval=eval0, t_wall=t_wall, n_H=n_H,
-                energies=list(energies) if hasattr(energies, '__iter__') else [],
+                El_list=EL_LIST.tolist(),
+                eval0_by_el=eval0_by_el,
+                energies_by_el=energies_by_el,
                 success=success, err_msg=err_msg)
 
 
@@ -220,7 +264,6 @@ H_fft, _, _ = build_3d_fft_operator(N, pot)
 row = run_filter(H_fft, "FFT")
 row["fd_order"] = None
 results.append(row)
-eval_ref = row["eval"]
 
 # 各阶有限差分
 print("\n=== 有限差分各阶 ===")
@@ -236,12 +279,12 @@ for order in FD_ORDERS:
 output = {
     "script"  : "compare_fd_filter.py",
     "datetime": TS,
-    "config"  : dict(N=N, EL=EL, NC=NC, DE=DE, VMIN=VMIN,
+    "config"  : dict(N=N, EL_LIST=EL_LIST.tolist(), NC=NC, DE=DE, VMIN=VMIN,
                      dt=dt, N_RANDOM=N_RANDOM, SVD_TOL=SVD_TOL,
                      nc_true=nc_true),
     "results" : results,
 }
-json_path = OUT_DIR / f"compare_fd_filter_{TS}.json"
+json_path = OUT_DIR / f"compare_fd_filter_{run_tag}_{TS}.json"
 with open(json_path, "w") as f:
     json.dump(output, f, indent=2, ensure_ascii=False)
 print(f"\nJSON saved: {json_path}")
@@ -251,17 +294,19 @@ print(f"\nJSON saved: {json_path}")
 # ──────────────────────────────────────────────
 lines = [
     f"# FD vs FFT — Filter Diagonalization  "
-    f"(N={N}, El={EL}, nc={nc_true}, Gaussian)\n",
+    f"(N={N}, El_list={EL_LIST.tolist()}, nc={nc_true}, Gaussian)\n",
     f"Generated: {TS}\n",
-    "| Method | E[0] (Hartree) | ΔE vs FFT | T_wall (s) | N_H (filter) |",
-    "|--------|--------------|-----------|------------|--------------|",
+    "| Method | mean |E0_FD-El - E0_FFT-El| | T_wall (s) | N_H (filter) |",
+    "|--------|-----------------------------|------------|--------------|",
 ]
 for row in results:
     method = row["label"]
     if row["success"]:
-        de = row["eval"] - eval_ref if not np.isnan(eval_ref) else float("nan")
+        ref_arr = np.array(results[0]["eval0_by_el"], dtype=float)
+        cur_arr = np.array(row["eval0_by_el"], dtype=float)
+        de = float(np.mean(np.abs(cur_arr - ref_arr))) if len(cur_arr) == len(ref_arr) else float("nan")
         lines.append(
-            f"| {method:8s} | {row['eval']:14.8f} | {de:+.2e} "
+            f"| {method:8s} | {de:27.3e} "
             f"| {row['t_wall']:10.3f} | {row['n_H']:12d} |"
         )
     else:
@@ -269,7 +314,7 @@ for row in results:
 
 md_text = "\n".join(lines) + "\n"
 print("\n" + md_text)
-md_path = OUT_DIR / f"compare_fd_filter_{TS}.md"
+md_path = OUT_DIR / f"compare_fd_filter_{run_tag}_{TS}.md"
 with open(md_path, "w") as f:
     f.write(md_text)
 print(f"Markdown saved: {md_path}")
@@ -279,17 +324,20 @@ print(f"Markdown saved: {md_path}")
 # ──────────────────────────────────────────────
 succ = [r for r in results if r["success"] and r["fd_order"] is not None]
 orders  = [r["fd_order"]  for r in succ]
-evals   = [r["eval"]      for r in succ]
 t_walls = [r["t_wall"]    for r in succ]
-d_evals = [abs(e - eval_ref) for e in evals]
+d_evals = []
+for row in succ:
+    ref_arr = np.array(results[0]["eval0_by_el"], dtype=float)
+    cur_arr = np.array(row["eval0_by_el"], dtype=float)
+    d_evals.append(float(np.mean(np.abs(cur_arr - ref_arr))))
 
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
 ax = axes[0]
 ax.semilogy(orders, d_evals, "o-", color="steelblue")
 ax.set_xlabel("FD order", fontsize=11)
-ax.set_ylabel("|E_FD - E_FFT| (Hartree)", fontsize=11)
-ax.set_title("Eigenvalue error vs FD order\n(Filter Diagonalization)", fontsize=10)
+ax.set_ylabel("mean |E0_FD-El - E0_FFT-El| (Hartree)", fontsize=11)
+ax.set_title("Mean E0 error vs FD order\n(shared Newton basis across El)", fontsize=10)
 ax.grid(True, which="both", alpha=0.4)
 ax.set_xticks(orders)
 
@@ -305,10 +353,10 @@ ax.grid(True, alpha=0.4)
 ax.set_xticks(orders)
 
 fig.suptitle(
-    f"Filter Diag: FD vs FFT  (N={N}, El={EL}, nc={nc_true}, Gaussian)",
+    f"Filter Diag: FD vs FFT  (N={N}, El_list={EL_LIST.tolist()}, nc={nc_true}, Gaussian)",
     fontsize=11)
 fig.tight_layout()
-plot_path = OUT_DIR / f"compare_fd_filter_{TS}.png"
+plot_path = OUT_DIR / f"compare_fd_filter_{run_tag}_{TS}.png"
 fig.savefig(plot_path, dpi=150, bbox_inches="tight")
 plt.close(fig)
 print(f"Plot saved:  {plot_path}")

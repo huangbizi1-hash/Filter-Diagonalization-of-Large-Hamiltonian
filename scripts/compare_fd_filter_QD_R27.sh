@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH -J compare_fd_filter
+#SBATCH -J compare_fd_filter_R27
 #SBATCH -q regular
 #SBATCH -C cpu
 #SBATCH -N 1
@@ -13,6 +13,6 @@ cd /pscratch/sd/b/bizi/3Dtest/Filter-Diagonalization-of-Large-Hamiltonian
 
 mkdir -p fd_results
 
-srun python -u compare_fd_filter.py
+srun python -u compare_fd_filter.py --qd-radius 27
 
-echo "compare_fd_filter（apply_filter_H_all + n_random=64）完成，结果保存在 fd_results/"
+echo "compare_fd_filter QD_R27 完成，结果保存在 fd_results/"
