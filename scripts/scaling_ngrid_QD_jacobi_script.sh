@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH -J scaling_QD_None
+#SBATCH -J scaling_QD_Jacobi
 #SBATCH -q regular
 #SBATCH -C cpu
 #SBATCH -N 1
@@ -21,7 +21,7 @@ fi
 
 mkdir -p scaling_results
 
-# ========== 无预条件子 ==========
-srun python -u scaling_ngrid_QD.py --precond None
+# ========== Jacobi 预条件子（k 空间对角 1/|T(k)-E|） ==========
+srun python -u scaling_ngrid_QD.py --precond Jacobi
 
-echo "scaling_ngrid_QD (None) 完成，结果保存在 scaling_results/"
+echo "scaling_ngrid_QD (Jacobi) 完成，结果保存在 scaling_results/"
