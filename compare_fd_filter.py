@@ -52,8 +52,11 @@ parser = argparse.ArgumentParser(description="FD vs FFT filter diagonalization")
 parser.add_argument("--qd-radius", type=int, default=None,
                     help="QD 半径（Bohr），读取 QD_Outputs/QD_R{R}.cube；"
                          "不指定则使用 localPot.cube（N=64）")
+parser.add_argument("--fft-only", action="store_true",
+                    help="只运行 FFT 算符，跳过有限差分阶数比较")
 args = parser.parse_args()
 QD_RADIUS = args.qd_radius
+FFT_ONLY  = args.fft_only
 
 # ──────────────────────────────────────────────
 # 固定超参数
@@ -301,13 +304,16 @@ row["fd_order"] = None
 results.append(row)
 eval_ref = row["eval"]
 
-# 各阶有限差分
-print("\n=== 有限差分各阶 ===")
-for order in FD_ORDERS:
-    H_fd, _, _ = build_3d_fd_operator(N, pot, fd_order=order)
-    row = run_filter(H_fd, f"FD-{order:2d}")
-    row["fd_order"] = order
-    results.append(row)
+# 各阶有限差分（仅在未指定 --fft-only 时运行）
+if FFT_ONLY:
+    print("\n=== 跳过有限差分（--fft-only 已指定）===")
+else:
+    print("\n=== 有限差分各阶 ===")
+    for order in FD_ORDERS:
+        H_fd, _, _ = build_3d_fd_operator(N, pot, fd_order=order)
+        row = run_filter(H_fd, f"FD-{order:2d}")
+        row["fd_order"] = order
+        results.append(row)
 
 # ──────────────────────────────────────────────
 # 保存 JSON
@@ -358,39 +364,59 @@ print(f"Markdown saved: {md_path}")
 # 绘图
 # ──────────────────────────────────────────────
 succ    = [r for r in results if r["success"] and r["fd_order"] is not None]
-orders  = [r["fd_order"] for r in succ]
-evals   = [r["eval"]     for r in succ]
-t_walls = [r["t_wall"]   for r in succ]
-d_evals = [abs(e - eval_ref) for e in evals]
-
-fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-ax = axes[0]
-ax.semilogy(orders, d_evals, "o-", color="steelblue")
-ax.set_xlabel("FD order", fontsize=11)
-ax.set_ylabel("|E_FD - E_FFT| (Hartree)", fontsize=11)
-ax.set_title("Eigenvalue error vs FD order\n(Filter Diagonalization)", fontsize=10)
-ax.grid(True, which="both", alpha=0.4)
-ax.set_xticks(orders)
-
-ax = axes[1]
-ax.plot(orders, t_walls, "o-", color="darkorange")
-if results[0]["success"]:
-    ax.axhline(results[0]["t_wall"], color="gray", lw=1.2,
-               ls="--", label="FFT ref")
-    ax.legend(fontsize=9)
-ax.set_xlabel("FD order", fontsize=11)
-ax.set_ylabel("Wall time (s)", fontsize=11)
-ax.set_title("Wall time vs FD order\n(Filter Diagonalization)", fontsize=10)
-ax.grid(True, alpha=0.4)
-ax.set_xticks(orders)
-
-fig.suptitle(
-    f"Filter Diag: FD vs FFT  "
-    f"({TAG}, N={N}, El={EL}, nc={nc_true}, Gaussian, n_random={N_RANDOM})",
-    fontsize=11)
-fig.tight_layout()
 plot_path = OUT_DIR / f"compare_fd_filter_{TAG}_{TS}.png"
-fig.savefig(plot_path, dpi=150, bbox_inches="tight")
-plt.close(fig)
+
+if not succ:
+    # --fft-only 模式：只有一个 FFT 结果，不画 FD 比较图
+    fft_row = results[0] if results and results[0]["success"] else None
+    fig, ax = plt.subplots(figsize=(6, 4))
+    if fft_row:
+        ax.bar(["FFT"], [fft_row["t_wall"]], color="steelblue")
+        ax.set_ylabel("Wall time (s)", fontsize=11)
+        ax.set_title(
+            f"Filter Diag (FFT only)\n"
+            f"{TAG}, N={N}, El={EL}, nc={nc_true}, n_random={N_RANDOM}",
+            fontsize=10)
+        ax.text(0, fft_row["t_wall"] * 0.5,
+                f"E[0]={fft_row['eval']:.6f}\nRR rank={fft_row['rr_rank']}",
+                ha="center", va="center", fontsize=10, color="white")
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+else:
+    orders  = [r["fd_order"] for r in succ]
+    evals   = [r["eval"]     for r in succ]
+    t_walls = [r["t_wall"]   for r in succ]
+    d_evals = [abs(e - eval_ref) for e in evals]
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    ax = axes[0]
+    ax.semilogy(orders, d_evals, "o-", color="steelblue")
+    ax.set_xlabel("FD order", fontsize=11)
+    ax.set_ylabel("|E_FD - E_FFT| (Hartree)", fontsize=11)
+    ax.set_title("Eigenvalue error vs FD order\n(Filter Diagonalization)", fontsize=10)
+    ax.grid(True, which="both", alpha=0.4)
+    ax.set_xticks(orders)
+
+    ax = axes[1]
+    ax.plot(orders, t_walls, "o-", color="darkorange")
+    if results[0]["success"]:
+        ax.axhline(results[0]["t_wall"], color="gray", lw=1.2,
+                   ls="--", label="FFT ref")
+        ax.legend(fontsize=9)
+    ax.set_xlabel("FD order", fontsize=11)
+    ax.set_ylabel("Wall time (s)", fontsize=11)
+    ax.set_title("Wall time vs FD order\n(Filter Diagonalization)", fontsize=10)
+    ax.grid(True, alpha=0.4)
+    ax.set_xticks(orders)
+
+    fig.suptitle(
+        f"Filter Diag: FD vs FFT  "
+        f"({TAG}, N={N}, El={EL}, nc={nc_true}, Gaussian, n_random={N_RANDOM})",
+        fontsize=11)
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
 print(f"Plot saved:  {plot_path}")

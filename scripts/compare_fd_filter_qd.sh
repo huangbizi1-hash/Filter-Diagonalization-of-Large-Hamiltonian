@@ -30,7 +30,7 @@ fi
 
 mkdir -p fd_results
 
-echo "运行 compare_fd_filter.py --qd-radius ${QD_RADIUS}"
-srun python -u compare_fd_filter.py --qd-radius ${QD_RADIUS}
+echo "运行 compare_fd_filter.py --qd-radius ${QD_RADIUS} --fft-only"
+srun python -u compare_fd_filter.py --qd-radius ${QD_RADIUS} --fft-only
 
 echo "compare_fd_filter QD_R${QD_RADIUS} 完成，结果保存在 fd_results/"

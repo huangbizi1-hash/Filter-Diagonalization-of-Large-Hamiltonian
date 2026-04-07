@@ -13,6 +13,7 @@ compare_fd_jdqmr.py
     compare_fd_jdqmr_TIMESTAMP.png
 """
 
+import argparse
 import time
 import json
 from datetime import datetime
@@ -30,6 +31,15 @@ from ho3d_solvers_v2 import (
     FD_STENCILS,
 )
 from gaussian_potential_builder import GaussianPotentialBuilder, PotentialGrid
+
+# ──────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────
+_parser = argparse.ArgumentParser(description="FD vs FFT JDQMR comparison")
+_parser.add_argument("--fft-only", action="store_true",
+                     help="只运行 FFT 算符，跳过有限差分阶数比较")
+_args    = _parser.parse_args()
+FFT_ONLY = _args.fft_only
 
 # ──────────────────────────────────────────────
 # 配置
@@ -110,13 +120,16 @@ row["fd_order"] = None
 results.append(row)
 eval_ref = row["eval"]
 
-# 各阶有限差分
-print("\n=== 有限差分各阶 ===")
-for order in FD_ORDERS:
-    H_fd, _, _ = build_3d_fd_operator(N, pot, fd_order=order)
-    row = run_jdqmr(H_fd, f"FD-{order:2d}")
-    row["fd_order"] = order
-    results.append(row)
+# 各阶有限差分（仅在未指定 --fft-only 时运行）
+if FFT_ONLY:
+    print("\n=== 跳过有限差分（--fft-only 已指定）===")
+else:
+    print("\n=== 有限差分各阶 ===")
+    for order in FD_ORDERS:
+        H_fd, _, _ = build_3d_fd_operator(N, pot, fd_order=order)
+        row = run_jdqmr(H_fd, f"FD-{order:2d}")
+        row["fd_order"] = order
+        results.append(row)
 
 # ──────────────────────────────────────────────
 # 保存 JSON
