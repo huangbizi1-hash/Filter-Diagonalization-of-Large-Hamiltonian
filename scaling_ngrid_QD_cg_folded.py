@@ -143,6 +143,7 @@ for r, cp, N, d_qd, origin_qd in qd_list:
             radius=r, N=N, N_grid=N_grid, d=d_qd,
             target=target, method="CG_FOLDED", precond="None",
             T_wall=T_wall, n_iter=n_iter, N_H=N_H,
+            N_H_equiv=None if n_iter is None else int(3 * n_iter + 2),
             evals=[] if eval0 is None else [eval0],
             success=success, conv_reason=conv_reason, err_msg=err_msg,
         )
