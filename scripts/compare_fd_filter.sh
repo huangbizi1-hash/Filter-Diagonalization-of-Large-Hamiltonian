@@ -3,7 +3,7 @@
 #SBATCH -q regular
 #SBATCH -C cpu
 #SBATCH -N 1
-#SBATCH -t 08:00:00
+#SBATCH -t 16:00:00
 #SBATCH -A m4868
 #SBATCH --output=%x-%j.out
 
@@ -15,4 +15,4 @@ mkdir -p fd_results
 
 srun python -u compare_fd_filter.py
 
-echo "compare_fd_filter 完成，结果保存在 fd_results/"
+echo "compare_fd_filter（apply_filter_H_all + n_random=64）完成，结果保存在 fd_results/"

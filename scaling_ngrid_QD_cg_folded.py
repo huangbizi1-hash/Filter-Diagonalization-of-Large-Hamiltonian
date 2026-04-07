@@ -5,7 +5,7 @@ scaling_ngrid_QD_cg_folded.py
 说明：
 - 每个 target 用 cg_minimize_folded 求 1 个态
 - 记录 wall time、CG 迭代次数 n_iter
-- 额外给出等效 Hψ 次数 N_H_equiv = 3*n_iter + 2（近似）
+- 通过 matvec 计数包装器直接统计 Hψ 次数 N_H（包含 line-search 内部调用）
 
 输出（scaling_results/）
     scaling_ngrid_QD_CG_FOLDED_TIMESTAMP.json
@@ -19,6 +19,7 @@ import json, time
 from datetime import datetime
 from pathlib import Path
 from scipy.interpolate import RegularGridInterpolator
+import scipy.sparse.linalg as spla
 
 from ho3d_solvers_v2 import build_3d_fft_operator, cg_minimize_folded
 from gaussian_potential_builder import GaussianPotentialBuilder, PotentialGrid
@@ -104,8 +105,16 @@ for r, cp, N, d_qd, origin_qd in qd_list:
         try:
             rng = np.random.default_rng(42)
             x0_cg = rng.standard_normal(n_un)
+            matvec_counter = [0]
+
+            def counted_mv(v):
+                matvec_counter[0] += 1
+                return H_op.matvec(v)
+
+            H_counted = spla.LinearOperator((n_un, n_un), matvec=counted_mv, dtype=float)
+
             cg_res = cg_minimize_folded(
-                H_op,
+                H_counted,
                 target,
                 x0_cg,
                 maxiter=CG_MAXITER,
@@ -116,7 +125,7 @@ for r, cp, N, d_qd, origin_qd in qd_list:
             )
             T_wall = time.perf_counter() - t0
             n_iter = int(cg_res["n_iter"])
-            N_H_equiv = int(3 * n_iter + 2)
+            N_H = int(matvec_counter[0])
             eval0 = float(cg_res["E_ritz"])
             success = bool(cg_res["converged"])
             err_msg = "" if success else f"not converged: {cg_res['conv_reason']}"
@@ -124,7 +133,7 @@ for r, cp, N, d_qd, origin_qd in qd_list:
         except Exception as exc:
             T_wall = time.perf_counter() - t0
             n_iter = None
-            N_H_equiv = None
+            N_H = None
             eval0 = None
             success = False
             err_msg = str(exc)
@@ -133,14 +142,15 @@ for r, cp, N, d_qd, origin_qd in qd_list:
         row = dict(
             radius=r, N=N, N_grid=N_grid, d=d_qd,
             target=target, method="CG_FOLDED", precond="None",
-            T_wall=T_wall, n_iter=n_iter, N_H_equiv=N_H_equiv,
+            T_wall=T_wall, n_iter=n_iter, N_H=N_H,
+            N_H_equiv=None if n_iter is None else int(3 * n_iter + 2),
             evals=[] if eval0 is None else [eval0],
             success=success, conv_reason=conv_reason, err_msg=err_msg,
         )
         results.append(row)
 
         if success:
-            print(f"T={T_wall:.1f}s  n_iter={n_iter}  N_H≈{N_H_equiv}  E={eval0:.6f}")
+            print(f"T={T_wall:.1f}s  n_iter={n_iter}  N_H={N_H}  E={eval0:.6f}")
         else:
             print(f"FAILED: {err_msg}")
 
@@ -166,8 +176,8 @@ print(f"\nJSON saved: {json_path}")
 fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 for ax, ykey, ylabel in zip(
     axes,
-    ["T_wall", "N_H_equiv"],
-    ["Wall time T (s)", "Equivalent matvec N_H≈3*n_iter+2"],
+    ["T_wall", "N_H"],
+    ["Wall time T (s)", "Matvec count N_H"],
 ):
     for target, color in zip(TARGETS, TARGET_COLORS):
         rows = [row for row in results if row["target"] == target and row["success"] and row[ykey] is not None]
