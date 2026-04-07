@@ -39,7 +39,8 @@ TOL       = 1e-6
 R_CUT     = 7.0
 CUBE_FILE   = "localPot.cube"
 PARAMS_FILE = "gaussian_fit_params.json"
-EPS_PRECOND = 1e-3      # 预条件分母保护
+EPS_PRECOND  = 1e-3     # 预条件分母保护
+MAX_MATVECS  = 30000    # PRIMME 最大 Hψ 次数（防止无限循环）
 
 OUT_DIR = Path("precond_results"); OUT_DIR.mkdir(exist_ok=True)
 TS      = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -96,12 +97,18 @@ print(f"  d={d_use:.4f},  V_mean={V_mean:.4f},  T_k_mean={T_k_flat.mean():.4f}")
 # ──────────────────────────────────────────────
 
 def make_jacobi(E_target: float) -> spla.LinearOperator:
-    """对角预条件：P⁻¹x = x / |diag(H) - E_target|
-    diag(T) 在实空间 = mean(T_k)（周期边界条件下对角元均等）。
+    """k 空间 Jacobi 预条件：P⁻¹(k) = 1 / |T(k) - E_target|
+
+    平面波代码中"Jacobi"的物理含义是在表示 H 的基（k 空间）中
+    取对角近似，即只保留动能 T(k)，忽略势能的对角元。
+    在实空间 diag(T) = mean(T_k) ≈ 5 Ha >> |E_target|，
+    直接用实空间对角会使搜索方向趋零导致不收敛，故改用 k 空间。
     """
-    T_diag = float(T_k_flat.mean())
-    denom  = np.abs(V_flat + T_diag - E_target) + EPS_PRECOND
-    def mv(v): return v / denom
+    denom = np.abs(T_k - E_target) + EPS_PRECOND
+    def mv(v: np.ndarray) -> np.ndarray:
+        psi   = v.reshape(N, N, N)
+        psi_k = np.fft.fftn(psi)
+        return np.fft.ifftn(psi_k / denom).real.ravel()
     return spla.LinearOperator((n_un, n_un), matvec=mv, dtype=float)
 
 
@@ -176,12 +183,13 @@ for target in TARGETS:
         t0 = time.perf_counter()
         try:
             kwargs = dict(
-                k          = N_LEVELS,
-                which      = target,
-                method     = "PRIMME_JDQMR",
+                k            = N_LEVELS,
+                which        = target,
+                method       = "PRIMME_JDQMR",
                 maxBlockSize = BLOCKSIZE,
-                ncv        = ncv,
-                tol        = TOL,
+                ncv          = ncv,
+                tol          = TOL,
+                maxMatvecs   = MAX_MATVECS,
                 return_stats = True,
                 return_history = False,
             )
