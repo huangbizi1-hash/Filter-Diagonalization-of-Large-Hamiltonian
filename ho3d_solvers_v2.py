@@ -15,8 +15,40 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import convolve1d
 import os
 import matplotlib.pyplot as plt
+
+# ──────────────────────────────────────────────
+# 有限差分动能系数表（中心差分，2至20阶）
+# 系数对应 (1/d²) Σ c_k ψ[i+k-half]，已含 -1/2 因子（动能 = -1/2 d²/dx²）
+# ──────────────────────────────────────────────
+FD_STENCILS: Dict[int, np.ndarray] = {
+    2:  np.array([1., -2., 1.]),
+    4:  np.array([-1/12, 4/3, -5/2, 4/3, -1/12]),
+    6:  np.array([1/90, -3/20, 3/2, -49/18, 3/2, -3/20, 1/90]),
+    8:  np.array([-1/560, 8/315, -1/5, 8/5, -205/72,
+                   8/5, -1/5, 8/315, -1/560]),
+    10: np.array([1/3150, -5/1008, 5/126, -5/21, 5/3, -5269/1800,
+                  5/3, -5/21, 5/126, -5/1008, 1/3150]),
+    12: np.array([-1/16632, 2/1925, -1/112, 10/189, -15/56, 12/7,
+                  -5369/1800, 12/7, -15/56, 10/189, -1/112, 2/1925, -1/16632]),
+    14: np.array([1/84084, -7/30888, 7/3300, -7/528, 7/108, -7/24, 7/4,
+                  -266681/88200, 7/4, -7/24, 7/108, -7/528, 7/3300,
+                  -7/30888, 1/84084]),
+    16: np.array([-1/411840, 16/315315, -2/3861, 112/32175, -7/396,
+                  112/1485, -14/45, 16/9, -1077749/352800,
+                  16/9, -14/45, 112/1485, -7/396, 112/32175,
+                  -2/3861, 16/315315, -1/411840]),
+    18: np.array([1/1969110, -9/777920, 9/70070, -2/2145, 18/3575,
+                  -63/2860, 14/165, -18/55, 9/5, -9778141/3175200,
+                  9/5, -18/55, 14/165, -63/2860, 18/3575, -2/2145,
+                  9/70070, -9/777920, 1/1969110]),
+    20: np.array([-1/9237800, 10/3741309, -5/155584, 30/119119, -5/3432,
+                  24/3575, -15/572, 40/429, -15/44, 20/11, -1968329/635040,
+                  20/11, -15/44, 40/429, -15/572, 24/3575, -5/3432,
+                  30/119119, -5/155584, 10/3741309, -1/9237800]),
+}
 
 try:
     import primme
@@ -544,6 +576,59 @@ def build_3d_fft_operator(N: int, potential_grid: Optional[PotentialGrid] = None
             return (Tpsi + V * psi).ravel()
 
     return spla.LinearOperator((N**3, N**3), matvec=matvec, dtype=float), N**3, V.ravel()
+
+
+def build_3d_fd_operator(N: int, potential_grid: Optional[PotentialGrid] = None,
+                          fd_order: int = 4, L: float = 5.0):
+    """
+    构建基于高阶中心有限差分的 3D 哈密顿量算符（LinearOperator）。
+
+    动能用中心差分计算：T̂ψ = -1/2 * (d²ψ/dx² + d²ψ/dy² + d²ψ/dz²)，
+    每轴用 fd_order 阶精度的对称差分系数（FD_STENCILS）；
+    卷积使用 scipy.ndimage.convolve1d(..., mode='wrap') 实现周期边界。
+
+    Parameters
+    ----------
+    N            : 每轴网格点数
+    potential_grid : 自定义势能网格；为 None 时使用 3D 谐振子 V=½r²
+    fd_order     : 差分阶数，须为 FD_STENCILS 中的键（2/4/6/…/20）
+    L            : 谐振子盒子半长（仅当 potential_grid=None 时有效）
+
+    Returns
+    -------
+    H_op  : LinearOperator  (N³, N³)
+    n_un  : int  总自由度 N³
+    V_flat: np.ndarray  势能展平向量 (N³,)
+    """
+    if fd_order not in FD_STENCILS:
+        raise ValueError(f"fd_order={fd_order} 不在 FD_STENCILS 中，"
+                         f"可选：{sorted(FD_STENCILS)}")
+    stencil = FD_STENCILS[fd_order].astype(float)
+
+    if potential_grid is None:
+        d_use = 2.0 * L / N
+        x1d   = (np.arange(N) - N / 2) * d_use
+        X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
+        V = 0.5 * (X ** 2 + Y ** 2 + Z ** 2)
+    else:
+        if potential_grid.Nx != N:
+            from grid_reader import resample_potential
+            potential_grid = resample_potential(potential_grid, N)
+        V     = potential_grid.potential
+        d_use = float(potential_grid.x[1] - potential_grid.x[0])
+
+    # 动能因子：T̂ψ = -1/2 * ∇²ψ；差分系数已对应 ∇²，故前置 -1/(2d²)
+    inv_d2  = -0.5 / (d_use ** 2)
+    V_flat  = V.ravel()
+
+    def matvec(v: np.ndarray) -> np.ndarray:
+        psi  = v.reshape(N, N, N)
+        Tpsi = (convolve1d(psi, stencil, axis=0, mode='wrap') +
+                convolve1d(psi, stencil, axis=1, mode='wrap') +
+                convolve1d(psi, stencil, axis=2, mode='wrap')) * inv_d2
+        return (Tpsi + V * psi).ravel()
+
+    return spla.LinearOperator((N**3, N**3), matvec=matvec, dtype=float), N**3, V_flat
 
 
 # ---------------------------
