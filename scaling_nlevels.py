@@ -32,7 +32,7 @@ R_CUT       = 7.0
 CUBE_FILE   = "localPot.cube"
 PARAMS_FILE = "gaussian_fit_params.json"
 
-N_LEVELS_LIST = np.arange(1, 21, 2, dtype=int)   # [1, 3, 5, ..., 19]
+N_LEVELS_LIST = np.arange(1, 51, 5, dtype=int)   # [1, 6, 11, 16, 21, 26, 31, 36, 41, 46]
 
 OUT_DIR = Path("scaling_results"); OUT_DIR.mkdir(exist_ok=True)
 TS      = datetime.now().strftime("%Y%m%d_%H%M%S")

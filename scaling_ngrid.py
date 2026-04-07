@@ -26,7 +26,7 @@ from gaussian_potential_builder import GaussianPotentialBuilder, PotentialGrid
 # 配置
 # ──────────────────────────────────────────────
 BASE_N      = 64
-N_LIST      = np.arange(64, 80, 1, dtype=int)   # [64, 65, 66, ..., 79]
+N_LIST      = np.arange(64, 121, 8, dtype=int)  # [64, 72, 80, 88, 96, 104, 112, 120]
 TARGETS     = [-0.17, -0.20, -0.22, -0.25]
 N_LEVELS    = 1
 BLOCKSIZE   = 1
