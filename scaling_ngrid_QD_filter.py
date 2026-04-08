@@ -301,12 +301,12 @@ print(f"\nJSON saved: {json_path}")
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
 ax = axes[0]
-ax.plot(El_list, El_list, "k--", lw=0.8, label="y=x (理想)")
+ax.plot(El_list, El_list, "k--", lw=0.8, label="y=x (ideal)")
 # 对每个 El，找最近的本征能级
 nearest = [energies[np.argmin(np.abs(energies - el))] for el in El_list
            if len(energies) > 0]
 ax.scatter(El_list[:len(nearest)], nearest,
-           s=30, color="steelblue", zorder=3, label="最近本征能级")
+           s=30, color="steelblue", zorder=3, label="Nearest energy level")
 ax.set_xlabel("El (Hartree)", fontsize=11)
 ax.set_ylabel("Nearest eigenvalue (Hartree)", fontsize=11)
 ax.set_title(f"QD_R{QD_RADIUS} (N={N}, N_grid={n_grid:,})\n"
@@ -319,7 +319,7 @@ for el in El_list:
     ax.axvline(el, color="gray", lw=0.5, alpha=0.5)
 ax.set_xlabel("Eigenvalue (Hartree)", fontsize=11)
 ax.set_ylabel("Count", fontsize=11)
-ax.set_title(f"本征值直方图\n"
+ax.set_title(f"Eigenvalue histogram\n"
              f"T={t_total:.1f}s  N_H={n_H_total}", fontsize=10)
 ax.grid(True, alpha=0.4)
 

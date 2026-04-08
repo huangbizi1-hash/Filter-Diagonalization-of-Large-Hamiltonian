@@ -146,7 +146,7 @@ for E, deg in exact_table:
     ax2.axvline(E, color='green', ls='-', lw=0.4, alpha=0.6)
 ax2.set_ylim(0, CLIP)
 ax2.set_xlabel('Energy (Hartree)')
-ax2.set_title(f'放大图（E ≤ {E_lower2+0.5}，绿线=精确能级）')
+ax2.set_title(f'Zoom (E ≤ {E_lower2+0.5}, green lines = Exact eigenlevels)')
 ax2.legend(fontsize=8)
 ax2.grid(True)
 
@@ -240,22 +240,22 @@ fig, ax = plt.subplots(figsize=(12, 4))
 
 ax.scatter(ritz1, np.full_like(ritz1, 0.0),
            marker='|', s=400, linewidths=2, color='steelblue',
-           label=f'Ritz (E<{E_lower1}): {len(ritz1)} 个')
+           label=f'Ritz (E<{E_lower1}): {len(ritz1)}')
 ax.scatter(ritz2, np.full_like(ritz2, 0.0),
            marker='|', s=400, linewidths=2, color='darkorange',
-           label=f'Ritz ({E_lower1}≤E<{E_lower2}): {len(ritz2)} 个')
+           label=f'Ritz ({E_lower1}≤E<{E_lower2}): {len(ritz2)}')
 ax.scatter(exact_flat1, np.full_like(exact_flat1, 0.4),
            marker='|', s=400, linewidths=2, color='navy',
-           label=f'Exact (E<{E_lower1}): {len(exact_flat1)} 个')
+           label=f'Exact (E<{E_lower1}): {len(exact_flat1)}')
 ax.scatter(exact_mid,   np.full_like(exact_mid, 0.4),
            marker='|', s=400, linewidths=2, color='chocolate',
-           label=f'Exact ({E_lower1}≤E<{E_lower2}): {len(exact_mid)} 个')
+           label=f'Exact ({E_lower1}≤E<{E_lower2}): {len(exact_mid)}')
 
 ax.axvline(E_lower1, color='steelblue',  ls='--', lw=1.2, label=f'E_lower1={E_lower1}')
 ax.axvline(E_lower2, color='darkorange', ls='--', lw=1.2, label=f'E_lower2={E_lower2}')
 ax.set_yticks([])
 ax.set_xlabel('Energy (Hartree)')
-ax.set_title(f'两级切比雪夫爆炸滤波 m1={m1}, m2={m2}：Ritz vs Exact')
+ax.set_title(f'Two-stage Chebyshev explosion filter m1={m1}, m2={m2}: Ritz vs Exact')
 ax.legend(fontsize=8, ncol=2)
 ax.grid(True, axis='x')
 ax.set_xlim(0, E_lower2 + 0.5)

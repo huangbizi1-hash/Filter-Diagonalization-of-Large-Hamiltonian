@@ -49,7 +49,7 @@ for nc in NC_LIST:
 # ──────────────────────────────────────────────
 n_rows = len(NC_LIST)
 fig, axes = plt.subplots(n_rows, 2, figsize=(14, 2.8 * n_rows))
-fig.suptitle("Ashkenazy 插值节点：选取顺序与分布（bandpass，区间 [-2, 2]）",
+fig.suptitle("Ashkenazy interpolation nodes: Selection order and distribution (bandpass, interval [-2, 2])",
              fontsize=13, y=1.002)
 
 for row, (nc, color) in enumerate(zip(NC_LIST, COLORS)):
@@ -62,13 +62,13 @@ for row, (nc, color) in enumerate(zip(NC_LIST, COLORS)):
                     c=[color], alpha=0.7, linewidths=0)
     ax_left.set_xlim(-5, nc + 5)
     ax_left.set_ylim(SMIN - 0.1, SMAX + 0.1)
-    ax_left.set_ylabel("节点 x 值", fontsize=9)
-    ax_left.set_title(f"nc={nc}  —  节点 x 值 vs 选取顺序", fontsize=10)
+    ax_left.set_ylabel("Node x value", fontsize=9)
+    ax_left.set_title(f"nc={nc}  —  Node x value vs Selection order", fontsize=10)
     ax_left.axhline(SMIN, color="gray", lw=0.8, ls="--")
     ax_left.axhline(SMAX, color="gray", lw=0.8, ls="--")
     ax_left.grid(True, alpha=0.25)
     if row == n_rows - 1:
-        ax_left.set_xlabel("选取顺序（贪心步编号）", fontsize=9)
+        ax_left.set_xlabel("Selection order (Greedy step index)", fontsize=9)
 
     # ── 右图：密度直方图 ─────────────────────────
     ax_right = axes[row, 1]
@@ -76,11 +76,11 @@ for row, (nc, color) in enumerate(zip(NC_LIST, COLORS)):
     ax_right.hist(pts, bins=n_bins, range=(SMIN, SMAX),
                   color=color, alpha=0.8, edgecolor="none")
     ax_right.set_xlim(SMIN - 0.1, SMAX + 0.1)
-    ax_right.set_ylabel("节点计数", fontsize=9)
-    ax_right.set_title(f"nc={nc}  —  节点位置分布直方图", fontsize=10)
+    ax_right.set_ylabel("Node count", fontsize=9)
+    ax_right.set_title(f"nc={nc}  —  Node position distribution histogram", fontsize=10)
     ax_right.grid(True, alpha=0.25, axis="y")
     if row == n_rows - 1:
-        ax_right.set_xlabel("节点 x 值（缩放坐标）", fontsize=9)
+        ax_right.set_xlabel("Node x value (Scaled coordinate)", fontsize=9)
 
 fig.tight_layout()
 combined_path = OUT_DIR / "bandpass_node_combined.png"
@@ -92,7 +92,7 @@ print(f"\n合并图已保存：{combined_path}")
 # 图2：前 200 步的放大轨迹（揭示贪心细节）
 # ──────────────────────────────────────────────
 fig2, axes2 = plt.subplots(2, 3, figsize=(16, 8))
-fig2.suptitle("前 200 步贪心选取轨迹（x 值 vs 选取顺序）", fontsize=13)
+fig2.suptitle("First 200 steps Greedy selection trajectory (x value vs Selection order)", fontsize=13)
 
 for ax, nc, color in zip(axes2.flat, NC_LIST, COLORS):
     pts = nodes_dict[nc]
@@ -105,8 +105,8 @@ for ax, nc, color in zip(axes2.flat, NC_LIST, COLORS):
     ax.axhline(SMIN, color="gray", lw=0.8, ls="--")
     ax.axhline(SMAX, color="gray", lw=0.8, ls="--")
     ax.set_title(f"nc={nc}", fontsize=10)
-    ax.set_xlabel("选取顺序", fontsize=9)
-    ax.set_ylabel("节点 x 值", fontsize=9)
+    ax.set_xlabel("Selection order", fontsize=9)
+    ax.set_ylabel("Node x value", fontsize=9)
     ax.grid(True, alpha=0.25)
 
     # 标注前 10 步编号
@@ -125,7 +125,7 @@ print(f"前200步放大图已保存：{order_path}")
 # 图3：所有 nc 覆盖图（同一坐标轴，看 nc 增大时的变化）
 # ──────────────────────────────────────────────
 fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(14, 5))
-fig3.suptitle("不同 nc 下 Ashkenazy 节点序列对比", fontsize=12)
+fig3.suptitle("Comparison of Ashkenazy node sequences for different nc", fontsize=12)
 
 for nc, color in zip(NC_LIST, COLORS):
     pts = nodes_dict[nc]
@@ -142,19 +142,19 @@ for nc, color in zip(NC_LIST, COLORS):
 # 对比 Chebyshev 理论 CDF（均匀弧密度：CDF = (1/π)·arccos(-x)）
 x_ref = np.linspace(SMIN + 0.01, SMAX - 0.01, 500)
 cdf_cheb = np.arccos(-x_ref) / np.pi
-ax3b.plot(x_ref, cdf_cheb, "k--", lw=1.5, label="Chebyshev 理论 CDF")
+ax3b.plot(x_ref, cdf_cheb, "k--", lw=1.5, label="Chebyshev theoretical CDF")
 
 ax3a.axhline(SMIN, color="gray", lw=0.8, ls="--")
 ax3a.axhline(SMAX, color="gray", lw=0.8, ls="--")
-ax3a.set_xlabel("选取顺序（归一化 0→1）", fontsize=10)
-ax3a.set_ylabel("节点 x 值", fontsize=10)
-ax3a.set_title("贪心序列轨迹（归一化顺序）", fontsize=10)
+ax3a.set_xlabel("Selection order (normalized 0→1)", fontsize=10)
+ax3a.set_ylabel("Node x value", fontsize=10)
+ax3a.set_title("Greedy sequence trajectory (normalized order)", fontsize=10)
 ax3a.legend(fontsize=8, markerscale=6)
 ax3a.grid(True, alpha=0.25)
 
-ax3b.set_xlabel("节点 x 值", fontsize=10)
-ax3b.set_ylabel("经验 CDF", fontsize=10)
-ax3b.set_title("节点分布 vs Chebyshev 理论 CDF", fontsize=10)
+ax3b.set_xlabel("Node x value", fontsize=10)
+ax3b.set_ylabel("Empirical CDF", fontsize=10)
+ax3b.set_title("Node distribution vs Chebyshev theoretical CDF", fontsize=10)
 ax3b.legend(fontsize=8)
 ax3b.grid(True, alpha=0.25)
 
