@@ -87,8 +87,9 @@ def train(
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
-    loss_history   = []
-    epoch_recorded = []
+    loss_history      = []
+    step_loss_history = []   # list of lists: [epoch][step]
+    epoch_recorded    = []
 
     # ── 训练循环 ──
     chain_info = (f"chain_len={chain_len}, kinetic_cutoff={kinetic_cutoff}"
@@ -96,7 +97,9 @@ def train(
     print(f"Training for {epochs} epochs ({batch_per_epoch} batches/epoch, {chain_info})...")
     for epoch in range(1, epochs + 1):
         model.train()
-        total_loss = 0.0
+        total_loss  = 0.0
+        step_totals = [0.0] * chain_len   # sum of per-step loss across batches
+        step_counts = [0]   * chain_len   # number of batches that reached step k
 
         for _ in range(batch_per_epoch):
             optimizer.zero_grad()
@@ -111,27 +114,40 @@ def train(
                     H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
                 pred = model(u_in, edge_index, edge_attr, V_tensor)
                 loss = criterion(pred, target)
+                step_totals[0] += loss.item()
+                step_counts[0] += 1
             else:
                 # ── Chain: generate chain_len (psi_k, H·psi_k) pairs from one psi_0 ──
                 # Each psi_k is L2-normalised; H·psi_k is the unnormalised target.
                 psi_0_fine = gen_fine_wavefunction(wf_type, k_max)
                 pairs = generate_chain(psi_0_fine, chain_len, kinetic_cutoff)
-                chain_loss = torch.zeros(1, device=device)
+                chain_loss  = torch.zeros(1, device=device)
+                step_losses = []
                 for psi_s, H_target in pairs:
                     u_in   = torch.tensor(
                         psi_s.flatten(),    dtype=torch.float32).unsqueeze(-1).to(device)
                     target = torch.tensor(
                         H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
                     pred = model(u_in, edge_index, edge_attr, V_tensor)
-                    chain_loss = chain_loss + criterion(pred, target)
+                    sl = criterion(pred, target)
+                    step_losses.append(sl)
+                    chain_loss = chain_loss + sl
                 loss = chain_loss / len(pairs)   # average over chain steps
+                for k, sl in enumerate(step_losses):
+                    step_totals[k] += sl.item()
+                    step_counts[k] += 1
 
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
 
         avg_loss = total_loss / batch_per_epoch
+        step_avgs = [
+            step_totals[k] / step_counts[k] if step_counts[k] > 0 else float('nan')
+            for k in range(chain_len)
+        ]
         loss_history.append(avg_loss)
+        step_loss_history.append(step_avgs)
         epoch_recorded.append(epoch)
 
         if epoch % 100 == 0:
@@ -151,13 +167,25 @@ def train(
 
     # ── 保存 loss ──
     with open(os.path.join(run_dir, "loss_history.json"), "w") as f:
-        json.dump({"epoch": epoch_recorded, "loss": loss_history}, f)
+        json.dump({
+            "epoch":       epoch_recorded,
+            "loss":        loss_history,
+            "step_losses": step_loss_history,   # list[epoch][step]
+        }, f)
 
     # ── loss 曲线 ──
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.semilogy(epoch_recorded, loss_history, lw=1.5, color="steelblue")
+    ax.semilogy(epoch_recorded, loss_history,
+                lw=2.0, color="steelblue", label="avg", zorder=10)
+    if chain_len > 1:
+        colors = plt.cm.Reds(np.linspace(0.35, 0.90, chain_len))
+        for k in range(chain_len):
+            vals = [step_loss_history[i][k] for i in range(len(step_loss_history))]
+            ax.semilogy(epoch_recorded, vals,
+                        lw=1.0, color=colors[k], alpha=0.75, label=f"step {k}")
     ax.set_xlabel("Epoch"); ax.set_ylabel("MSE Loss")
-    ax.set_title(f"Training Loss ({wf_type}, hidden={hidden_dim})")
+    ax.set_title(f"Training Loss ({wf_type}, hidden={hidden_dim}, chain={chain_len})")
+    ax.legend(fontsize=8, loc="upper right")
     ax.grid(True, which='both', ls='--', alpha=0.5)
     fig.tight_layout()
     fig.savefig(os.path.join(run_dir, "loss_curve.png"), dpi=150)
