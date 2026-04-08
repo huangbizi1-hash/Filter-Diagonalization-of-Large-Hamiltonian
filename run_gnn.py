@@ -64,6 +64,8 @@ def main():
     # 测试参数
     parser.add_argument("--omega", type=float, default=1.0,
                         help="HO frequency for test_ho mode")
+    parser.add_argument("--kinetic_cutoff", type=float, default=30.0,
+                        help="Kinetic energy cutoff T(k)<=cutoff in FFT operator")
     parser.add_argument("--n_steps", type=int, default=8,
                         help="Max number of H applications in test")
     parser.add_argument("--n_test",  type=int, default=5,
@@ -94,7 +96,9 @@ def main():
     if args.mode == "test_ho":
         from gnn_code.fd_baseline import test_ho_groundstate
         test_ho_groundstate(
+            n_steps=args.n_steps,
             omega=args.omega,
+            kinetic_cutoff=args.kinetic_cutoff,
             output_root=OUTPUT_ROOT,
         )
         return

@@ -54,16 +54,25 @@ K2_fine = _Kx**2 + _Ky**2 + _Kz**2
 # ──────────────────────────────────────────────
 # FFT 精确哈密顿量
 # ──────────────────────────────────────────────
-def fft_hamiltonian(psi_fine: np.ndarray) -> np.ndarray:
-    """H|ψ⟩ = -1/2 ∇²ψ + Vψ，通过 FFT 精确计算（fine grid）。"""
+def fft_hamiltonian(psi_fine: np.ndarray,
+                    kinetic_cutoff: float = 30.0) -> np.ndarray:
+    """H|ψ⟩ = -1/2 ∇²ψ + Vψ，通过 FFT 精确计算（fine grid）。
+
+    kinetic_cutoff : float
+        Cap on T(k) = |k|²/2 in k-space (atomic units).  Mirrors the
+        build_k_diagonal cutoff in fft_code/grid.py.  Default 30.0.
+        Set to np.inf to disable.
+    """
     psi_k = np.fft.fftn(psi_fine)
-    T_psi = np.fft.ifftn(0.5 * K2_fine * psi_k).real
+    T_k   = np.minimum(0.5 * K2_fine, kinetic_cutoff)
+    T_psi = np.fft.ifftn(T_k * psi_k).real
     return T_psi + V_fine * psi_fine
 
 
-def fft_energy(psi_fine: np.ndarray) -> float:
+def fft_energy(psi_fine: np.ndarray,
+               kinetic_cutoff: float = 30.0) -> float:
     """期望能量 ⟨ψ|H|ψ⟩ / ⟨ψ|ψ⟩（fine grid）。"""
-    H_psi = fft_hamiltonian(psi_fine)
+    H_psi = fft_hamiltonian(psi_fine, kinetic_cutoff=kinetic_cutoff)
     norm2  = np.sum(psi_fine**2) * d_fine**3
     energy = np.sum(psi_fine * H_psi) * d_fine**3
     return energy / norm2

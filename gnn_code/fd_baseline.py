@@ -237,33 +237,36 @@ def test_fd_baseline(
 # ──────────────────────────────────────────────
 
 def test_ho_groundstate(
-    omega:       float = 1.0,
-    output_root: str   = ".",
+    n_steps:        int   = 10,
+    omega:          float = 1.0,
+    kinetic_cutoff: float = 30.0,
+    output_root:    str   = ".",
 ) -> dict:
     """
-    Correctness test for the FD and FFT Hamiltonians on the 3D harmonic oscillator.
+    H^n power-iteration test on the 3D harmonic oscillator ground state.
 
-    H = -1/2 nabla^2 + 0.5 * omega^2 * r^2
-    Exact infinite-space ground state energy: E_0 = 3/2 * omega
+    H = -1/2 nabla^2 + 0.5 * omega^2 * r^2,  E_0 = 3/2 * omega
 
-    NOTE: The analytic psi_0 = exp(-omega/2 r^2) is NOT a perfect eigenstate of
-    H_PBC (periodic-box Hamiltonian), so repeated power iteration (H^n psi_0)
-    diverges toward the highest eigenvalue — that is expected, not a bug.
+    Starting from the analytic psi_0, applies H repeatedly (with renormalization
+    after every step) and tracks the Ritz energy E_n = <psi_n|H|psi_n>/<psi_n|psi_n>.
 
-    This test instead measures correctness by:
-      1. Variational energy: E_ritz = <psi_0|H|psi_0>/<psi_0|psi_0> — should be
-         close to E_0_exact (variational upper bound).
-      2. Residual: ||H psi_0 - E_ritz psi_0|| / ||psi_0|| — how close psi_0 is
-         to an eigenstate of H (depends on box size / PBC contamination).
-      3. Numerical eigenvalue: the lowest eigenvalue of H_FD_HO obtained via
-         scipy.sparse.linalg.eigsh — should converge to E_0 as d -> 0.
-      4. Grid-convergence: compare E_ritz on sparse grid (d=0.5) vs fine grid (d=0.25).
+    For a true eigenstate, E_n would stay constant at E_0.  In a finite periodic
+    box psi_0 is not exact, so E_n drifts — the drift rate reveals the operator
+    quality.  FFT (fine grid, d=0.25, with kinetic cutoff) is the near-exact
+    reference; FD (sparse grid, d=0.5, 4th-order isotropic stencil) is the
+    "GNN without neural network" baseline.
+
+    Parameters
+    ----------
+    n_steps        : number of H applications to iterate (x-axis range 0..n_steps)
+    omega          : HO frequency (Hartree atomic units)
+    kinetic_cutoff : cap on T(k)=|k|^2/2 in the FFT operator (same as fft_code)
+    output_root    : directory under which gnn_models/ is created
     """
-    from scipy.sparse.linalg import eigsh
-
-    print(f"\n=== HO Ground State Correctness Test (omega={omega}) ===")
+    print(f"\n=== HO Power-Iteration Test  omega={omega}  n_steps={n_steps} ===")
     E0_exact = 1.5 * omega
-    print(f"Exact E_0 = {E0_exact:.6f} Hartree  (3/2 * omega, infinite-space)")
+    print(f"Exact E_0 = {E0_exact:.6f} Ha  (3/2*omega, infinite space)")
+    print(f"kinetic_cutoff = {kinetic_cutoff}")
 
     # ── HO potential on both grids ──
     r2_fine   = X_f**2 + Y_f**2 + Z_f**2
@@ -271,129 +274,104 @@ def test_ho_groundstate(
     V_ho_fine   = 0.5 * omega**2 * r2_fine
     V_ho_sparse = 0.5 * omega**2 * r2_sparse
 
-    # ── Analytic ground state (Gaussian, normalized) ──
+    # ── Analytic ground state (Gaussian) normalized on each grid ──
     psi0_fine   = np.exp(-omega / 2.0 * r2_fine)
     psi0_sparse = np.exp(-omega / 2.0 * r2_sparse)
     psi0_fine   /= np.sqrt(np.sum(psi0_fine**2)   * d_fine**3)
     psi0_sparse /= np.sqrt(np.sum(psi0_sparse**2) * d_sparse**3)
 
-    # ── FFT Hamiltonian with HO potential ──
+    # ── FFT HO Hamiltonian (fine grid, with kinetic cutoff) ──
     def fft_ho(psi: np.ndarray) -> np.ndarray:
         psi_k = np.fft.fftn(psi)
-        T_psi = np.fft.ifftn(0.5 * K2_fine * psi_k).real
+        T_k   = np.minimum(0.5 * K2_fine, kinetic_cutoff)
+        T_psi = np.fft.ifftn(T_k * psi_k).real
         return T_psi + V_ho_fine * psi
 
-    # ── Variational energy and residual (FFT, fine grid) ──
-    Hpsi0_fft = fft_ho(psi0_fine)
-    norm2_f    = np.sum(psi0_fine**2) * d_fine**3
-    E_ritz_fft = np.sum(psi0_fine * Hpsi0_fft) * d_fine**3 / norm2_f
-    res_fft    = np.sqrt(np.sum((Hpsi0_fft - E_ritz_fft * psi0_fine)**2)
-                         * d_fine**3 / norm2_f)
+    # ── FD HO Hamiltonian (sparse grid, d=d_sparse) ──
+    print(f"Building FD Hamiltonian (d={d_sparse})...", flush=True)
+    H_fd = _build_fd_hamiltonian(V_ho_sparse.flatten(), N_sparse, d_sparse)
+    print(f"  shape={H_fd.shape}  nnz={H_fd.nnz:,}")
 
-    # ── Build FD HO Hamiltonians (sparse and fine grids) ──
-    print("Building FD Hamiltonians...", flush=True)
-    N_fine_loc = int(L / d_fine)
-    # We also build a FD HO on the FINE grid to compare discretization error fairly
-    def _build_fd_fine_ho():
-        kin_pref = -1.0 / (24.0 * d_fine**2)  # stencil encodes 12*d²*∇²
-        S_off = np.array([[3, -4, 3], [-4, 16, -4], [3, -4, 3]])
-        S_mid = np.array([[-4, 16, -4], [16, -72, 16], [-4, 16, -4]])
-        S_loc = np.stack([S_off, S_mid, S_off], axis=0)
-        V_flat = V_ho_fine.flatten()
-        N = N_fine_loc
-        H = lil_matrix((N**3, N**3), dtype=np.float64)
-        def idx(i, j, k): return (i%N)*N**2 + (j%N)*N + (k%N)
-        for i in range(N):
-            for j in range(N):
-                for k in range(N):
-                    u = idx(i, j, k); ds = 0.0
-                    for di in (-1,0,1):
-                        for dj in (-1,0,1):
-                            for dk in (-1,0,1):
-                                if di==0 and dj==0 and dk==0: continue
-                                v = idx(i+di, j+dj, k+dk)
-                                w = float(S_loc[di+1,dj+1,dk+1]) * kin_pref
-                                H[u, v] += w; ds -= w
-                    H[u, u] = ds + V_flat[u]
-        return H.tocsr()
+    # ── Power-iteration helper: compute Ritz energy series ──
+    def _ritz_series_fft(psi0: np.ndarray) -> np.ndarray:
+        """Apply H_FFT^n (n=0..n_steps) with renormalization; return energies."""
+        psi = psi0.copy()
+        energies = []
+        for _ in range(n_steps + 1):
+            Hpsi  = fft_ho(psi)
+            norm2 = np.sum(psi**2) * d_fine**3
+            E     = np.sum(psi * Hpsi) * d_fine**3 / norm2
+            energies.append(E)
+            nrm = np.linalg.norm(Hpsi)
+            if nrm < 1e-30 or not np.isfinite(nrm):
+                energies.extend([float('nan')] * (n_steps + 1 - len(energies)))
+                break
+            psi = Hpsi / nrm   # renormalize
+        return np.array(energies)
 
-    H_fd_sparse = _build_fd_hamiltonian(V_ho_sparse.flatten(), N_sparse, d_sparse)
-    H_fd_fine   = _build_fd_fine_ho()
-    print(f"  Sparse FD: {H_fd_sparse.shape}  nnz={H_fd_sparse.nnz:,}  (d={d_sparse})")
-    print(f"  Fine   FD: {H_fd_fine.shape}  nnz={H_fd_fine.nnz:,}  (d={d_fine})")
+    def _ritz_series_fd(u0: np.ndarray) -> np.ndarray:
+        """Apply H_FD^n (n=0..n_steps) with renormalization; return energies."""
+        u = u0.flatten().astype(np.float64)
+        u /= np.linalg.norm(u)
+        energies = []
+        for _ in range(n_steps + 1):
+            Hu    = H_fd @ u
+            norm2 = np.dot(u, u) * d_sparse**3
+            E     = np.dot(u, Hu) * d_sparse**3 / norm2
+            energies.append(E)
+            nrm = np.linalg.norm(Hu)
+            if nrm < 1e-30 or not np.isfinite(nrm):
+                energies.extend([float('nan')] * (n_steps + 1 - len(energies)))
+                break
+            u = Hu / nrm   # renormalize
+        return np.array(energies)
 
-    # ── Variational energy and residual (FD, sparse) ──
-    u0_s    = psi0_sparse.flatten()
-    Hu0_s   = H_fd_sparse @ u0_s
-    norm2_s = np.dot(u0_s, u0_s) * d_sparse**3
-    E_ritz_fd_s = np.dot(u0_s, Hu0_s) * d_sparse**3 / norm2_s
-    res_fd_s    = np.sqrt(np.sum((Hu0_s - E_ritz_fd_s * u0_s)**2)
-                          * d_sparse**3 / norm2_s)
+    print("Running FFT power iteration...", flush=True)
+    e_fft = _ritz_series_fft(psi0_fine)
+    print("Running FD  power iteration...", flush=True)
+    e_fd  = _ritz_series_fd(psi0_sparse)
 
-    # ── Variational energy and residual (FD, fine) ──
-    u0_f    = psi0_fine.flatten()
-    Hu0_f   = H_fd_fine @ u0_f
-    norm2_ffd = np.dot(u0_f, u0_f) * d_fine**3
-    E_ritz_fd_f = np.dot(u0_f, Hu0_f) * d_fine**3 / norm2_ffd
-    res_fd_f    = np.sqrt(np.sum((Hu0_f - E_ritz_fd_f * u0_f)**2)
-                          * d_fine**3 / norm2_ffd)
+    steps = np.arange(n_steps + 1)
 
-    # ── Lowest numerical eigenvalue via scipy eigsh ──
-    print("Computing lowest eigenvalue via scipy eigsh...", flush=True)
-    v0_s = psi0_sparse.flatten().astype(np.float64)
-    v0_f = psi0_fine.flatten().astype(np.float64)
-    E_eig_s = eigsh(H_fd_sparse, k=1, which='SM', v0=v0_s, tol=1e-10,
-                    maxiter=5000, return_eigenvectors=False)[0]
-    E_eig_f = eigsh(H_fd_fine,   k=1, which='SM', v0=v0_f, tol=1e-10,
-                    maxiter=5000, return_eigenvectors=False)[0]
-
-    # ── Summary table ──
-    print(f"\n  Method               E_ritz       Residual   |E-E0_exact|")
-    print(f"  {'─'*58}")
-    print(f"  FFT   (d={d_fine})       {E_ritz_fft:10.6f}   {res_fft:9.2e}   "
-          f"{abs(E_ritz_fft-E0_exact):.2e}")
-    print(f"  FD    (d={d_fine})       {E_ritz_fd_f:10.6f}   {res_fd_f:9.2e}   "
-          f"{abs(E_ritz_fd_f-E0_exact):.2e}")
-    print(f"  FD    (d={d_sparse})       {E_ritz_fd_s:10.6f}   {res_fd_s:9.2e}   "
-          f"{abs(E_ritz_fd_s-E0_exact):.2e}")
-    print(f"  ─── numerical eigenvalues (eigsh) ───")
-    print(f"  FD eig (d={d_fine})     {E_eig_f:10.6f}               "
-          f"{abs(E_eig_f-E0_exact):.2e}")
-    print(f"  FD eig (d={d_sparse})     {E_eig_s:10.6f}               "
-          f"{abs(E_eig_s-E0_exact):.2e}")
-    print(f"  Exact (infinite box)  {E0_exact:10.6f}")
+    # ── Print table ──
+    print(f"\n  {'n':>3}  {'E_FFT':>10}  {'E_FD':>10}  "
+          f"{'|E_FFT-E0|':>12}  {'|E_FD-E0|':>12}")
+    print("  " + "-" * 56)
+    for n, ef, efd in zip(steps, e_fft, e_fd):
+        sf = f"{abs(ef  - E0_exact):.3e}" if np.isfinite(ef)  else "  nan"
+        sd = f"{abs(efd - E0_exact):.3e}" if np.isfinite(efd) else "  nan"
+        print(f"  {n:3d}  {ef:10.6f}  {efd:10.6f}  {sf:>12}  {sd:>12}")
 
     # ── Plot ──
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
 
-    labels = [f'FFT  d={d_fine}', f'FD   d={d_fine}', f'FD   d={d_sparse}']
-    e_ritz = [E_ritz_fft, E_ritz_fd_f, E_ritz_fd_s]
-    e_eig  = [None,        E_eig_f,     E_eig_s]
-    resids = [res_fft,     res_fd_f,    res_fd_s]
-    colors = ['tomato', 'steelblue', 'darkorange']
-
+    # Left: absolute Ritz energy vs n
     ax = axes[0]
-    x = np.arange(len(labels))
-    bars = ax.bar(x, e_ritz, color=colors, alpha=0.8, label='Ritz energy (analytic psi_0)')
-    # Overlay eigsh eigenvalue as marker
-    for xi, ee in zip(x[1:], e_eig[1:]):
-        ax.plot(xi, ee, 'k^', ms=9, zorder=5,
-                label='eigsh eigenvalue' if xi == x[1] else None)
+    ax.plot(steps, e_fft, 'r-s', lw=2, ms=6,
+            label=f'FFT (d={d_fine}, cutoff={kinetic_cutoff})')
+    ax.plot(steps, e_fd,  'b-o', lw=2, ms=6,
+            label=f'FD  (d={d_sparse}, 4th-order isotropic)')
     ax.axhline(E0_exact, color='k', ls='--', lw=1.5,
-               label=f'Exact E_0={E0_exact:.4f}')
-    ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=9)
-    ax.set_ylabel("Energy (Hartree)")
-    ax.set_title(f"HO ground state energy (omega={omega})\n"
-                 f"Ritz: variational energy with analytic psi_0")
-    ax.legend(fontsize=9); ax.grid(True, axis='y', ls='--', alpha=0.5)
+               label=f'Exact E_0 = {E0_exact:.4f} Ha')
+    ax.set_xlabel("n  (H applications)")
+    ax.set_ylabel("Ritz energy  <H>_n  (Ha)")
+    ax.set_title(f"HO ground state power iteration  (omega={omega})\n"
+                 f"Flat = eigenstate preserved; drift = PBC / discretisation error")
+    ax.legend(fontsize=9); ax.grid(True, ls='--', alpha=0.4)
 
+    # Right: |E_n - E0_exact| on semilogy
     ax = axes[1]
-    ax.bar(x, resids, color=colors, alpha=0.8)
-    ax.set_xticks(x); ax.set_xticklabels(labels, fontsize=9)
-    ax.set_ylabel("||H psi_0 - E_ritz psi_0|| / ||psi_0||")
-    ax.set_title("Eigenvalue residual of analytic psi_0\n"
-                 "(small = psi_0 is close to eigenstate of H_PBC)")
-    ax.set_yscale('log'); ax.grid(True, axis='y', which='both', ls='--', alpha=0.5)
+    ax.semilogy(steps, np.abs(e_fft - E0_exact) + 1e-16,
+                'r-s', lw=2, ms=6,
+                label=f'FFT  |E_n - E0|')
+    ax.semilogy(steps, np.abs(e_fd  - E0_exact) + 1e-16,
+                'b-o', lw=2, ms=6,
+                label=f'FD   |E_n - E0|')
+    ax.set_xlabel("n  (H applications)")
+    ax.set_ylabel("|E_n - E0_exact|  (Ha)")
+    ax.set_title("Deviation from exact E_0 after n H-applications\n"
+                 "(lower = operator closer to exact H)")
+    ax.legend(fontsize=9); ax.grid(True, which='both', ls='--', alpha=0.4)
 
     plt.tight_layout()
     out_dir   = os.path.join(output_root, "gnn_models")
@@ -405,9 +383,8 @@ def test_ho_groundstate(
 
     return {
         "omega": omega, "E0_exact": E0_exact,
-        "E_ritz_fft": E_ritz_fft,  "res_fft": res_fft,
-        "E_ritz_fd_fine": E_ritz_fd_f,   "res_fd_fine": res_fd_f,
-        "E_ritz_fd_sparse": E_ritz_fd_s, "res_fd_sparse": res_fd_s,
-        "E_eig_fd_fine": E_eig_f,
-        "E_eig_fd_sparse": E_eig_s,
+        "n_steps": n_steps, "kinetic_cutoff": kinetic_cutoff,
+        "steps":  steps.tolist(),
+        "e_fft":  [x if np.isfinite(x) else None for x in e_fft.tolist()],
+        "e_fd":   [x if np.isfinite(x) else None for x in e_fd.tolist()],
     }
