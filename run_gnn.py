@@ -69,8 +69,6 @@ def main():
     # 测试参数
     parser.add_argument("--omega", type=float, default=1.0,
                         help="HO frequency for test_ho mode")
-    parser.add_argument("--kinetic_cutoff", type=float, default=30.0,
-                        help="Kinetic energy cutoff T(k)<=cutoff in FFT operator")
     parser.add_argument("--n_steps", type=int, default=8,
                         help="Max number of H applications in test")
     parser.add_argument("--n_test",  type=int, default=5,
