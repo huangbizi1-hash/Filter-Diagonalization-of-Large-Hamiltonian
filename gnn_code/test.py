@@ -22,10 +22,7 @@ import matplotlib.pyplot as plt
 from .physics import (
     d_fine, d_sparse, V_sparse, fft_hamiltonian,
 )
-from .data  import (
-    gen_gaussian_wavefunction, gen_sine_wavefunction,
-    generate_wavefunction_and_target,
-)
+from .data  import gen_fine_wavefunction
 from .graph import build_graph
 from .model import HamiltonianGNN, FiniteDiffHamiltonian
 
@@ -109,11 +106,8 @@ def test_baseline(
     fd_energies_list  = []
 
     for _ in range(n_test):
-        if wf_type == 'gaussian':
-            psi_fine, _ = gen_gaussian_wavefunction()
-        else:
-            psi_fine, _ = gen_sine_wavefunction(k_max=k_max)
-        psi_sparse = psi_fine[::2, ::2, ::2]
+        psi_fine   = gen_fine_wavefunction(wf_type, k_max)  # (N_fine,)^3
+        psi_sparse = psi_fine[::2, ::2, ::2]                # (N_sparse,)^3
 
         fft_energies_list.append(_fft_energy_series(psi_fine,   n_steps))
         fd_energies_list.append(_gnn_energy_series( psi_sparse, fd_ham, n_steps, device))
@@ -201,11 +195,8 @@ def test_gnn_from_run(
     test_sparse_list = []
     test_fine_list   = []
     for _ in range(n_test):
-        if wf_type == 'gaussian':
-            psi_fine, _ = gen_gaussian_wavefunction()
-        else:
-            psi_fine, _ = gen_sine_wavefunction(k_max=k_max)
-        test_sparse_list.append(psi_fine[::2, ::2, ::2])
+        psi_fine = gen_fine_wavefunction(wf_type, k_max)  # (N_fine,)^3
+        test_sparse_list.append(psi_fine[::2, ::2, ::2])  # (N_sparse,)^3
         test_fine_list.append(psi_fine)
 
     # ── FFT 参考（与 checkpoint 无关）──

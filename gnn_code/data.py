@@ -55,6 +55,35 @@ def gen_sine_wavefunction(k_max: int = 2):
     return psi_sparse, H_psi_target
 
 
+def gen_fine_wavefunction(wf_type: str = 'gaussian', k_max: int = 2) -> np.ndarray:
+    """
+    Generate a wavefunction on the fine grid (N_fine³) without downsampling.
+    Returns psi_fine of shape (N_fine, N_fine, N_fine).
+    Used when the FFT reference energy series (fine grid) is needed separately.
+    """
+    if wf_type == 'gaussian':
+        psi_fine = np.zeros_like(X_f, dtype=np.float64)
+        for _ in range(3):
+            cx, cy, cz = (np.random.rand(3) - 0.5) * L * 0.5
+            width = 0.5 + np.random.rand() * 0.5
+            psi_fine += np.exp(
+                -((X_f - cx)**2 + (Y_f - cy)**2 + (Z_f - cz)**2)
+                / (2 * width**2))
+    elif wf_type == 'sine':
+        psi_fine = np.zeros_like(X_f, dtype=np.float64)
+        n_modes = np.random.randint(3, 7)
+        dk = 2 * np.pi / L
+        for _ in range(n_modes):
+            kx = np.random.randint(-k_max, k_max + 1) * dk
+            ky = np.random.randint(-k_max, k_max + 1) * dk
+            kz = np.random.randint(-k_max, k_max + 1) * dk
+            b = np.random.rand() * 2 * np.pi
+            psi_fine += np.sin(kx * X_f + ky * Y_f + kz * Z_f + b)
+    else:
+        raise ValueError(f"Unknown wf_type: {wf_type!r}. Choose 'gaussian' or 'sine'.")
+    return psi_fine
+
+
 def generate_wavefunction_and_target(wf_type: str = 'gaussian', k_max: int = 2):
     """
     统一接口：wf_type ∈ {'gaussian', 'sine'}

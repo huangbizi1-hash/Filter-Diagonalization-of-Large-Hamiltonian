@@ -154,15 +154,15 @@ def test_fd_baseline(
 
     返回 (fd_energies, fft_energies) 各形状 (n_test, n_steps+1)。
     """
-    print("构建有限差分稀疏矩阵 H_FD ...", flush=True)
+    print("Building sparse FD Hamiltonian H_FD ...", flush=True)
     H_fd = build_fd_hamiltonian_sparse()
-    print(f"  H_FD 形状: {H_fd.shape}  非零元: {H_fd.nnz:,}")
+    print(f"  H_FD shape: {H_fd.shape}  nnz: {H_fd.nnz:,}")
 
     fft_e_list = []
     fd_e_list  = []
 
     for i in range(n_test):
-        print(f"  测试波函数 {i+1}/{n_test} ...", flush=True)
+        print(f"  Test wavefunction {i+1}/{n_test} ...", flush=True)
         psi_fine   = _gen_fine_wavefunction(wf_type, k_max)
         psi_sparse = psi_fine[::2, ::2, ::2]
 
@@ -183,28 +183,27 @@ def test_fd_baseline(
                 label='FD'      if i == 0 else None)
         ax.plot(steps, fft_e[i], 'r--s', alpha=0.6, ms=4, lw=1.3,
                 label='FFT ref' if i == 0 else None)
-    ax.set_xlabel("n  （H 作用次数）")
-    ax.set_ylabel("Ritz 能量  ⟨H⟩")
-    ax.set_title(f"FD 差分基准：能量 vs H 作用次数\n"
+    ax.set_xlabel("n  (H applications)")
+    ax.set_ylabel("Ritz energy  <H>")
+    ax.set_title(f"FD Baseline: Energy vs H applications\n"
                  f"(d_sparse={d_sparse}, N_sparse={N_sparse})")
     ax.legend(); ax.grid(True, ls='--', alpha=0.5)
 
     ax = axes[1]
     mean_err = rel_err.mean(axis=0)
     std_err  = rel_err.std(axis=0)
-    ax.semilogy(steps, mean_err, 'b-o', lw=1.8, label='均值相对误差')
+    ax.semilogy(steps, mean_err, 'b-o', lw=1.8, label='mean relative error')
     ax.fill_between(steps,
                     np.maximum(mean_err - std_err, 1e-12),
                     mean_err + std_err,
-                    alpha=0.25, label='±1σ')
-    # 标出初始误差和最终误差
+                    alpha=0.25, label='+/-1sigma')
     ax.annotate(f"{mean_err[0]:.2e}", xy=(0, mean_err[0]),
                 xytext=(0.5, mean_err[0]*2), fontsize=9, color='navy')
     ax.annotate(f"{mean_err[-1]:.2e}", xy=(n_steps, mean_err[-1]),
                 xytext=(n_steps-1.5, mean_err[-1]*2), fontsize=9, color='navy')
-    ax.set_xlabel("n  （H 作用次数）")
-    ax.set_ylabel("相对能量误差  |E_FD - E_FFT| / |E_FFT|")
-    ax.set_title("FD 差分基准：相对误差 vs n")
+    ax.set_xlabel("n  (H applications)")
+    ax.set_ylabel("Relative energy error  |E_FD - E_FFT| / |E_FFT|")
+    ax.set_title("FD Baseline: Relative error vs n")
     ax.legend(); ax.grid(True, which='both', ls='--', alpha=0.5)
 
     plt.tight_layout()
@@ -213,7 +212,7 @@ def test_fd_baseline(
     save_path = os.path.join(out_dir, "fd_baseline_numpy.png")
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
-    print(f"\n图像已保存 → {save_path}")
+    print(f"\nPlot saved -> {save_path}")
 
     # ── 打印汇总 ──
     print(f"\n{'n':>4}  {'mean rel err':>14}  {'std':>10}")
