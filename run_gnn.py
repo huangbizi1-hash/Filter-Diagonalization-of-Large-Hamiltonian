@@ -57,7 +57,10 @@ def main():
     # 训练超参数
     parser.add_argument("--hidden_dim",      type=int,   default=64)
     parser.add_argument("--epochs",          type=int,   default=5000)
-    parser.add_argument("--batch_per_epoch", type=int,   default=10)
+    parser.add_argument("--batch_per_epoch", type=int,   default=10,
+                        help="Number of optimizer steps per epoch")
+    parser.add_argument("--batch_size",      type=int,   default=1,
+                        help="Number of independent psi's averaged per optimizer step")
     parser.add_argument("--save_every",      type=int,   default=500)
     parser.add_argument("--lr",              type=float, default=1e-3)
     parser.add_argument("--chain_len",       type=int,   default=1,
@@ -127,6 +130,7 @@ def main():
             hidden_dim=args.hidden_dim,
             epochs=args.epochs,
             batch_per_epoch=args.batch_per_epoch,
+            batch_size=args.batch_size,
             save_every=args.save_every,
             lr=args.lr,
             chain_len=args.chain_len,

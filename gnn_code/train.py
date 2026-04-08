@@ -35,6 +35,7 @@ def train(
     hidden_dim:      int   = 64,
     epochs:          int   = 5000,
     batch_per_epoch: int   = 10,
+    batch_size:      int   = 1,
     save_every:      int   = 500,
     lr:              float = 1e-3,
     chain_len:       int   = 1,
@@ -58,7 +59,7 @@ def train(
     config = dict(
         wf_type=wf_type, k_max=k_max,
         hidden_dim=hidden_dim, epochs=epochs,
-        batch_per_epoch=batch_per_epoch,
+        batch_per_epoch=batch_per_epoch, batch_size=batch_size,
         save_every=save_every, lr=lr,
         chain_len=chain_len, kinetic_cutoff=kinetic_cutoff,
         L=L, d_fine=d_fine, d_sparse=d_sparse,
@@ -94,52 +95,66 @@ def train(
     # ── 训练循环 ──
     chain_info = (f"chain_len={chain_len}, kinetic_cutoff={kinetic_cutoff}"
                   if chain_len > 1 else "single-step")
-    print(f"Training for {epochs} epochs ({batch_per_epoch} batches/epoch, {chain_info})...")
+    print(f"Training for {epochs} epochs "
+          f"({batch_per_epoch} steps/epoch, batch_size={batch_size}, {chain_info})...")
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss  = 0.0
-        step_totals = [0.0] * chain_len   # sum of per-step loss across batches
-        step_counts = [0]   * chain_len   # number of batches that reached step k
+        step_totals = [0.0] * chain_len   # sum of per-step loss across optimizer steps
+        step_counts = [0]   * chain_len
 
         for _ in range(batch_per_epoch):
             optimizer.zero_grad()
 
-            if chain_len == 1:
-                # ── Original single-step: one (psi, H·psi) pair per sample ──
-                psi_s, H_target = generate_wavefunction_and_target(
-                    wf_type=wf_type, k_max=k_max)
-                u_in   = torch.tensor(
-                    psi_s.flatten(),    dtype=torch.float32).unsqueeze(-1).to(device)
-                target = torch.tensor(
-                    H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
-                pred = model(u_in, edge_index, edge_attr, V_tensor)
-                loss = criterion(pred, target)
-                step_totals[0] += loss.item()
-                step_counts[0] += 1
-            else:
-                # ── Chain: generate chain_len (psi_k, H·psi_k) pairs from one psi_0 ──
-                # Each psi_k is L2-normalised; H·psi_k is the unnormalised target.
-                psi_0_fine = gen_fine_wavefunction(wf_type, k_max)
-                pairs = generate_chain(psi_0_fine, chain_len, kinetic_cutoff)
-                chain_loss  = torch.zeros(1, device=device)
-                step_losses = []
-                for psi_s, H_target in pairs:
+            # Accumulate over batch_size independent psi's; share one backward pass.
+            # loss scale is independent of batch_size (average, not sum).
+            batch_loss = torch.zeros(1, device=device)
+            # Step-level accumulators for logging (detached)
+            step_sum = [torch.zeros(1, device=device) for _ in range(chain_len)]
+            step_n   = [0] * chain_len
+
+            for _ in range(batch_size):
+                if chain_len == 1:
+                    # Single-step: one (psi, H·psi) pair per psi
+                    psi_s, H_target = generate_wavefunction_and_target(
+                        wf_type=wf_type, k_max=k_max)
                     u_in   = torch.tensor(
                         psi_s.flatten(),    dtype=torch.float32).unsqueeze(-1).to(device)
                     target = torch.tensor(
                         H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
                     pred = model(u_in, edge_index, edge_attr, V_tensor)
                     sl = criterion(pred, target)
-                    step_losses.append(sl)
-                    chain_loss = chain_loss + sl
-                loss = chain_loss / len(pairs)   # average over chain steps
-                for k, sl in enumerate(step_losses):
-                    step_totals[k] += sl.item()
-                    step_counts[k] += 1
+                    batch_loss     = batch_loss + sl
+                    step_sum[0]    = step_sum[0] + sl.detach()
+                    step_n[0]     += 1
+                else:
+                    # Chain: chain_len steps per psi_0; each psi_k is L2-normalised
+                    psi_0_fine = gen_fine_wavefunction(wf_type, k_max)
+                    pairs = generate_chain(psi_0_fine, chain_len, kinetic_cutoff)
+                    psi_chain_loss = torch.zeros(1, device=device)
+                    for k, (psi_s, H_target) in enumerate(pairs):
+                        u_in   = torch.tensor(
+                            psi_s.flatten(),    dtype=torch.float32).unsqueeze(-1).to(device)
+                        target = torch.tensor(
+                            H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
+                        pred = model(u_in, edge_index, edge_attr, V_tensor)
+                        sl = criterion(pred, target)
+                        psi_chain_loss = psi_chain_loss + sl
+                        step_sum[k]    = step_sum[k] + sl.detach()
+                        step_n[k]     += 1
+                    # Contribute mean-over-steps to batch (same scale as chain_len=1)
+                    batch_loss = batch_loss + psi_chain_loss / len(pairs)
 
+            loss = batch_loss / batch_size   # mean over psi's in batch
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+
+            # Per-step averages over the batch (for logging only)
+            for k in range(chain_len):
+                if step_n[k] > 0:
+                    step_totals[k] += (step_sum[k] / step_n[k]).item()
+                    step_counts[k] += 1
 
         avg_loss = total_loss / batch_per_epoch
         step_avgs = [
