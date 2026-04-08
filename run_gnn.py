@@ -42,8 +42,10 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--mode", default="all",
-                        choices=["train", "test_baseline", "test_gnn", "test_fd", "all"],
-                        help="运行模式：test_fd 为纯差分基准（无需 PyTorch）")
+                        choices=["train", "test_baseline", "test_gnn",
+                                 "test_fd", "test_ho", "all"],
+                        help="test_fd: FD baseline on random wfs (no PyTorch); "
+                             "test_ho: HO ground state correctness test (no PyTorch)")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
@@ -60,8 +62,10 @@ def main():
     parser.add_argument("--lr",              type=float, default=1e-3)
 
     # 测试参数
+    parser.add_argument("--omega", type=float, default=1.0,
+                        help="HO frequency for test_ho mode")
     parser.add_argument("--n_steps", type=int, default=8,
-                        help="测试时作用 H 的最大次数")
+                        help="Max number of H applications in test")
     parser.add_argument("--n_test",  type=int, default=5,
                         help="测试波函数数量")
     parser.add_argument("--d_test",  type=int, default=1,
@@ -82,6 +86,15 @@ def main():
             n_test=args.n_test,
             wf_type=args.wf_type,
             k_max=args.k_max,
+            output_root=OUTPUT_ROOT,
+        )
+        return
+
+    # ── HO ground state correctness test (no PyTorch) ──
+    if args.mode == "test_ho":
+        from gnn_code.fd_baseline import test_ho_groundstate
+        test_ho_groundstate(
+            omega=args.omega,
             output_root=OUTPUT_ROOT,
         )
         return
