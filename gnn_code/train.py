@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 from .physics import (
     L, d_fine, d_sparse, N_fine, N_sparse, A_pot, sigma_pot, V_sparse,
 )
-from .data  import generate_wavefunction_and_target
+from .data  import generate_wavefunction_and_target, generate_chain, gen_fine_wavefunction
 from .graph import build_graph
 from .model import HamiltonianGNN
 
@@ -37,7 +37,9 @@ def train(
     batch_per_epoch: int   = 10,
     save_every:      int   = 500,
     lr:              float = 1e-3,
-    output_root:     str   = ".",       # 仓库根目录（run_gnn.py 从此处运行）
+    chain_len:       int   = 1,
+    kinetic_cutoff:  float = 30.0,
+    output_root:     str   = ".",
 ):
     """
     训练 HamiltonianGNN，返回 (model, run_dir, loss_history)。
@@ -58,6 +60,7 @@ def train(
         hidden_dim=hidden_dim, epochs=epochs,
         batch_per_epoch=batch_per_epoch,
         save_every=save_every, lr=lr,
+        chain_len=chain_len, kinetic_cutoff=kinetic_cutoff,
         L=L, d_fine=d_fine, d_sparse=d_sparse,
         N_fine=N_fine, N_sparse=N_sparse,
         A_pot=A_pot, sigma_pot=sigma_pot,
@@ -88,23 +91,41 @@ def train(
     epoch_recorded = []
 
     # ── 训练循环 ──
-    print(f"Training for {epochs} epochs ({batch_per_epoch} batches/epoch)...")
+    chain_info = (f"chain_len={chain_len}, kinetic_cutoff={kinetic_cutoff}"
+                  if chain_len > 1 else "single-step")
+    print(f"Training for {epochs} epochs ({batch_per_epoch} batches/epoch, {chain_info})...")
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
 
         for _ in range(batch_per_epoch):
-            psi_s, H_target = generate_wavefunction_and_target(
-                wf_type=wf_type, k_max=k_max)
-
-            u_in   = torch.tensor(
-                psi_s.flatten(),    dtype=torch.float32).unsqueeze(-1).to(device)
-            target = torch.tensor(
-                H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
-
             optimizer.zero_grad()
-            pred = model(u_in, edge_index, edge_attr, V_tensor)
-            loss = criterion(pred, target)
+
+            if chain_len == 1:
+                # ── Original single-step: one (psi, H·psi) pair per sample ──
+                psi_s, H_target = generate_wavefunction_and_target(
+                    wf_type=wf_type, k_max=k_max)
+                u_in   = torch.tensor(
+                    psi_s.flatten(),    dtype=torch.float32).unsqueeze(-1).to(device)
+                target = torch.tensor(
+                    H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
+                pred = model(u_in, edge_index, edge_attr, V_tensor)
+                loss = criterion(pred, target)
+            else:
+                # ── Chain: generate chain_len (psi_k, H·psi_k) pairs from one psi_0 ──
+                # Each psi_k is L2-normalised; H·psi_k is the unnormalised target.
+                psi_0_fine = gen_fine_wavefunction(wf_type, k_max)
+                pairs = generate_chain(psi_0_fine, chain_len, kinetic_cutoff)
+                chain_loss = torch.zeros(1, device=device)
+                for psi_s, H_target in pairs:
+                    u_in   = torch.tensor(
+                        psi_s.flatten(),    dtype=torch.float32).unsqueeze(-1).to(device)
+                    target = torch.tensor(
+                        H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
+                    pred = model(u_in, edge_index, edge_attr, V_tensor)
+                    chain_loss = chain_loss + criterion(pred, target)
+                loss = chain_loss / len(pairs)   # average over chain steps
+
             loss.backward()
             optimizer.step()
             total_loss += loss.item()

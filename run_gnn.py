@@ -60,6 +60,11 @@ def main():
     parser.add_argument("--batch_per_epoch", type=int,   default=10)
     parser.add_argument("--save_every",      type=int,   default=500)
     parser.add_argument("--lr",              type=float, default=1e-3)
+    parser.add_argument("--chain_len",       type=int,   default=1,
+                        help="H-application chain length per training sample "
+                             "(1 = original single-step; >1 = chain training)")
+    parser.add_argument("--kinetic_cutoff",  type=float, default=30.0,
+                        help="Kinetic energy cap T(k)<=cutoff in FFT operator (Ha)")
 
     # 测试参数
     parser.add_argument("--omega", type=float, default=1.0,
@@ -126,6 +131,8 @@ def main():
             batch_per_epoch=args.batch_per_epoch,
             save_every=args.save_every,
             lr=args.lr,
+            chain_len=args.chain_len,
+            kinetic_cutoff=args.kinetic_cutoff,
             output_root=OUTPUT_ROOT,
         )
 

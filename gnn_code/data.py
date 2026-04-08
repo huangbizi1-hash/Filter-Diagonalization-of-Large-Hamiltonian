@@ -9,7 +9,7 @@ data.py — 波函数生成
 
 import numpy as np
 from .physics import (
-    X_f, Y_f, Z_f, L, fft_hamiltonian,
+    X_f, Y_f, Z_f, L, fft_hamiltonian, d_fine,
 )
 
 
@@ -82,6 +82,50 @@ def gen_fine_wavefunction(wf_type: str = 'gaussian', k_max: int = 2) -> np.ndarr
     else:
         raise ValueError(f"Unknown wf_type: {wf_type!r}. Choose 'gaussian' or 'sine'.")
     return psi_fine
+
+
+def generate_chain(psi_0_fine: np.ndarray,
+                   chain_len: int = 1,
+                   kinetic_cutoff: float = 30.0) -> list:
+    """
+    Generate a chain of (psi_k_sparse, target_k_sparse) training pairs.
+
+    Starting from psi_0_fine, repeatedly applies H_FFT and normalises to
+    produce the next input, matching the GNN inference loop exactly.
+
+    Step k:
+      input  = psi_k_fine[::2,::2,::2]          (normalised, on sparse grid)
+      target = H_FFT(psi_k_fine)[::2,::2,::2]   (unnormalised H·psi_k)
+      psi_{k+1}_fine = H_FFT(psi_k_fine) / ‖H_FFT(psi_k_fine)‖
+
+    Parameters
+    ----------
+    psi_0_fine     : initial wavefunction on fine grid (will be L2-normalised)
+    chain_len      : number of steps; returns list of length ≤ chain_len
+    kinetic_cutoff : forwarded to fft_hamiltonian (Ha, default 30.0)
+
+    Returns
+    -------
+    list of (psi_sparse, target_sparse) numpy arrays, length = chain_len
+    (may be shorter if norm collapses to zero)
+    """
+    pairs = []
+    psi = psi_0_fine.copy()
+    # L2-normalise on fine grid
+    nrm = np.sqrt(np.sum(psi**2) * d_fine**3)
+    if nrm > 1e-30:
+        psi /= nrm
+
+    for _ in range(chain_len):
+        H_psi = fft_hamiltonian(psi, kinetic_cutoff=kinetic_cutoff)
+        pairs.append((psi[::2, ::2, ::2].copy(),
+                      H_psi[::2, ::2, ::2].copy()))
+        nrm = np.sqrt(np.sum(H_psi**2) * d_fine**3)
+        if nrm < 1e-30 or not np.isfinite(nrm):
+            break
+        psi = H_psi / nrm      # normalise for next step
+
+    return pairs
 
 
 def generate_wavefunction_and_target(wf_type: str = 'gaussian', k_max: int = 2):
