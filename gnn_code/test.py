@@ -42,13 +42,20 @@ def _gnn_energy_series(psi_sparse: np.ndarray,
     """
     u = torch.tensor(
         psi_sparse.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
+    # Normalize initial vector to avoid overflow during repeated H applications
+    u = u / (torch.norm(u) + 1e-30)
     energies = []
     for _ in range(n_steps + 1):
         H_u    = apply_H(u)
         norm2  = torch.sum(u**2).item() * d_sparse**3
         energy = torch.sum(u * H_u).item() * d_sparse**3
         energies.append(energy / norm2)
-        u = H_u   # ψ_{k+1} = H ψ_k（不归一化）
+        # Normalize before next application to prevent numerical overflow
+        nrm = torch.norm(H_u)
+        if nrm < 1e-30 or not torch.isfinite(nrm):
+            energies.extend([float('nan')] * (n_steps - len(energies) + 1))
+            break
+        u = H_u / nrm
     return energies
 
 
@@ -58,13 +65,20 @@ def _fft_energy_series(psi_fine: np.ndarray, n_steps: int) -> list:
     返回各步的精确 Ritz 能量（ground truth）。
     """
     psi = psi_fine.copy()
+    nrm = np.linalg.norm(psi)
+    if nrm > 0:
+        psi /= nrm
     energies = []
     for _ in range(n_steps + 1):
         H_psi  = fft_hamiltonian(psi)
         norm2  = np.sum(psi**2) * d_fine**3
         energy = np.sum(psi * H_psi) * d_fine**3
         energies.append(energy / norm2)
-        psi = H_psi
+        nrm = np.linalg.norm(H_psi)
+        if nrm < 1e-30 or not np.isfinite(nrm):
+            energies.extend([float('nan')] * (n_steps - len(energies) + 1))
+            break
+        psi = H_psi / nrm
     return energies
 
 
@@ -175,10 +189,11 @@ def test_gnn_from_run(
         config = json.load(f)
     hidden_dim = config.get('hidden_dim', 64)
 
-    ckpt_files = sorted([
-        fn for fn in os.listdir(run_dir)
-        if fn.startswith("epoch_") and fn.endswith(".pt")
-    ])
+    ckpt_files = sorted(
+        [fn for fn in os.listdir(run_dir)
+         if fn.startswith("epoch_") and fn.endswith(".pt")],
+        key=lambda fn: int(fn[len("epoch_"):-len(".pt")])   # numeric sort by epoch
+    )
     if not ckpt_files:
         print("No checkpoints found.")
         return None
@@ -271,4 +286,26 @@ def test_gnn_from_run(
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
     print(f"GNN test plot → {save_path}")
+
+    # Save numerical results so plots can be reproduced without re-running
+    json_path = os.path.join(run_dir, "gnn_test_energy.json")
+    save_data = {
+        "n_steps":      n_steps,
+        "n_test":       n_test,
+        "wf_type":      wf_type,
+        "steps":        steps.tolist(),
+        "fft_mean_err": (np.abs(fft_e_all - fft_e_all) / (np.abs(fft_e_all) + 1e-10)
+                         ).mean(axis=0).tolist(),   # always zero, kept for schema
+        "fd_mean_err":  fd_mean_err.tolist(),
+        "checkpoints":  [
+            {"epoch": r["epoch"],
+             "mean_rel_err": [x if np.isfinite(x) else None
+                              for x in r["mean_rel_err"].tolist()]}
+            for r in results
+        ],
+    }
+    with open(json_path, "w") as f:
+        json.dump(save_data, f, indent=2)
+    print(f"GNN test data  → {json_path}")
+
     return results
