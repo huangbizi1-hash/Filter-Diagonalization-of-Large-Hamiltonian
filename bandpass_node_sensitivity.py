@@ -192,7 +192,7 @@ xlo_s = phys_to_scaled(xlo_p)
 xhi_s = phys_to_scaled(xhi_p)
 
 # ── 拟合曲线 ──
-ax_main.plot(x_eval, f_true, "k-", lw=2.5, zorder=5, label="真实 bandpass")
+ax_main.plot(x_eval, f_true, "k-", lw=2.5, zorder=5, label="True bandpass")
 
 for delta, col in zip(deltas_to_plot, colors_c):
     f_fit  = fit_curves[delta]
@@ -248,10 +248,10 @@ for x_p, s_n in zip(annot_p, annot_step):
 ax_err.axvline(EL_PHYS - E1_PHYS, color="navy", lw=1.0, ls=":", alpha=0.5)
 ax_err.axvline(EL_PHYS + E1_PHYS, color="navy", lw=1.0, ls=":", alpha=0.5)
 ax_err.set_xlim(xlo_p, xhi_p)
-ax_err.set_ylabel("|残差|", fontsize=10)
+ax_err.set_ylabel("|Residual|", fontsize=10)
 ax_err.set_xlabel("E (Hartree)", fontsize=11)
 ax_err.grid(True, which="both", alpha=0.25)
-ax_err.set_title("点态残差 |f_fit - f_true|（半对数）", fontsize=10)
+ax_err.set_title("Pointwise residual |f_fit - f_true| (semi-log)", fontsize=10)
 ax_err.legend(fontsize=7, ncol=4, loc="upper right")
 
 fig.tight_layout()
@@ -273,9 +273,9 @@ delta_p_pos = delta_vals[pos_mask] * DE / 4.0
 delta_p_neg = (-delta_vals[neg_mask]) * DE / 4.0
 
 ax2.semilogy(delta_p_pos, max_errors[pos_mask],
-             "o-", color="steelblue", lw=1.8, ms=6, label="delta > 0（正方向）")
+             "o-", color="steelblue", lw=1.8, ms=6, label="delta > 0 (positive direction)")
 ax2.semilogy(delta_p_neg, max_errors[neg_mask],
-             "s--", color="tomato", lw=1.5, ms=5, alpha=0.8, label="|delta|（负方向）")
+             "s--", color="tomato", lw=1.5, ms=5, alpha=0.8, label="|delta| (negative direction)")
 
 # 相邻节点间距（物理单位）
 sort_s   = np.sort(nodes_orig)
@@ -284,11 +284,11 @@ if 0 < k_sorted < NC - 1:
     sp_l_p = (sort_s[k_sorted] - sort_s[k_sorted - 1]) * DE / 4.0
     sp_r_p = (sort_s[k_sorted + 1] - sort_s[k_sorted]) * DE / 4.0
     ax2.axvline(sp_l_p, color="green",  lw=1.2, ls="--", alpha=0.7,
-                label=f"左邻间距 {sp_l_p:.4f} Ha")
+                label=f"Left neighbor spacing {sp_l_p:.4f} Ha")
     ax2.axvline(sp_r_p, color="purple", lw=1.2, ls="--", alpha=0.7,
-                label=f"右邻间距 {sp_r_p:.4f} Ha")
+                label=f"Right neighbor spacing {sp_r_p:.4f} Ha")
 
-ax2.set_xlabel("|delta| (Hartree，物理坐标位移)", fontsize=11)
+ax2.set_xlabel("|delta| (Hartree, physical coordinate displacement)", fontsize=11)
 ax2.set_ylabel("max |f_fit - f_true|", fontsize=11)
 ax2.set_title(
     f"最大拟合误差 vs 节点位移  (nc={NC}, 被扰动节点步骤 #{k_near})\n"

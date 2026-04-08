@@ -124,7 +124,7 @@ for ax, beta in zip(axes, BETAS):
     for x_n, s_n in zip(annot_x, annot_step):
         ax.axvline(x_n, color=cmap_step(s_n / step_max), lw=0.9, alpha=0.55)
 
-    ax.set_ylabel("拟合误差", fontsize=10)
+    ax.set_ylabel("Fit error", fontsize=10)
     ax.set_title(f"beta={beta}，E1={E1}，nc={NC}", fontsize=10)
     ax.legend(fontsize=9, loc="upper right")
     ax.grid(True, which="both", alpha=0.3)
@@ -135,7 +135,7 @@ ax_top.set_xlim(axes[0].get_xlim())
 ax_top.set_xticks(annot_x)
 ax_top.set_xticklabels([f"#{s}" for s in annot_step],
                         rotation=90, fontsize=7, ha="center")
-ax_top.set_xlabel("节点步骤序号（贪心选取顺序）", fontsize=9)
+ax_top.set_xlabel("Node step index (Greedy selection order)", fontsize=9)
 
 # 颜色条
 sm = plt.cm.ScalarMappable(cmap=cmap_step,
@@ -144,7 +144,7 @@ sm.set_array([])
 cb = fig.colorbar(sm, ax=axes.tolist(), pad=0.01, fraction=0.015)
 cb.set_label("节点步骤序号", fontsize=9)
 
-axes[-1].set_xlabel("带通中心 El（缩放坐标）", fontsize=11)
+axes[-1].set_xlabel("Bandpass center El (Scaled coordinate)", fontsize=11)
 fig.suptitle(
     f"Bandpass 拟合误差 vs El（nc={NC}，E1={E1}）\n"
     "竖线 = 插值节点；颜色深红 = 晚选（高步骤序号），绿 = 早选",
@@ -182,14 +182,14 @@ for ax_c, idx_c, col in zip(axes2, showcase, colors_c):
     El = float(el_list[idx_c])
     me, _, f_true, f_fit = fit_error(El, BETA_CURVES)
 
-    ax_c.plot(s_eval, f_true, "k-",  lw=2.0, label="真实 bandpass", zorder=3)
+    ax_c.plot(s_eval, f_true, "k-",  lw=2.0, label="True bandpass", zorder=3)
     ax_c.plot(s_eval, f_fit,  "--",  color=col, lw=1.5, alpha=0.9,
-              label=f"Newton 拟合 (nc={NC})", zorder=2)
+              label=f"Newton fit (nc={NC})", zorder=2)
 
     # 残差（右轴）
     ax_r = ax_c.twinx()
     ax_r.fill_between(s_eval, 0, f_fit - f_true, alpha=0.2, color="tomato")
-    ax_r.set_ylabel("残差", fontsize=8, color="tomato")
+    ax_r.set_ylabel("Residual", fontsize=8, color="tomato")
     ax_r.tick_params(axis="y", labelcolor="tomato", labelsize=7)
 
     # 标注节点位置和步骤序号（只标注 El 附近 ±0.15 范围内）
@@ -206,7 +206,7 @@ for ax_c, idx_c, col in zip(axes2, showcase, colors_c):
     ax_c.axvline(El + E1, color="navy", lw=1.0, ls=":", alpha=0.7)
 
     ax_c.set_xlim(El - 0.18, El + 0.18)
-    ax_c.set_xlabel("x（缩放坐标）", fontsize=9)
+    ax_c.set_xlabel("x (Scaled coordinate)", fontsize=9)
     ax_c.set_title(
         f"El={El:+.5f}  |  max_err={me:.2e}  |  beta={BETA_CURVES}",
         fontsize=10,

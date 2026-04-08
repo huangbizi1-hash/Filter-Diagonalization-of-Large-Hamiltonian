@@ -116,16 +116,16 @@ ax.plot(E_arr, np.clip(np.abs(f1),       0, CLIP), color='steelblue',
 ax.plot(E_arr, np.clip(np.abs(f2),       0, CLIP), color='darkorange',
         lw=1.2, label=f'|T_{m2}(H_s2)|  E_lower={E_lower2}', ls='--')
 ax.plot(E_arr, np.clip(np.abs(combined), 0, CLIP), color='crimson',
-        lw=1.8, label='|f1·f2|  (联合)')
+        lw=1.8, label='|f1·f2|  (joint)')
 ax.axvline(E_lower1, color='steelblue', ls=':', lw=1)
 ax.axvline(E_lower2, color='darkorange', ls=':', lw=1)
 ax.axhline(1, color='gray', ls=':', lw=0.8)
 ax.fill_betweenx([0, CLIP], E_lower1, E_lower2, alpha=0.07,
-                 color='darkorange', label=f'[{E_lower1},{E_lower2}) 目标区间')
+                 color='darkorange', label=f'[{E_lower1},{E_lower2}) Target interval')
 ax.set_ylim(0, CLIP)
 ax.set_xlabel('Energy (Hartree)')
 ax.set_ylabel(f'|filter(E)| (clipped at {CLIP})')
-ax.set_title('两级联合放大因子')
+ax.set_title('Two-stage joint amplification')
 ax.legend(fontsize=8)
 ax.grid(True)
 
