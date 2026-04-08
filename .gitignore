@@ -1,3 +1,6 @@
 __pycache__/
 *.py[cod]
 *.pyo
+
+# GNN 运行输出（模型检查点、测试图像等，不纳入版本控制）
+gnn_models/
