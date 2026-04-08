@@ -18,14 +18,24 @@ test     : 测试 H_eff^n psi 精度并画图
     python run_gnn.py --mode all --epochs 5000
 """
 
+# 无 torch 依赖的模块：始终可导入
 from .physics import (
     L, d_fine, d_sparse, N_fine, N_sparse,
     X_f, Y_f, Z_f, X_s, Y_s, Z_s,
     V_fine, V_sparse, K2_fine,
     fft_hamiltonian, fft_energy,
 )
-from .data  import gen_gaussian_wavefunction, gen_sine_wavefunction, generate_wavefunction_and_target
-from .graph import build_graph
-from .model import HamiltonianGNN, FiniteDiffHamiltonian
-from .train import train
-from .test  import test_baseline, test_gnn_from_run
+from .data import (
+    gen_gaussian_wavefunction,
+    gen_sine_wavefunction,
+    generate_wavefunction_and_target,
+)
+
+# torch 依赖模块：仅在 torch 可用时导入
+try:
+    from .graph import build_graph
+    from .model import HamiltonianGNN, FiniteDiffHamiltonian
+    from .train import train
+    from .test  import test_baseline, test_gnn_from_run
+except ImportError:
+    pass   # 无 PyTorch 时跳过；test_fd 模式只需 fd_baseline.py

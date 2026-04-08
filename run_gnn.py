@@ -3,7 +3,10 @@ run_gnn.py — Hamiltonian GNN 统一入口
 
 从仓库根目录运行：
 
-    # 完整流程（baseline + 训练 + 测试）
+    # 纯差分基准测试（无 PyTorch，可独立运行）
+    python run_gnn.py --mode test_fd
+
+    # 完整流程（baseline + 训练 + 测试，需要 PyTorch）
     python run_gnn.py --mode all --wf_type gaussian --epochs 5000 --save_every 500
 
     # 仅训练（正弦波）
@@ -24,12 +27,11 @@ run_gnn.py — Hamiltonian GNN 统一入口
         loss_curve.png
         gnn_test_energy.png
       baseline_test.png
+      fd_baseline_numpy.png      ← test_fd 模式输出
 """
 
 import os
 import argparse
-
-from gnn_code import train, test_baseline, test_gnn_from_run
 
 OUTPUT_ROOT = os.path.dirname(os.path.abspath(__file__))   # 仓库根目录
 
@@ -40,8 +42,8 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--mode", default="all",
-                        choices=["train", "test_baseline", "test_gnn", "all"],
-                        help="运行模式")
+                        choices=["train", "test_baseline", "test_gnn", "test_fd", "all"],
+                        help="运行模式：test_fd 为纯差分基准（无需 PyTorch）")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
@@ -72,7 +74,22 @@ def main():
 
     run_dir = args.run_dir   # 训练后会更新
 
-    # ── baseline 测试 ──
+    # ── 纯差分基准（无 PyTorch）──
+    if args.mode == "test_fd":
+        from gnn_code.fd_baseline import test_fd_baseline
+        test_fd_baseline(
+            n_steps=args.n_steps,
+            n_test=args.n_test,
+            wf_type=args.wf_type,
+            k_max=args.k_max,
+            output_root=OUTPUT_ROOT,
+        )
+        return
+
+    # ── 以下模式需要 PyTorch ──
+    from gnn_code import train, test_baseline, test_gnn_from_run
+
+    # ── baseline 测试（torch 版）──
     if args.mode in ("test_baseline", "all"):
         test_baseline(
             n_steps=args.n_steps,
