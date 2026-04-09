@@ -114,17 +114,40 @@ print(f"\n应用滤波器 T_{m}(H_scaled) 到 {n_states} 个随机态...")
 print(f"  E_lower={E_lower}, E_upper={E_upper}")
 print(f"  每个态需要 {m} 次 H-apply，共 {n_states * m} 次")
 
+d = (2 * L) / N   # grid spacing
+
+def ritz_energy(psi):
+    """Compute Ritz energy <psi|H|psi>/<psi|psi> on the real-space grid."""
+    H_psi  = apply_H(psi, V, T_k)
+    norm2  = np.sum(psi**2)   * d**3
+    expval = np.sum(psi*H_psi) * d**3
+    return expval / norm2 if norm2 > 0 else float('nan')
+
 t0 = time.perf_counter()
-filtered = []
+filtered     = []
+ritz_before  = []   # Ritz energy of random psi0 before filtering
+ritz_after   = []   # Ritz energy after applying T_m(H)
+norms_after  = []   # L2 norm of filtered state
 for i in range(n_states):
     psi0 = random_sine_psi(X, Y, Z, rng=rng).real
+    ritz_before.append(ritz_energy(psi0))
     psi_f = apply_chebyshev_explosion(psi0, V, T_k, m, E_lower, E_upper)
     filtered.append(psi_f)
+    ritz_after.append(ritz_energy(psi_f))
+    norms_after.append(np.sqrt(np.sum(psi_f**2) * d**3))
     if (i + 1) % 10 == 0:
         print(f"  {i+1}/{n_states}  {time.perf_counter()-t0:.1f}s")
 
 t_filter = time.perf_counter() - t0
 print(f"滤波完成，耗时 {t_filter:.2f}s")
+
+# ── 每个态滤波前后的 Ritz 能量 ──
+print(f"\n{'─'*65}")
+print(f"  {'#':>3}  {'E_before':>10}  {'E_after':>10}  {'norm_after':>12}")
+print(f"{'─'*65}")
+for i in range(n_states):
+    print(f"  {i:>3}  {ritz_before[i]:>10.4f}  {ritz_after[i]:>10.4f}  {norms_after[i]:>12.3e}")
+print(f"{'─'*65}")
 
 # ──────────────────────────────────────────────
 # SVD + Rayleigh-Ritz
@@ -140,6 +163,12 @@ energies, Ur, rank = svd_rayleigh_ritz(
 )
 t_ritz = time.perf_counter() - t1
 print(f"  Rayleigh-Ritz 完成，秩 r={rank}，耗时 {t_ritz:.2f}s")
+
+# ── 全部 Ritz 值 ──
+print(f"\n全部 Ritz 能量（共 {len(energies)} 个，秩 r={rank}）：")
+for i, E in enumerate(energies):
+    marker = " ← target" if E < E_lower else ""
+    print(f"  {i:>3}  {E:>12.6f}{marker}")
 
 # ──────────────────────────────────────────────
 # 结果对比
