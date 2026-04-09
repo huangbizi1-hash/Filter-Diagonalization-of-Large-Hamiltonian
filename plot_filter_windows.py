@@ -42,7 +42,8 @@ E_arr = np.linspace(E_min_plot, args.E_upper, args.n_pts)
 colors = plt.cm.tab10(np.linspace(0, 0.9, len(args.E_lower)))
 
 # ── 计算每条曲线 ──
-curves = {}   # E_lower_val -> Tm_vals array
+curves = {}        # E_lower_val -> Tm_vals array
+expressions = {}   # E_lower_val -> expression info
 for E_lo in args.E_lower:
     a    = 2.0 / (args.E_upper - E_lo)
     b    = -(args.E_upper + E_lo) / (args.E_upper - E_lo)
@@ -50,6 +51,12 @@ for E_lo in args.E_lower:
     coef[args.m] = 1.0
     Tm   = _Cheb(coef)(a * E_arr + b)
     curves[E_lo] = np.abs(Tm)
+    expressions[E_lo] = {
+        "a": float(a),
+        "b": float(b),
+        "affine_x_of_E": f"x(E) = {a:.16g} * E + {b:.16g}",
+        "filter_expression": f"|T_{args.m}({a:.16g} * E + {b:.16g})|",
+    }
 
 # ── 画图 ──
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -102,3 +109,34 @@ print(f"  E_arr shape: {len(E_arr)} points in [{E_arr[0]:.3f}, {E_arr[-1]:.3f}]"
 for E_lo in args.E_lower:
     peak = curves[E_lo].max()
     print(f"  E_lower={E_lo:5.2f}: peak |T_m| = {peak:.3e}")
+
+# ── 输出并存储每条线的数学表达式 ──
+expr_lines = []
+for E_lo in args.E_lower:
+    expr = expressions[E_lo]["filter_expression"]
+    line = f"E_lower={E_lo:5.2f}: {expr}"
+    expr_lines.append(line)
+    print(line)
+
+expr_txt_path = out_dir / "filter_window_expressions.txt"
+with open(expr_txt_path, "w", encoding="utf-8") as f:
+    f.write("Chebyshev filter expressions\n")
+    f.write(f"m={args.m}, E_upper={args.E_upper}\n")
+    f.write("\n".join(expr_lines))
+    f.write("\n")
+print(f"Expressions saved → {expr_txt_path}")
+
+expr_json_path = out_dir / "filter_window_expressions.json"
+with open(expr_json_path, "w", encoding="utf-8") as f:
+    json.dump(
+        {
+            "m": args.m,
+            "E_upper": args.E_upper,
+            "expressions": {
+                str(E_lo): expressions[E_lo] for E_lo in args.E_lower
+            },
+        },
+        f,
+        indent=2,
+    )
+print(f"Expressions saved → {expr_json_path}")
