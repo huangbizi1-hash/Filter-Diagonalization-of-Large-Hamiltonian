@@ -42,7 +42,7 @@ from fft_code.params      import PhysParams
 L        = 5       # 盒子半长（box 长 = 2L = 10 Bohr）
 N        = 20      # 每轴网格点数
 E_lower  = 4.0    # 放大/抑制分界（我们想要 E < E_lower 的态）
-E_upper  = 30.0   # 抑制上界（覆盖全谱高端）
+E_upper  = 70.0   # 抑制上界（覆盖全谱高端）
 m        = 40      # 切比雪夫多项式阶数（越大滤波越锐利，每个态 m 次 H-apply）
 n_states = 60      # 随机初态数量（越多子空间越完整）
 svd_tol  = 1e-3    # Rayleigh-Ritz SVD 截断阈值
