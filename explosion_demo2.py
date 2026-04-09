@@ -36,7 +36,7 @@ import matplotlib.pyplot as plt
 from numpy.polynomial.chebyshev import Chebyshev as _Cheb
 
 from fft_code.grid        import build_grid_box, build_k_diagonal
-from fft_code.hamiltonian  import apply_chebyshev_explosion
+from fft_code.hamiltonian  import apply_H, apply_chebyshev_explosion
 from fft_code.wavefunction import random_sine_psi
 from fft_code.rayleigh_ritz import svd_rayleigh_ritz
 
@@ -45,7 +45,7 @@ from fft_code.rayleigh_ritz import svd_rayleigh_ritz
 # ──────────────────────────────────────────────
 L        = 5
 N        = 20
-E_upper  = 30.0
+E_upper  = 70.0
 
 E_lower1 = 4.0    # 第一级滤波下界
 E_lower2 = 6.0    # 第二级滤波下界
@@ -92,6 +92,13 @@ print(f"\n构建网格：N={N}, L={L}...")
 x, y, z, X, Y, Z, x_grid = build_grid_box(N, L=2*L)
 V = 0.5 * (X**2 + Y**2 + Z**2)
 T_k = build_k_diagonal(x_grid)
+d = (2 * L) / N
+
+def ritz_energy(psi):
+    H_psi  = apply_H(psi, V, T_k)
+    norm2  = np.sum(psi**2)    * d**3
+    expval = np.sum(psi * H_psi) * d**3
+    return expval / norm2 if norm2 > 0 else float('nan')
 
 # ──────────────────────────────────────────────
 # 绘制联合放大因子
@@ -161,29 +168,60 @@ print(f"\n联合放大因子图已保存：{path_cf}")
 # ──────────────────────────────────────────────
 print(f"\n第一级滤波 T_{m1}(H_s1)，E_lower={E_lower1}，共 {n_states} 个态...")
 t0 = time.perf_counter()
-set1 = []
+set1        = []
+ritz1_after = []
+norms1      = []
 for i in range(n_states):
-    psi0 = random_sine_psi(X, Y, Z, rng=rng).real
+    psi0  = random_sine_psi(X, Y, Z, rng=rng).real
     psi_f = apply_chebyshev_explosion(psi0, V, T_k, m1, E_lower1, E_upper)
-    set1.append(psi_f)
+    # 归一化，保证第二级滤波数值稳定
+    nrm = np.sqrt(np.sum(psi_f**2) * d**3)
+    norms1.append(nrm)
+    psi_f_norm = psi_f / nrm if nrm > 1e-30 else psi_f
+    set1.append(psi_f_norm)
+    ritz1_after.append(ritz_energy(psi_f_norm))
     if (i + 1) % 30 == 0:
         print(f"  {i+1}/{n_states}  {time.perf_counter()-t0:.1f}s")
 t1_done = time.perf_counter() - t0
 print(f"  第一级完成，耗时 {t1_done:.2f}s")
 
+print(f"\n{'─'*65}")
+print(f"  第一级滤波后 Ritz 能量（归一化后）")
+print(f"  {'#':>3}  {'E_after1':>10}  {'norm_before_norm':>18}")
+print(f"{'─'*65}")
+for i in range(n_states):
+    marker = " ← target" if ritz1_after[i] < E_lower1 else ""
+    print(f"  {i:>3}  {ritz1_after[i]:>10.4f}  {norms1[i]:>18.3e}{marker}")
+print(f"{'─'*65}")
+
 # ──────────────────────────────────────────────
 # 第二级滤波（作用在 set1 上）
 # ──────────────────────────────────────────────
-print(f"\n第二级滤波 T_{m2}(H_s2)，E_lower={E_lower2}，作用在 set1 上...")
+print(f"\n第二级滤波 T_{m2}(H_s2)，E_lower={E_lower2}，作用在归一化 set1 上...")
 t0 = time.perf_counter()
-set2 = []
+set2        = []
+ritz2_after = []
+norms2      = []
 for i, psi_s1 in enumerate(set1):
     psi_s2 = apply_chebyshev_explosion(psi_s1, V, T_k, m2, E_lower2, E_upper)
-    set2.append(psi_s2)
+    nrm = np.sqrt(np.sum(psi_s2**2) * d**3)
+    norms2.append(nrm)
+    set2.append(psi_s2)   # 不归一化，保留幅度信息供 SVD 使用
+    ritz2_after.append(ritz_energy(psi_s2 / nrm) if nrm > 1e-30 else float('nan'))
     if (i + 1) % 30 == 0:
         print(f"  {i+1}/{n_states}  {time.perf_counter()-t0:.1f}s")
 t2_done = time.perf_counter() - t0
 print(f"  第二级完成，耗时 {t2_done:.2f}s")
+
+print(f"\n{'─'*65}")
+print(f"  第二级滤波后 Ritz 能量（T_m2 作用在归一化 set1 上）")
+print(f"  {'#':>3}  {'E_after1':>10}  {'E_after2':>10}  {'norm2':>12}")
+print(f"{'─'*65}")
+for i in range(n_states):
+    m2_marker = " ← in [E1,E2)" if E_lower1 <= ritz2_after[i] < E_lower2 else (
+                " ← <E1"        if ritz2_after[i] < E_lower1 else "")
+    print(f"  {i:>3}  {ritz1_after[i]:>10.4f}  {ritz2_after[i]:>10.4f}  {norms2[i]:>12.3e}{m2_marker}")
+print(f"{'─'*65}")
 
 # ──────────────────────────────────────────────
 # 合并子空间：set1 + set2
@@ -203,6 +241,13 @@ energies, Ur, rank = svd_rayleigh_ritz(
 )
 t_ritz = time.perf_counter() - t0
 print(f"  秩 r={rank}，耗时 {t_ritz:.2f}s")
+
+# ── 全部 Ritz 值 ──
+print(f"\n全部 Ritz 能量（共 {len(energies)} 个）：")
+for i, E in enumerate(energies):
+    marker = (" ← <E1"         if E < E_lower1 else
+              " ← [E1,E2)"     if E < E_lower2 else "")
+    print(f"  {i:>3}  {E:>12.6f}{marker}")
 
 # ──────────────────────────────────────────────
 # 结果对比
