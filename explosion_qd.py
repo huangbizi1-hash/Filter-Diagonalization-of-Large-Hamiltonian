@@ -32,6 +32,7 @@ explosion_qd.py
 """
 
 import argparse
+import json
 import time
 from pathlib import Path
 
@@ -378,3 +379,37 @@ fig.tight_layout()
 fig.savefig(out_dir / "ritz_energies.png", dpi=150)
 plt.close(fig)
 print(f"Ritz energy plot → {out_dir}/ritz_energies.png")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 保存结果到 JSON
+# ──────────────────────────────────────────────────────────────────────────────
+counts = {str(args.E_lower[k]): int(np.sum(energies < args.E_lower[k]))
+          for k in range(args.n_stages)}
+results_dict = {
+    "params": {
+        "cube_file":   args.cube_file,
+        "N":           N,
+        "n_stages":    args.n_stages,
+        "E_lower":     args.E_lower,
+        "E_upper":     args.E_upper,
+        "m":           args.m,
+        "n_states":    args.n_states,
+        "k_max":       args.k_max,
+        "svd_tol":     args.svd_tol,
+        "ritz_filter": args.ritz_filter,
+        "seed":        args.seed,
+    },
+    "rank":           int(rank),
+    "n_ritz":         len(energies),
+    "ritz_energies":  [float(e) for e in energies],
+    "counts_below":   counts,        # {"E_lower": n_ritz_below}
+    "timing": {
+        "filter_s":   round(t_total_filt, 3),
+        "ritz_s":     round(t_ritz, 3),
+        "total_s":    round(t_total_filt + t_ritz, 3),
+    },
+}
+json_path = out_dir / "results.json"
+with open(json_path, "w") as f:
+    json.dump(results_dict, f, indent=2)
+print(f"Results JSON  → {json_path}")
