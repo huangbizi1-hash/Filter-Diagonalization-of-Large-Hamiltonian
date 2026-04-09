@@ -13,6 +13,10 @@
 #   bash sweep_explosion.sh            # 顺序运行
 #   bash sweep_explosion.sh --dry-run  # 仅打印命令，不执行
 
+# ── 环境 ──
+module load conda
+conda activate primme_env
+
 set -euo pipefail
 
 COMMON="--m 20 --k_max 2.0 --E_upper 33.0 --N 64 --svd_tol 1e-3"
