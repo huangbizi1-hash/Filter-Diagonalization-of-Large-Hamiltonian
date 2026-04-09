@@ -128,7 +128,7 @@ def test_baseline(
 
     fft_e = np.array(fft_energies_list)   # (n_test, n_steps+1)
     fd_e  = np.array(fd_energies_list)
-    rel_err = np.abs(fd_e - fft_e) / (np.abs(fft_e) + 1e-10)
+    abs_err = np.abs(fd_e - fft_e)
     steps   = np.arange(n_steps + 1)
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
@@ -145,16 +145,16 @@ def test_baseline(
     ax.set_title("Baseline: Energy vs H applications")
 
     ax = axes[1]
-    mean_err = rel_err.mean(axis=0)
-    std_err  = rel_err.std(axis=0)
-    ax.semilogy(steps, mean_err, 'b-o', lw=1.5, label='mean relative error')
+    mean_err = abs_err.mean(axis=0)
+    std_err  = abs_err.std(axis=0)
+    ax.semilogy(steps, mean_err, 'b-o', lw=1.5, label='mean |ΔE|')
     ax.fill_between(steps,
                     np.maximum(mean_err - std_err, 1e-12),
                     mean_err + std_err, alpha=0.2)
     ax.set_xlabel("n (H applications)")
-    ax.set_ylabel("Relative Energy Error")
+    ax.set_ylabel("Absolute Energy Error |ΔE|")
     ax.legend(); ax.grid(True, which='both', ls='--', alpha=0.5)
-    ax.set_title("Baseline: Relative Error vs n")
+    ax.set_title("Baseline: Absolute Error vs n")
 
     plt.tight_layout()
     out_dir = os.path.join(output_root, "gnn_models")
@@ -224,8 +224,7 @@ def test_gnn_from_run(
         _gnn_energy_series(ps, fd_ham, n_steps, device)
         for ps in test_sparse_list
     ])
-    fd_rel = np.abs(fd_e_all - fft_e_all) / (np.abs(fft_e_all) + 1e-10)
-    fd_mean_err = fd_rel.mean(axis=0)
+    fd_mean_err = np.abs(fd_e_all - fft_e_all).mean(axis=0)
 
     steps = np.arange(n_steps + 1)
 
@@ -246,39 +245,39 @@ def test_gnn_from_run(
             _gnn_energy_series(ps, apply_H, n_steps, device)
             for ps in test_sparse_list
         ])
-        rel_err  = np.abs(gnn_e_all - fft_e_all) / (np.abs(fft_e_all) + 1e-10)
-        mean_err = rel_err.mean(axis=0)
+        mean_err = np.abs(gnn_e_all - fft_e_all).mean(axis=0)
 
-        results.append({'epoch': epoch_num, 'mean_rel_err': mean_err})
-        print(f"  epoch {epoch_num:5d} | err n=0: {mean_err[0]:.3e}"
+        results.append({'epoch': epoch_num, 'mean_abs_err': mean_err})
+        print(f"  epoch {epoch_num:5d} | |ΔE| n=0: {mean_err[0]:.3e}"
               f" | n={n_steps}: {mean_err[-1]:.3e}")
 
     # ── 画图 ──
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
-    # 左图：误差 vs n
+    # 左图：|ΔE| vs n
     ax    = axes[0]
     cmap  = plt.cm.viridis
     cols  = cmap(np.linspace(0, 1, len(results)))
     for r, c in zip(results, cols):
-        ax.semilogy(steps, r['mean_rel_err'], '-o', ms=4, lw=1.5,
+        ax.semilogy(steps, r['mean_abs_err'], '-o', ms=4, lw=1.5,
                     color=c, label=f"ep {r['epoch']}")
     ax.semilogy(steps, fd_mean_err, 'r--^', ms=5, lw=2, label='FD baseline')
     ax.set_xlabel("n (H applications)")
-    ax.set_ylabel("Mean Relative Energy Error")
-    ax.set_title("GNN Error vs H Applications")
+    ax.set_ylabel("Mean Absolute Energy Error |ΔE|")
+    ax.set_title("GNN |ΔE| vs H Applications")
     ax.legend(fontsize=7, ncol=2)
     ax.grid(True, which='both', ls='--', alpha=0.4)
 
-    # 右图：误差 vs epoch
-    ax     = axes[1]
-    epochs = [r['epoch'] for r in results]
-    for step_n in [1, max(1, n_steps // 2), n_steps]:
-        ax.semilogy(epochs, [r['mean_rel_err'][step_n] for r in results],
-                    '-o', ms=4, lw=1.5, label=f"n={step_n}")
+    # 右图：|ΔE| vs epoch（去重，避免 n_steps 小时出现重复线）
+    ax       = axes[1]
+    ep_list  = [r['epoch'] for r in results]
+    step_ns  = sorted({1, max(1, n_steps // 2), n_steps})   # deduplicated
+    for sn in step_ns:
+        ax.semilogy(ep_list, [r['mean_abs_err'][sn] for r in results],
+                    '-o', ms=4, lw=1.5, label=f"n={sn}")
     ax.set_xlabel("Training Epoch")
-    ax.set_ylabel("Mean Relative Energy Error")
-    ax.set_title("Error vs Training Epoch")
+    ax.set_ylabel("Mean Absolute Energy Error |ΔE|")
+    ax.set_title("|ΔE| vs Training Epoch")
     ax.legend(); ax.grid(True, which='both', ls='--', alpha=0.4)
 
     plt.tight_layout()
@@ -294,13 +293,12 @@ def test_gnn_from_run(
         "n_test":       n_test,
         "wf_type":      wf_type,
         "steps":        steps.tolist(),
-        "fft_mean_err": (np.abs(fft_e_all - fft_e_all) / (np.abs(fft_e_all) + 1e-10)
-                         ).mean(axis=0).tolist(),   # always zero, kept for schema
+        "fft_mean_err": [0.0] * (n_steps + 1),   # FFT is ground truth, error = 0
         "fd_mean_err":  fd_mean_err.tolist(),
         "checkpoints":  [
             {"epoch": r["epoch"],
-             "mean_rel_err": [x if np.isfinite(x) else None
-                              for x in r["mean_rel_err"].tolist()]}
+             "mean_abs_err": [x if np.isfinite(x) else None
+                              for x in r["mean_abs_err"].tolist()]}
             for r in results
         ],
     }
