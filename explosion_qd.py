@@ -5,10 +5,17 @@ explosion_qd.py
 算法
 ----
 第 k 阶（k = 0, …, n_stages-1）：
-  输入集合 = 初始随机正弦态（k=0）或上一阶归一化输出（k>0）
+  输入集合 = 初始随机正弦态（k=0）或上一阶归一化/Ritz输出（k>0）
   → T_m(H_scaled) 作用，H_scaled 将 [E_lower[k], E_upper] 映射到 [-1, 1]
   → E < E_lower[k] 的分量被放大，其余被抑制
 每阶输出均并入最终子空间 → SVD + Rayleigh-Ritz 提取 Ritz 能量。
+
+--ritz_filter 模式（可选）
+--------------------------
+每阶滤波后先做一次 SVD+Ritz：
+  - 保留 E < E_lower[k+1] 的 Ritz 向量
+  - 以这些 Ritz 向量（而非简单的滤波归一化态）作为下一阶的输入
+  - 同时将 Ritz 向量也并入最终子空间
 
 默认参数
 --------
@@ -18,9 +25,10 @@ explosion_qd.py
 用法
 ----
   python explosion_qd.py
-  python explosion_qd.py --n_stages 3 --E_lower -0.5 -0.4 -0.3
+  python explosion_qd.py --ritz_filter
+  python explosion_qd.py --n_stages 3 --E_lower -0.5 -0.4 -0.3 --ritz_filter
   python explosion_qd.py --n_states 128 --m 60 --k_max 2.0
-  python explosion_qd.py --E_upper 80.0 --svd_tol 5e-4
+  python explosion_qd.py --E_upper 33.0 --svd_tol 5e-4
 """
 
 import argparse
@@ -32,8 +40,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from numpy.polynomial.chebyshev import Chebyshev as _Cheb
+from scipy.linalg import eigh
 
-from fft_code.grid         import build_k_diagonal
+from fft_code.grid         import build_k_diagonal, grid_to_vec, vec_to_grid
 from fft_code.hamiltonian  import apply_H, apply_chebyshev_explosion
 from fft_code.rayleigh_ritz import svd_rayleigh_ritz
 from gaussian_potential_builder import GaussianPotentialBuilder
@@ -63,6 +72,9 @@ parser.add_argument("--k_max",       type=float, default=3.0,
                     help="Wavevector cutoff for random sine states (Bohr^-1)")
 parser.add_argument("--svd_tol",     type=float, default=1e-3,
                     help="SVD truncation threshold")
+parser.add_argument("--ritz_filter", action="store_true",
+                    help="After each intermediate stage: SVD+Ritz, keep only Ritz vectors "
+                         "with E < E_lower[next], use them as input to next stage")
 parser.add_argument("--seed",        type=int,   default=42)
 parser.add_argument("--out_dir",     type=str,   default="figs_explosion_qd")
 args = parser.parse_args()
@@ -114,6 +126,44 @@ def rand_sine(k_max):
     b = rng.uniform(0, 2 * np.pi)
     psi = np.sin(kx * X + ky * Y + kz * Z + b)
     return normalize(psi)
+
+def intermediate_svd_ritz(states, svd_tol, label=""):
+    """
+    SVD + Rayleigh-Ritz on a list of (N,N,N) states.
+    Returns (energies, ritz_vecs) where ritz_vecs is a list of (N,N,N) real arrays,
+    one per Ritz vector, sorted by energy.
+    """
+    mat  = np.stack(states, axis=0)              # (n, N, N, N)
+    C_f  = grid_to_vec(mat)                      # (N^3, n)
+    nrms = np.linalg.norm(C_f, axis=0)
+    C_f  = C_f[:, nrms > 0] / nrms[nrms > 0]   # normalise, drop zeros
+    C_f  = C_f[:, ~np.any(np.isinf(C_f), axis=0)]
+
+    Q, R = np.linalg.qr(C_f, mode='reduced')
+    U1, sigma, _ = np.linalg.svd(R, full_matrices=False)
+    U  = Q @ U1
+    r  = int(np.sum(sigma > svd_tol))
+    if r == 0:
+        print(f"  {label} WARNING: rank=0 after SVD, lowering tol to 1e-8")
+        r = int(np.sum(sigma > 1e-8))
+    Ur = U[:, :r]                                # (N^3, r)
+
+    # Build projected Hamiltonian
+    Ur_grid  = vec_to_grid(Ur, N, N, N)          # (r, N, N, N)
+    HUr_grid = np.stack([apply_H(Ur_grid[i], V, T_k) for i in range(r)])
+    H_tilde  = Ur.T.conj() @ grid_to_vec(HUr_grid)   # (r, r)
+
+    energies, evecs = eigh(H_tilde)              # evecs: (r, r) columns
+    energies = energies.real
+
+    # Ritz vectors in original space: Ur @ evecs  → (N^3, r)
+    ritz_flat = (Ur @ evecs).real
+    ritz_grid = vec_to_grid(ritz_flat, N, N, N)  # (r, N, N, N)
+
+    ritz_vecs = [normalize(ritz_grid[i].real) for i in range(r)]
+    print(f"  {label}SVD rank={r}, "
+          f"E range [{energies[0]:.4f}, {energies[-1]:.4f}]")
+    return energies, ritz_vecs
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 绘制各阶滤波窗形状
@@ -212,17 +262,50 @@ for k in range(args.n_stages):
 
     sets.append(stage_out)
 
-    # Normalize for next stage input (last stage doesn't need this)
+    # ── prepare input for next stage ──
     if k < args.n_stages - 1:
-        current_set = [psi_f / np.sqrt(np.sum(psi_f**2) * d**3)
-                       if np.sqrt(np.sum(psi_f**2) * d**3) > 1e-30 else psi_f
-                       for psi_f in stage_out]
+        threshold_next = args.E_lower[k + 1]
+
+        if args.ritz_filter:
+            # Intermediate SVD+Ritz: extract and filter Ritz vectors
+            print(f"\n   [ritz_filter] Intermediate SVD+Ritz after stage {k}...")
+            e_int, rv_int = intermediate_svd_ritz(
+                stage_out, args.svd_tol, label=f"stage {k} → ")
+
+            # Print all intermediate Ritz values with keep/discard label
+            print(f"   {'#':>3}  {'E_ritz':>10}  decision")
+            print(f"   {'─'*32}")
+            for i, E in enumerate(e_int):
+                decision = f"keep  (< {threshold_next})" if E < threshold_next else "discard"
+                print(f"   {i:>3}  {E:>10.4f}  {decision}")
+            print(f"   {'─'*32}")
+
+            kept = [(e_int[i], rv_int[i]) for i in range(len(e_int))
+                    if e_int[i] < threshold_next]
+            if not kept:
+                print(f"   WARNING: no Ritz vectors below {threshold_next}, "
+                      f"keeping all {len(e_int)}")
+                kept = list(zip(e_int, rv_int))
+            print(f"   Kept {len(kept)}/{len(e_int)} Ritz vectors "
+                  f"with E < {threshold_next}")
+
+            # Also add the kept Ritz vectors to the final combined set
+            sets.append([psi for _, psi in kept])
+
+            current_set = [psi for _, psi in kept]
+
+        else:
+            # Original behaviour: normalize filtered states
+            current_set = [psi_f / np.sqrt(np.sum(psi_f**2) * d**3)
+                           if np.sqrt(np.sum(psi_f**2) * d**3) > 1e-30 else psi_f
+                           for psi_f in stage_out]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 合并所有阶段 → SVD + Rayleigh-Ritz
 # ──────────────────────────────────────────────────────────────────────────────
-all_states = [psi for stage in sets for psi in stage]  # n_stages * n_states total
-print(f"\nCombining {len(all_states)} vectors ({args.n_stages} stages × {args.n_states} states)")
+all_states = [psi for stage in sets for psi in stage]
+sizes = [len(s) for s in sets]
+print(f"\nCombining {len(all_states)} vectors from {len(sets)} sets: {sizes}")
 print(f"SVD + Rayleigh-Ritz (svd_tol={args.svd_tol})...")
 
 filtered_matrix = np.stack(all_states, axis=0)   # (n_stages*n_states, N, N, N)
