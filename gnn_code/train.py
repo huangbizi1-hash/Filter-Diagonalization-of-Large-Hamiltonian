@@ -41,6 +41,7 @@ def train(
     chain_len:       int   = 1,
     kinetic_cutoff:  float = 30.0,
     output_root:     str   = ".",
+    device:          str   = "auto",   # "auto" | "cpu" | "cuda"
 ):
     """
     训练 HamiltonianGNN，返回 (model, run_dir, loss_history)。
@@ -77,11 +78,27 @@ def train(
     V_tensor = torch.tensor(
         V_sparse.flatten(), dtype=torch.float32).unsqueeze(-1)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device == "auto":
+        _dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    else:
+        _dev = torch.device(device)
+    # Try the requested device; if CUDA OOM at graph loading, fall back to CPU
+    try:
+        edge_index = edge_index.to(_dev)
+        edge_attr  = edge_attr.to(_dev)
+        V_tensor   = V_tensor.to(_dev)
+        device     = _dev
+    except RuntimeError as e:
+        if 'out of memory' in str(e).lower() and _dev.type == 'cuda':
+            print(f"WARNING: CUDA OOM when loading graph ({e}). Falling back to CPU.")
+            torch.cuda.empty_cache()
+            device     = torch.device('cpu')
+            edge_index = edge_index.to(device)
+            edge_attr  = edge_attr.to(device)
+            V_tensor   = V_tensor.to(device)
+        else:
+            raise
     print(f"Device: {device}")
-    edge_index = edge_index.to(device)
-    edge_attr  = edge_attr.to(device)
-    V_tensor   = V_tensor.to(device)
 
     # ── 模型与优化器 ──
     model     = HamiltonianGNN(hidden_dim=hidden_dim).to(device)

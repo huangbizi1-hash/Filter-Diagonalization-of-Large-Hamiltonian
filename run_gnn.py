@@ -70,6 +70,10 @@ def main():
                              "(1 = original single-step; >1 = chain training)")
     parser.add_argument("--kinetic_cutoff",  type=float, default=30.0,
                         help="Kinetic energy cap T(k)<=cutoff in FFT operator (Ha)")
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cpu", "cuda"],
+                        help="Device for training: auto=use CUDA if available, "
+                             "cpu=force CPU, cuda=force CUDA (fails if unavailable)")
 
     # 测试参数
     parser.add_argument("--omega", type=float, default=1.0,
@@ -138,6 +142,7 @@ def main():
             chain_len=args.chain_len,
             kinetic_cutoff=args.kinetic_cutoff,
             output_root=OUTPUT_ROOT,
+            device=args.device,
         )
 
     # ── HO + GNN 测试（能量 + 相似度序列）──
