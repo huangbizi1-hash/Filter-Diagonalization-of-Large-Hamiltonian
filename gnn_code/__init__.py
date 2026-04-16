@@ -30,6 +30,7 @@ from .data import (
     gen_sine_wavefunction,
     generate_wavefunction_and_target,
 )
+from .dataset import generate_k_grid_dataset, WavefunctionDataset, try_load_dataset
 
 # torch 依赖模块：仅在 torch 可用时导入
 try:

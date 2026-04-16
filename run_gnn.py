@@ -43,18 +43,27 @@ def main():
     )
     parser.add_argument("--mode", default="all",
                         choices=["train", "test_baseline", "test_gnn",
-                                 "test_fd", "test_ho", "test_gnn_ho", "all"],
+                                 "test_fd", "test_ho", "test_gnn_ho",
+                                 "gen_dataset", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
                              "test_ho: HO ground state correctness test (no PyTorch); "
                              "test_gnn_ho: HO ground state test with GNN comparison "
-                             "(energy + wavefunction similarity vs n)")
+                             "(energy + wavefunction similarity vs n); "
+                             "gen_dataset: generate fixed k-grid sine-wave dataset")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
                         choices=["gaussian", "sine"],
-                        help="训练/测试波函数类型")
+                        help="训练/测试波函数类型（on-the-fly 模式）")
     parser.add_argument("--k_max", type=int, default=2,
-                        help="正弦波最大波数（仅 wf_type=sine 时有效）")
+                        help="正弦波最大波数（仅 wf_type=sine 或 gen_dataset 时有效）")
+
+    # 固定数据集
+    parser.add_argument("--dataset_dir", type=str, default=None,
+                        help="预生成数据集目录；训练时指定则从磁盘加载，"
+                             "不指定则按 wf_type 动态生成")
+    parser.add_argument("--n_k", type=int, default=10,
+                        help="gen_dataset 模式：每轴 k 取值点数（共 n_k³ 个态）")
 
     # 训练超参数
     parser.add_argument("--hidden_dim",      type=int,   default=64)
@@ -113,6 +122,19 @@ def main():
         )
         return
 
+    # ── 生成固定数据集（无 PyTorch）──
+    if args.mode == "gen_dataset":
+        from gnn_code.dataset import generate_k_grid_dataset
+        out_dir = args.dataset_dir or os.path.join(OUTPUT_ROOT, "gnn_dataset")
+        generate_k_grid_dataset(
+            k_max=args.k_max,
+            n_k=args.n_k,
+            chain_len=args.chain_len,
+            kinetic_cutoff=args.kinetic_cutoff,
+            out_dir=out_dir,
+        )
+        return
+
     # ── HO ground state correctness test (no PyTorch) ──
     if args.mode == "test_ho":
         from gnn_code.fd_baseline import test_ho_groundstate
@@ -154,6 +176,7 @@ def main():
             kinetic_cutoff=args.kinetic_cutoff,
             output_root=OUTPUT_ROOT,
             device=args.device,
+            dataset_dir=args.dataset_dir,
         )
 
     # ── HO + GNN 测试（能量 + 相似度序列）──

@@ -24,9 +24,10 @@ import matplotlib.pyplot as plt
 from .physics import (
     L, d_fine, d_sparse, N_fine, N_sparse, A_pot, sigma_pot, V_sparse,
 )
-from .data  import generate_wavefunction_and_target, generate_chain, gen_fine_wavefunction
-from .graph import build_graph
-from .model import HamiltonianGNN
+from .data    import generate_wavefunction_and_target, generate_chain, gen_fine_wavefunction
+from .graph   import build_graph
+from .model   import HamiltonianGNN
+from .dataset import try_load_dataset
 
 
 def train(
@@ -44,14 +45,16 @@ def train(
     kinetic_cutoff:  float = 30.0,
     output_root:     str   = ".",
     device:          str   = "auto",   # "auto" | "cpu" | "cuda"
+    dataset_dir:     str   = None,     # pregenerated dataset directory; None = on-the-fly
 ):
     """
     训练 HamiltonianGNN，返回 (model, run_dir, loss_history)。
 
     Parameters
     ----------
-    output_root : str
-        gnn_models/ 将创建在此目录下（默认"."即仓库根目录）。
+    output_root  : gnn_models/ 将创建在此目录下（默认"."即仓库根目录）。
+    dataset_dir  : 预生成数据集目录（由 gen_dataset 模式产生）。
+                   提供时从磁盘/内存加载固定样本，忽略 wf_type/k_max 的随机生成。
     """
     # ── 建立输出目录 ──
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -66,6 +69,7 @@ def train(
         save_every=save_every, lr=lr,
         chain_len=chain_len, chain_mode=chain_mode, chain_bptt=chain_bptt,
         kinetic_cutoff=kinetic_cutoff,
+        dataset_dir=dataset_dir,
         L=L, d_fine=d_fine, d_sparse=d_sparse,
         N_fine=N_fine, N_sparse=N_sparse,
         A_pot=A_pot, sigma_pot=sigma_pot,
@@ -112,12 +116,21 @@ def train(
     step_loss_history = []   # list of lists: [epoch][step]
     epoch_recorded    = []
 
+    # ── 加载数据集（如有）──
+    dataset = None
+    if dataset_dir is not None:
+        dataset = try_load_dataset(dataset_dir)
+        n_ds    = len(dataset)
+        print(f"Using fixed dataset ({n_ds} samples) from {dataset_dir}")
+
     # ── 训练循环 ──
     bptt_tag   = "+bptt" if (chain_mode == 'auto' and chain_bptt) else ""
     chain_info = (f"chain_len={chain_len}, mode={chain_mode}{bptt_tag}, kinetic_cutoff={kinetic_cutoff}"
                   if chain_len > 1 else "single-step")
+    data_src = f"dataset({n_ds})" if dataset is not None else "on-the-fly"
     print(f"Training for {epochs} epochs "
-          f"({batch_per_epoch} steps/epoch, batch_size={batch_size}, {chain_info})...")
+          f"({batch_per_epoch} steps/epoch, batch_size={batch_size}, "
+          f"{chain_info}, data={data_src})...")
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss  = 0.0
@@ -135,14 +148,28 @@ def train(
             step_n   = [0] * chain_len
 
             for _ in range(batch_size):
+                # ── sample one wavefunction (from dataset or on-the-fly) ──
+                if dataset is not None:
+                    pairs_raw = dataset[int(np.random.randint(0, len(dataset)))]
+                    # pairs_raw: list of (psi_tensor, target_tensor), already float32 [N,1]
+                    # truncate/use as many steps as chain_len allows
+                    pairs_raw = pairs_raw[:chain_len]
+                else:
+                    pairs_raw = None   # sentinel: generate below
+
                 if chain_len == 1:
-                    # Single-step: one (psi, H·psi) pair per psi
-                    psi_s, H_target = generate_wavefunction_and_target(
-                        wf_type=wf_type, k_max=k_max)
-                    u_in   = torch.tensor(
-                        psi_s.flatten(),    dtype=torch.float32).unsqueeze(-1).to(device)
-                    target = torch.tensor(
-                        H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
+                    if pairs_raw is not None:
+                        u_in, target = pairs_raw[0]
+                        u_in   = u_in.to(device)
+                        target = target.to(device)
+                    else:
+                        # Single-step: one (psi, H·psi) pair per psi
+                        psi_s, H_target = generate_wavefunction_and_target(
+                            wf_type=wf_type, k_max=k_max)
+                        u_in   = torch.tensor(
+                            psi_s.flatten(),    dtype=torch.float32).unsqueeze(-1).to(device)
+                        target = torch.tensor(
+                            H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
                     pred = model(u_in, edge_index, edge_attr, V_tensor)
                     sl = criterion(pred, target)
                     batch_loss     = batch_loss + sl
@@ -150,11 +177,24 @@ def train(
                     step_n[0]     += 1
                 else:
                     # Chain: chain_len steps per psi_0
-                    psi_0_fine = gen_fine_wavefunction(wf_type, k_max)
-                    pairs = generate_chain(psi_0_fine, chain_len, kinetic_cutoff)
+                    if pairs_raw is None:
+                        psi_0_fine = gen_fine_wavefunction(wf_type, k_max)
+                        pairs_raw_np = generate_chain(psi_0_fine, chain_len, kinetic_cutoff)
+                        # Convert to tensors on-the-fly (lazy, stay as numpy for now)
+                        pairs_iter = pairs_raw_np
+                        use_np = True
+                    else:
+                        pairs_iter = pairs_raw
+                        use_np = False
+
                     psi_chain_loss = torch.zeros(1, device=device)
                     prev_pred = None   # used only in 'auto' mode
-                    for k, (psi_s, H_target) in enumerate(pairs):
+                    for k, step_data in enumerate(pairs_iter):
+                        if use_np:
+                            psi_s, H_target = step_data
+                        else:
+                            psi_s, H_target = step_data   # tensors [N,1]
+
                         if chain_mode == 'auto' and k > 0 and prev_pred is not None:
                             # Autoregressive: feed normalised GNN output as next input.
                             # chain_bptt=False: detach → independent per-step gradients
@@ -164,10 +204,18 @@ def train(
                             u_in = src / nrm
                         else:
                             # Teacher forcing (default): use FFT reference chain input
-                            u_in = torch.tensor(
-                                psi_s.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
-                        target = torch.tensor(
-                            H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
+                            if use_np:
+                                u_in = torch.tensor(
+                                    psi_s.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
+                            else:
+                                u_in = psi_s.to(device)
+
+                        if use_np:
+                            target = torch.tensor(
+                                H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
+                        else:
+                            target = H_target.to(device)
+
                         pred = model(u_in, edge_index, edge_attr, V_tensor)
                         prev_pred = pred
                         sl = criterion(pred, target)
@@ -175,7 +223,7 @@ def train(
                         step_sum[k]    = step_sum[k] + sl.detach()
                         step_n[k]     += 1
                     # Contribute mean-over-steps to batch (same scale as chain_len=1)
-                    batch_loss = batch_loss + psi_chain_loss / len(pairs)
+                    batch_loss = batch_loss + psi_chain_loss / len(pairs_iter)
 
             loss = batch_loss / batch_size   # mean over psi's in batch
             loss.backward()
