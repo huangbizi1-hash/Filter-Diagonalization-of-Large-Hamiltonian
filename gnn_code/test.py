@@ -379,7 +379,7 @@ def test_gnn_ho(
             Hu    = apply_H_fn(u)
             norm2 = torch.sum(u**2).item() * d_sparse**3
             Es.append(torch.sum(u * Hu).item() * d_sparse**3 / norm2)
-            sims.append(abs(torch.sum(u * p0).item() * d_sparse**3))
+            sims.append(abs(torch.sum(u * p0).item()))  # cosine sim; both vector-normalized → =1 at n=0
             nrm = torch.norm(Hu)
             if nrm < 1e-30 or not torch.isfinite(nrm):
                 pad = [float('nan')] * (n_steps + 1 - len(Es))
