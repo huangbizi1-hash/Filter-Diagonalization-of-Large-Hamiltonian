@@ -32,7 +32,10 @@ def build_graph():
     S_mid = np.array([[-4, 16, -4], [16, -72, 16], [-4, 16, -4]])
     S     = np.stack([S_off, S_mid, S_off], axis=0)   # (3, 3, 3)
 
-    kin_pref = -1.0 / (2.0 * d_sparse**2)
+    # The stencil satisfies: ∑_{j≠i} S[offset] * (ψ_j - ψ_i) ≈ 12*d²*∇²ψ
+    # (from Taylor: ∑ S*di² = 24 per axis, giving h²/2*24 = 12h² coefficient)
+    # T = -½∇² requires multiplying by -1/(2 * 12 * d²) = -1/(24d²)
+    kin_pref = -1.0 / (24.0 * d_sparse**2)
 
     edge_index: list = []
     edge_attr:  list = []
