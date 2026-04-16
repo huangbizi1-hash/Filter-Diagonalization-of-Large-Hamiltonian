@@ -36,6 +36,6 @@ try:
     from .graph import build_graph
     from .model import HamiltonianGNN, FiniteDiffHamiltonian
     from .train import train
-    from .test  import test_baseline, test_gnn_from_run
+    from .test  import test_baseline, test_gnn_from_run, test_gnn_ho
 except ImportError:
     pass   # 无 PyTorch 时跳过；test_fd 模式只需 fd_baseline.py

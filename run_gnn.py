@@ -43,9 +43,11 @@ def main():
     )
     parser.add_argument("--mode", default="all",
                         choices=["train", "test_baseline", "test_gnn",
-                                 "test_fd", "test_ho", "all"],
+                                 "test_fd", "test_ho", "test_gnn_ho", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
-                             "test_ho: HO ground state correctness test (no PyTorch)")
+                             "test_ho: HO ground state correctness test (no PyTorch); "
+                             "test_gnn_ho: HO ground state test with GNN comparison "
+                             "(energy + wavefunction similarity vs n)")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
@@ -110,7 +112,7 @@ def main():
         return
 
     # ── 以下模式需要 PyTorch ──
-    from gnn_code import train, test_baseline, test_gnn_from_run
+    from gnn_code import train, test_baseline, test_gnn_from_run, test_gnn_ho
 
     # ── baseline 测试（torch 版）──
     if args.mode in ("test_baseline", "all"):
@@ -137,6 +139,29 @@ def main():
             kinetic_cutoff=args.kinetic_cutoff,
             output_root=OUTPUT_ROOT,
         )
+
+    # ── HO + GNN 测试（能量 + 相似度序列）──
+    if args.mode == "test_gnn_ho":
+        if run_dir is None:
+            gnn_models_dir = os.path.join(OUTPUT_ROOT, "gnn_models")
+            candidates = sorted([
+                d for d in os.listdir(gnn_models_dir)
+                if os.path.isdir(os.path.join(gnn_models_dir, d))
+                and d[0].isdigit()
+            ])
+            if not candidates:
+                raise RuntimeError(
+                    "gnn_models/ 下未找到任何 run 目录。"
+                    "请先训练或用 --run_dir 指定目录。")
+            run_dir = os.path.join(gnn_models_dir, candidates[-1])
+            print(f"Auto-selected run_dir: {run_dir}")
+        test_gnn_ho(
+            run_dir=run_dir,
+            n_steps=args.n_steps,
+            omega=args.omega,
+            kinetic_cutoff=args.kinetic_cutoff,
+        )
+        return
 
     # ── GNN 测试 ──
     if args.mode in ("test_gnn", "all"):

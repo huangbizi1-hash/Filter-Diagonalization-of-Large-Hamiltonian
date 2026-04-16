@@ -307,3 +307,179 @@ def test_gnn_from_run(
     print(f"GNN test data  → {json_path}")
 
     return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# HO ground state test: FFT vs FD vs GNN, energy + similarity sequences
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_gnn_ho(
+    run_dir:        str,
+    n_steps:        int   = 8,
+    omega:          float = 1.0,
+    kinetic_cutoff: float = 30.0,
+):
+    """
+    在谐振子势能上用解析基态 ψ₀ 作为初态，比较：
+      - FFT  (fine grid, d=d_fine,   参考)
+      - FD   (sparse grid, d=d_sparse, 无GNN基准)
+      - GNN  (sparse grid, 从 run_dir 最新 checkpoint 加载)
+
+    输出两张子图，横轴均为 H 作用次数 n：
+      左图：Ritz 能量 E_n 序列（FFT/FD/GNN）
+      右图：波函数与初态 ψ₀ 的相似度 |⟨ψ_n|ψ₀⟩|（越接近1说明算符越精确）
+
+    保存到 run_dir/ho_test.png。
+    """
+    from .physics import (d_fine, d_sparse, N_fine, N_sparse,
+                          X_f, Y_f, Z_f, X_s, Y_s, Z_s, K2_fine)
+
+    E0_exact = 1.5 * omega
+    print(f"\n=== GNN HO Test  omega={omega}  n_steps={n_steps} ===")
+    print(f"  Exact E_0 = {E0_exact:.6f} Ha  (3/2*omega)")
+
+    # ── HO potential on both grids ──
+    V_ho_fine   = 0.5 * omega**2 * (X_f**2 + Y_f**2 + Z_f**2)
+    V_ho_sparse = 0.5 * omega**2 * (X_s**2 + Y_s**2 + Z_s**2)
+
+    # ── Analytic HO ground state, normalized on each grid ──
+    r2_fine   = X_f**2 + Y_f**2 + Z_f**2
+    r2_sparse = X_s**2 + Y_s**2 + Z_s**2
+    psi0_fine   = np.exp(-omega / 2.0 * r2_fine)
+    psi0_sparse = np.exp(-omega / 2.0 * r2_sparse)
+    psi0_fine   /= np.sqrt(np.sum(psi0_fine**2)   * d_fine**3)
+    psi0_sparse /= np.sqrt(np.sum(psi0_sparse**2) * d_sparse**3)
+
+    # ── Helper: FFT HO series — returns (energies, similarities) ──
+    def _series_fft():
+        psi = psi0_fine.copy()
+        T_k = np.minimum(0.5 * K2_fine, kinetic_cutoff)
+        Es, sims = [], []
+        for _ in range(n_steps + 1):
+            Hpsi  = np.fft.ifftn(T_k * np.fft.fftn(psi)).real + V_ho_fine * psi
+            norm2 = np.sum(psi**2) * d_fine**3
+            Es.append(np.sum(psi * Hpsi) * d_fine**3 / norm2)
+            sims.append(abs(np.sum(psi * psi0_fine) * d_fine**3))
+            nrm = np.linalg.norm(Hpsi)
+            if nrm < 1e-30 or not np.isfinite(nrm):
+                pad = [float('nan')] * (n_steps + 1 - len(Es))
+                Es.extend(pad); sims.extend(pad); break
+            psi = Hpsi / nrm
+        return np.array(Es), np.array(sims)
+
+    # ── Helper: torch-based series (FD or GNN with HO V) ──
+    def _series_torch(apply_H_fn):
+        device = torch.device('cpu')
+        u  = torch.tensor(psi0_sparse.flatten(), dtype=torch.float32).unsqueeze(-1)
+        u  = u / (torch.norm(u) + 1e-30)
+        p0 = torch.tensor(psi0_sparse.flatten(), dtype=torch.float32).unsqueeze(-1)
+        p0 = p0 / (torch.norm(p0) + 1e-30)
+        Es, sims = [], []
+        for _ in range(n_steps + 1):
+            Hu    = apply_H_fn(u)
+            norm2 = torch.sum(u**2).item() * d_sparse**3
+            Es.append(torch.sum(u * Hu).item() * d_sparse**3 / norm2)
+            sims.append(abs(torch.sum(u * p0).item() * d_sparse**3))
+            nrm = torch.norm(Hu)
+            if nrm < 1e-30 or not torch.isfinite(nrm):
+                pad = [float('nan')] * (n_steps + 1 - len(Es))
+                Es.extend(pad); sims.extend(pad); break
+            u = Hu / nrm
+        return np.array(Es), np.array(sims)
+
+    # ── Build graph with HO potential ──
+    device = torch.device('cpu')
+    edge_index, edge_attr = build_graph()
+    edge_index = edge_index.to(device)
+    edge_attr  = edge_attr.to(device)
+    V_ho_t = torch.tensor(
+        V_ho_sparse.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
+
+    fd_ham = FiniteDiffHamiltonian(edge_index, edge_attr, V_ho_t, device)
+
+    print("Running FFT series...", flush=True)
+    e_fft, sim_fft = _series_fft()
+    print("Running FD  series...", flush=True)
+    e_fd,  sim_fd  = _series_torch(fd_ham)
+
+    # ── Load GNN (latest checkpoint in run_dir) ──
+    with open(os.path.join(run_dir, "config.json")) as f:
+        config = json.load(f)
+    hidden_dim = config.get('hidden_dim', 64)
+    ckpt_files = sorted(
+        [fn for fn in os.listdir(run_dir)
+         if fn.startswith("epoch_") and fn.endswith(".pt")],
+        key=lambda fn: int(fn[len("epoch_"):-len(".pt")])
+    )
+    if not ckpt_files:
+        raise RuntimeError(f"No checkpoints found in {run_dir}")
+    ckpt_path = os.path.join(run_dir, ckpt_files[-1])
+    ckpt      = torch.load(ckpt_path, map_location=device)
+    epoch_num = ckpt['epoch']
+    model = HamiltonianGNN(hidden_dim=hidden_dim).to(device)
+    model.load_state_dict(ckpt['model_state_dict'])
+    model.eval()
+    print(f"Running GNN  series (epoch={epoch_num})...", flush=True)
+
+    def apply_gnn_ho(u):
+        with torch.no_grad():
+            return model(u, edge_index, edge_attr, V_ho_t)
+
+    e_gnn, sim_gnn = _series_torch(apply_gnn_ho)
+
+    steps = np.arange(n_steps + 1)
+
+    # ── Print table ──
+    print(f"\n  {'n':>3}  {'E_FFT':>10}  {'E_FD':>10}  {'E_GNN':>10}  "
+          f"{'sim_FFT':>9}  {'sim_FD':>9}  {'sim_GNN':>9}")
+    print("  " + "─" * 72)
+    for n in steps:
+        ef  = f"{e_fft[n]:10.5f}"  if np.isfinite(e_fft[n])  else "       nan"
+        efd = f"{e_fd[n]:10.5f}"   if np.isfinite(e_fd[n])   else "       nan"
+        eg  = f"{e_gnn[n]:10.5f}"  if np.isfinite(e_gnn[n])  else "       nan"
+        sf  = f"{sim_fft[n]:9.5f}" if np.isfinite(sim_fft[n]) else "      nan"
+        sfd = f"{sim_fd[n]:9.5f}"  if np.isfinite(sim_fd[n])  else "      nan"
+        sg  = f"{sim_gnn[n]:9.5f}" if np.isfinite(sim_gnn[n]) else "      nan"
+        print(f"  {n:>3}  {ef}  {efd}  {eg}  {sf}  {sfd}  {sg}")
+
+    # ── Plot ──
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    # Left: energy series
+    ax = axes[0]
+    ax.plot(steps, e_fft, 'r-s',  lw=2, ms=6, label=f'FFT (d={d_fine})')
+    ax.plot(steps, e_fd,  'b-o',  lw=2, ms=6, label=f'FD  (d={d_sparse})')
+    ax.plot(steps, e_gnn, 'g-^',  lw=2, ms=6, label=f'GNN (epoch={epoch_num})')
+    ax.axhline(E0_exact, color='k', ls='--', lw=1.4,
+               label=f'Exact E₀ = {E0_exact:.4f} Ha')
+    ax.set_xlabel("n  (H applications)")
+    ax.set_ylabel("Ritz energy  ⟨H⟩ₙ  (Ha)")
+    ax.set_title(f"HO ground state  (ω={omega})\nEnergy vs H applications")
+    ax.legend(fontsize=9); ax.grid(True, ls='--', alpha=0.4)
+
+    # Right: wavefunction similarity |<ψ_n|ψ₀>|
+    ax = axes[1]
+    ax.plot(steps, sim_fft, 'r-s', lw=2, ms=6, label='FFT')
+    ax.plot(steps, sim_fd,  'b-o', lw=2, ms=6, label='FD')
+    ax.plot(steps, sim_gnn, 'g-^', lw=2, ms=6, label=f'GNN (epoch={epoch_num})')
+    ax.axhline(1.0, color='k', ls='--', lw=1.0, label='ideal = 1')
+    ax.set_xlabel("n  (H applications)")
+    ax.set_ylabel("|⟨ψₙ|ψ₀⟩|  (overlap with initial ground state)")
+    ax.set_title("Wavefunction similarity\n(1 = perfect eigenstate preservation)")
+    ax.set_ylim(0, 1.05)
+    ax.legend(fontsize=9); ax.grid(True, ls='--', alpha=0.4)
+
+    fig.tight_layout()
+    save_path = os.path.join(run_dir, "ho_test.png")
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"\nPlot saved → {save_path}")
+
+    return {
+        "omega": omega, "E0_exact": E0_exact,
+        "epoch": epoch_num, "n_steps": n_steps,
+        "steps":   steps.tolist(),
+        "e_fft":   e_fft.tolist(),  "sim_fft":  sim_fft.tolist(),
+        "e_fd":    e_fd.tolist(),   "sim_fd":   sim_fd.tolist(),
+        "e_gnn":   e_gnn.tolist(),  "sim_gnn":  sim_gnn.tolist(),
+    }
