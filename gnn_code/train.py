@@ -39,6 +39,7 @@ def train(
     save_every:      int   = 500,
     lr:              float = 1e-3,
     chain_len:       int   = 1,
+    chain_mode:      str   = 'teacher',  # 'teacher' | 'auto'
     kinetic_cutoff:  float = 30.0,
     output_root:     str   = ".",
     device:          str   = "auto",   # "auto" | "cpu" | "cuda"
@@ -62,7 +63,7 @@ def train(
         hidden_dim=hidden_dim, epochs=epochs,
         batch_per_epoch=batch_per_epoch, batch_size=batch_size,
         save_every=save_every, lr=lr,
-        chain_len=chain_len, kinetic_cutoff=kinetic_cutoff,
+        chain_len=chain_len, chain_mode=chain_mode, kinetic_cutoff=kinetic_cutoff,
         L=L, d_fine=d_fine, d_sparse=d_sparse,
         N_fine=N_fine, N_sparse=N_sparse,
         A_pot=A_pot, sigma_pot=sigma_pot,
@@ -110,7 +111,7 @@ def train(
     epoch_recorded    = []
 
     # ── 训练循环 ──
-    chain_info = (f"chain_len={chain_len}, kinetic_cutoff={kinetic_cutoff}"
+    chain_info = (f"chain_len={chain_len}, mode={chain_mode}, kinetic_cutoff={kinetic_cutoff}"
                   if chain_len > 1 else "single-step")
     print(f"Training for {epochs} epochs "
           f"({batch_per_epoch} steps/epoch, batch_size={batch_size}, {chain_info})...")
@@ -145,16 +146,25 @@ def train(
                     step_sum[0]    = step_sum[0] + sl.detach()
                     step_n[0]     += 1
                 else:
-                    # Chain: chain_len steps per psi_0; each psi_k is L2-normalised
+                    # Chain: chain_len steps per psi_0
                     psi_0_fine = gen_fine_wavefunction(wf_type, k_max)
                     pairs = generate_chain(psi_0_fine, chain_len, kinetic_cutoff)
                     psi_chain_loss = torch.zeros(1, device=device)
+                    prev_pred = None   # used only in 'auto' mode
                     for k, (psi_s, H_target) in enumerate(pairs):
-                        u_in   = torch.tensor(
-                            psi_s.flatten(),    dtype=torch.float32).unsqueeze(-1).to(device)
+                        if chain_mode == 'auto' and k > 0 and prev_pred is not None:
+                            # Autoregressive: feed normalised GNN output as next input.
+                            # Detach so gradients don't flow across steps.
+                            nrm  = torch.norm(prev_pred.detach()) + 1e-30
+                            u_in = prev_pred.detach() / nrm
+                        else:
+                            # Teacher forcing (default): use FFT reference chain input
+                            u_in = torch.tensor(
+                                psi_s.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
                         target = torch.tensor(
                             H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
                         pred = model(u_in, edge_index, edge_attr, V_tensor)
+                        prev_pred = pred
                         sl = criterion(pred, target)
                         psi_chain_loss = psi_chain_loss + sl
                         step_sum[k]    = step_sum[k] + sl.detach()

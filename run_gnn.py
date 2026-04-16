@@ -68,6 +68,11 @@ def main():
     parser.add_argument("--chain_len",       type=int,   default=1,
                         help="H-application chain length per training sample "
                              "(1 = original single-step; >1 = chain training)")
+    parser.add_argument("--chain_mode",     type=str,   default="teacher",
+                        choices=["teacher", "auto"],
+                        help="teacher: each step uses FFT reference input (teacher forcing); "
+                             "auto: each step uses normalised GNN output from previous step "
+                             "(autoregressive, trains model on its own output distribution)")
     parser.add_argument("--kinetic_cutoff",  type=float, default=30.0,
                         help="Kinetic energy cap T(k)<=cutoff in FFT operator (Ha)")
     parser.add_argument("--device", type=str, default="auto",
@@ -140,6 +145,7 @@ def main():
             save_every=args.save_every,
             lr=args.lr,
             chain_len=args.chain_len,
+            chain_mode=args.chain_mode,
             kinetic_cutoff=args.kinetic_cutoff,
             output_root=OUTPUT_ROOT,
             device=args.device,
