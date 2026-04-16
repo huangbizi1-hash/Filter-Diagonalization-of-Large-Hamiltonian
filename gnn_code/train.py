@@ -40,6 +40,7 @@ def train(
     lr:              float = 1e-3,
     chain_len:       int   = 1,
     chain_mode:      str   = 'teacher',  # 'teacher' | 'auto'
+    chain_bptt:      bool  = False,      # True: no detach in auto → full BPTT across steps
     kinetic_cutoff:  float = 30.0,
     output_root:     str   = ".",
     device:          str   = "auto",   # "auto" | "cpu" | "cuda"
@@ -63,7 +64,8 @@ def train(
         hidden_dim=hidden_dim, epochs=epochs,
         batch_per_epoch=batch_per_epoch, batch_size=batch_size,
         save_every=save_every, lr=lr,
-        chain_len=chain_len, chain_mode=chain_mode, kinetic_cutoff=kinetic_cutoff,
+        chain_len=chain_len, chain_mode=chain_mode, chain_bptt=chain_bptt,
+        kinetic_cutoff=kinetic_cutoff,
         L=L, d_fine=d_fine, d_sparse=d_sparse,
         N_fine=N_fine, N_sparse=N_sparse,
         A_pot=A_pot, sigma_pot=sigma_pot,
@@ -111,7 +113,8 @@ def train(
     epoch_recorded    = []
 
     # ── 训练循环 ──
-    chain_info = (f"chain_len={chain_len}, mode={chain_mode}, kinetic_cutoff={kinetic_cutoff}"
+    bptt_tag   = "+bptt" if (chain_mode == 'auto' and chain_bptt) else ""
+    chain_info = (f"chain_len={chain_len}, mode={chain_mode}{bptt_tag}, kinetic_cutoff={kinetic_cutoff}"
                   if chain_len > 1 else "single-step")
     print(f"Training for {epochs} epochs "
           f"({batch_per_epoch} steps/epoch, batch_size={batch_size}, {chain_info})...")
@@ -154,9 +157,11 @@ def train(
                     for k, (psi_s, H_target) in enumerate(pairs):
                         if chain_mode == 'auto' and k > 0 and prev_pred is not None:
                             # Autoregressive: feed normalised GNN output as next input.
-                            # Detach so gradients don't flow across steps.
-                            nrm  = torch.norm(prev_pred.detach()) + 1e-30
-                            u_in = prev_pred.detach() / nrm
+                            # chain_bptt=False: detach → independent per-step gradients
+                            # chain_bptt=True : no detach → full BPTT across chain
+                            src  = prev_pred if chain_bptt else prev_pred.detach()
+                            nrm  = torch.norm(src) + 1e-30
+                            u_in = src / nrm
                         else:
                             # Teacher forcing (default): use FFT reference chain input
                             u_in = torch.tensor(

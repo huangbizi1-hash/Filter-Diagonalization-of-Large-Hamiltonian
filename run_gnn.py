@@ -73,6 +73,10 @@ def main():
                         help="teacher: each step uses FFT reference input (teacher forcing); "
                              "auto: each step uses normalised GNN output from previous step "
                              "(autoregressive, trains model on its own output distribution)")
+    parser.add_argument("--chain_bptt",    action="store_true", default=False,
+                        help="[auto mode only] allow gradients to flow across chain steps "
+                             "(full BPTT); default is detach between steps. "
+                             "Has no effect in teacher mode.")
     parser.add_argument("--kinetic_cutoff",  type=float, default=30.0,
                         help="Kinetic energy cap T(k)<=cutoff in FFT operator (Ha)")
     parser.add_argument("--device", type=str, default="auto",
@@ -146,6 +150,7 @@ def main():
             lr=args.lr,
             chain_len=args.chain_len,
             chain_mode=args.chain_mode,
+            chain_bptt=args.chain_bptt,
             kinetic_cutoff=args.kinetic_cutoff,
             output_root=OUTPUT_ROOT,
             device=args.device,
