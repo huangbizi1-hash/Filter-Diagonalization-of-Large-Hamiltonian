@@ -183,7 +183,8 @@ def train(
         epoch_recorded.append(epoch)
 
         if epoch % 100 == 0:
-            print(f"  Epoch {epoch:5d} | Loss: {avg_loss:.6e}")
+            step_str = "  ".join(f"s{k}:{step_avgs[k]:.3e}" for k in range(chain_len))
+            print(f"  Epoch {epoch:5d} | Loss: {avg_loss:.6e}  [{step_str}]")
 
         # ── 定期保存检查点 ──
         if epoch % save_every == 0 or epoch == epochs:
