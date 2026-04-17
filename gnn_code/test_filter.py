@@ -1,15 +1,23 @@
 """
 test_filter.py — Filter diagonalization on the real QD potential.
 
-Runs the Newton-filter recursion using the FD Hamiltonian (and optionally
-the GNN Hamiltonian) on the real QD potential loaded from localPot.cube /
-gaussian_fit_params.json.
+Runs Newton-filter recursion using:
+  · FD Hamiltonian  — build_3d_fd_operator from ho3d_solvers_v2 (any N)
+  · GNN Hamiltonian — build_gnn_operator (only when N_qd == GNN training N)
 
-Grid spacing is taken from the GNN training config (d_sparse field).
-N is derived as round(box_extent / d_sparse) per axis.
+The QD potential is reconstructed via GaussianPotentialBuilder at the grid
+spacing d_sparse read from the GNN run's config.json.  N_qd is then derived
+as round(box_extent / d_sparse), making the grid consistent with the training.
 
-If the QD grid size differs from the GNN's training grid size, the GNN
-comparison is skipped (GNN must be retrained on the real QD potential first).
+When the GNN was trained on the real QD at the same d_sparse the grids match
+and both FD and GNN are compared.  If they differ (e.g., GNN trained on the
+toy Gaussian), GNN is skipped with a note.
+
+Results are stored as:
+  <out_dir>/filter_test_<TIMESTAMP>.json    — full metadata + energies
+  <out_dir>/filter_test_<TIMESTAMP>.md     — Markdown comparison table
+  <out_dir>/filter_windows.png             — Gaussian filter windows
+  <out_dir>/filter_test.png               — eigenvalue comparison plot
 
 Usage (via run_gnn.py):
     python run_gnn.py --mode test_filter --run_dir gnn_models/XXXXXXXX \\
@@ -17,15 +25,17 @@ Usage (via run_gnn.py):
         --filter_el_list -0.24 -0.22 -0.20 -0.18 \\
         --filter_n_random 64
 
-Physics parameters (real QD)
------------------------------
-  VMIN = -5.0 Ha   (true minimum of the InAs/GaAs QD potential)
-  DE   = 50.0 Ha   (spectral width; same as compare_fd_filter.py)
+Spectral parameters (real QD, fixed)
+-------------------------------------
+  VMIN = -5.0 Ha   (same as compare_fd_filter.py)
+  DE   = 50.0 Ha
 """
 
-import os
 import json
+import os
+import datetime
 import time
+from pathlib import Path
 
 import numpy as np
 import matplotlib; matplotlib.use("Agg")
@@ -35,7 +45,7 @@ from scipy.linalg import eigh
 from .physics  import N_sparse, d_sparse
 from .gnn_operator import build_gnn_operator
 
-# ── fft_code imports (filter coefficients live there) ────────────────────────
+# ── fft_code imports ──────────────────────────────────────────────────────────
 try:
     from fft_code.params       import PhysParams
     from fft_code.filter_coeff import build_filter_coefficients, _filt_func_gaussian
@@ -43,67 +53,72 @@ try:
 except ImportError:
     _HAS_FILTER = False
 
+# ── FD operator builder (works for arbitrary N) ───────────────────────────────
+try:
+    from ho3d_solvers_v2 import build_3d_fd_operator
+    _HAS_HO3D = True
+except ImportError:
+    _HAS_HO3D = False
+
 # ── real QD potential builder ─────────────────────────────────────────────────
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_REPO_ROOT      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DEFAULT_CUBE   = os.path.join(_REPO_ROOT, "localPot.cube")
 _DEFAULT_PARAMS = os.path.join(_REPO_ROOT, "gaussian_fit_params.json")
 
-# Fixed spectral parameters for the real QD (consistent with compare_fd_filter.py)
+# Fixed spectral parameters for the real QD (matches compare_fd_filter.py)
 _QD_VMIN = -5.0   # Ha
 _QD_DE   = 50.0   # Ha
-_QD_RCUT = 7.0    # Å
+_QD_RCUT = 7.0    # Å (cutoff radius for Gaussian reconstruction)
 
 
-def _load_qd_potential(d: float,
-                       cube_file:   str = _DEFAULT_CUBE,
-                       params_file: str = _DEFAULT_PARAMS,
-                       r_cut:       float = _QD_RCUT):
+# ── QD potential loader ───────────────────────────────────────────────────────
+
+def _load_qd_potential(d, cube_file=_DEFAULT_CUBE, params_file=_DEFAULT_PARAMS,
+                       r_cut=_QD_RCUT):
     """
     Load the real QD potential at grid spacing d (Bohr).
 
-    Uses GaussianPotentialBuilder to reconstruct the potential from Gaussian
-    fit parameters, evaluated on a grid with spacing d derived from the cube
-    file's spatial extent.
+    N is derived from the cube file's spatial extent divided by d, so the
+    resulting grid has spacing exactly d (within rounding).
 
     Returns
     -------
-    V_flat : np.ndarray, shape (N³,)   potential values (Ha)
-    N      : int                        grid points per axis
-    x      : np.ndarray, shape (N,)    coordinate array (Å)
+    pot_grid : PotentialGrid  — N×N×N potential ready for build_3d_fd_operator
+    N        : int            — grid points per axis
+    d_actual : float          — actual grid spacing (Bohr), ≈ d
     """
     try:
-        from gaussian_potential_builder import GaussianPotentialBuilder
+        from gaussian_potential_builder import GaussianPotentialBuilder, PotentialGrid
     except ImportError:
         raise ImportError(
-            "gaussian_potential_builder not found.  "
-            "Run from the repo root so it is on sys.path.")
+            "gaussian_potential_builder not found — run from repo root.")
 
     builder = GaussianPotentialBuilder(cube_file=cube_file,
                                        params_file=params_file,
                                        r_cut=r_cut)
 
-    # Derive N from the cube file extent and desired d
-    # The cube spatial extent is in Å; d is in Bohr (1 Bohr ≈ 0.529177 Å)
-    # The cube file uses Bohr internally (origin and vectors are in Bohr)
-    # builder.x is in Bohr already (set from cube header directly)
-    box_extent_bohr = builder.x[-1] - builder.x[0]   # Bohr
-    N = max(2, round(box_extent_bohr / d) + 1)
+    # Cube file positions are in Bohr. Derive N from box extent and d.
+    box_extent = float(builder.x[-1] - builder.x[0])   # Bohr
+    N          = max(2, round(box_extent / d) + 1)
 
-    print(f"  QD grid: box_extent={box_extent_bohr:.3f} Bohr, "
-          f"d={d:.4f} Bohr → N={N} ({N**3:,} points)")
+    x, y, z, V = builder.build_potential(N)
+    d_actual    = float(x[1] - x[0])
 
-    x_arr, y_arr, z_arr, V = builder.build_potential(N)
-    return V.ravel().astype(np.float64), N, x_arr
+    print(f"  QD grid: box={box_extent:.3f} Bohr, d_req={d:.4f} → "
+          f"N={N} ({N**3:,} pts), d_actual={d_actual:.4f} Bohr")
+    print(f"  V_qd:   min={V.min():.4f}  max={V.max():.4f} Ha")
+
+    return PotentialGrid(x, y, z, V, source="QD"), N, d_actual
 
 
-# ── Newton filter + Rayleigh-Ritz ─────────────────────────────────────────────
+# ── Newton filter ─────────────────────────────────────────────────────────────
 
 def _apply_filter_all(H_op, psi_flat, nodes, an, par):
     """
     f_i(H)|ψ⟩ for all ms filter centres, sharing Newton basis vectors.
-    H-apply count = nc.  Returns (ms, n_grid).
+    H is applied nc times total.  Returns (ms, n_grid).
     """
-    ms, nc = an.shape
+    ms, nc   = an.shape
     results  = an[:, 0:1] * psi_flat[None, :]
     psi_prev = psi_flat.copy()
     for j in range(1, nc):
@@ -116,6 +131,8 @@ def _apply_filter_all(H_op, psi_flat, nodes, an, par):
     return results
 
 
+# ── Rayleigh-Ritz ─────────────────────────────────────────────────────────────
+
 def _rayleigh_ritz(basis_mat, H_op, svd_tol=1e-3, max_energies=20):
     """SVD + Rayleigh-Ritz on columns of basis_mat.  Returns (energies, rank)."""
     norms = np.linalg.norm(basis_mat, axis=0)
@@ -124,8 +141,7 @@ def _rayleigh_ritz(basis_mat, H_op, svd_tol=1e-3, max_energies=20):
         print("    WARNING: all filtered vectors are zero — no eigenvalues found")
         return np.array([]), 0
 
-    B = basis_mat[:, mask] / norms[None, mask]
-
+    B            = basis_mat[:, mask] / norms[None, mask]
     Q, R         = np.linalg.qr(B, mode='reduced')
     U1, sigma, _ = np.linalg.svd(R, full_matrices=False)
     r            = max(1, int(np.sum(sigma > svd_tol)))
@@ -143,22 +159,20 @@ def _rayleigh_ritz(basis_mat, H_op, svd_tol=1e-3, max_energies=20):
     return np.sort(evals.real)[:max_energies], r
 
 
-# ── Gaussian window plot ──────────────────────────────────────────────────────
+# ── filter window plot ────────────────────────────────────────────────────────
 
 def _plot_filter_windows(El_list, vmin, d_e, dt, nc_true, out_path):
-    """Plot Gaussian filter windows f(E; El) over the physical energy range."""
+    """Plot Gaussian filter windows over the physical energy range."""
     e_min  = vmin
     e_max  = vmin + d_e
     x_phys = np.linspace(e_min, e_max, 2000)
+    cmap   = plt.cm.viridis
+    colors = [cmap(i / max(len(El_list) - 1, 1)) for i in range(len(El_list))]
 
     fig, ax = plt.subplots(figsize=(9, 4))
-    cmap    = plt.cm.viridis
-    colors  = [cmap(i / max(len(El_list) - 1, 1)) for i in range(len(El_list))]
-
     for el, color in zip(El_list, colors):
         w = np.array([_filt_func_gaussian(e, el, dt) for e in x_phys])
         ax.plot(x_phys, w, color=color, lw=1.5, label=f"El={el:.3f}")
-
     ax.set_xlabel("Energy (Ha)")
     ax.set_ylabel("Filter weight")
     ax.set_title(f"Gaussian filter windows  (nc={nc_true}, dt={dt:.4f})")
@@ -170,7 +184,84 @@ def _plot_filter_windows(El_list, vmin, d_e, dt, nc_true, out_path):
     print(f"  Filter windows → {out_path}")
 
 
-# ── main test function ────────────────────────────────────────────────────────
+# ── result storage ────────────────────────────────────────────────────────────
+
+def _save_results(results_list, config_meta, out_dir, ts):
+    """
+    Save filter results to JSON and Markdown (mirrors compare_fd_filter.py).
+
+    results_list : list of dicts with keys
+                   label, energies, rank, t_filter, t_rr, n_H_filter, n_H_total
+    config_meta  : dict of run metadata
+    out_dir      : Path or str to output directory
+    ts           : timestamp string for file names
+    """
+    out_dir = Path(out_dir)
+
+    # ── JSON ─────────────────────────────────────────────────────────────────
+    def _to_list(arr):
+        if hasattr(arr, 'tolist'):
+            return arr.tolist()
+        return list(arr)
+
+    json_results = []
+    for r in results_list:
+        ev = r["energies"]
+        json_results.append({
+            "label":     r["label"],
+            "E0":        float(ev[0]) if len(ev) > 0 else None,
+            "t_wall":    r["t_filter"] + r["t_rr"],
+            "n_H_total": r["n_H_total"],
+            "rr_rank":   r["rank"],
+            "energies":  _to_list(ev),
+            "success":   len(ev) > 0,
+        })
+
+    output = {
+        "script":   "gnn_code/test_filter.py",
+        "datetime": datetime.datetime.now().isoformat(),
+        "config":   config_meta,
+        "results":  json_results,
+    }
+    json_path = out_dir / f"filter_test_{ts}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
+    print(f"  JSON → {json_path}")
+
+    # ── Markdown table ────────────────────────────────────────────────────────
+    fd_E0 = next(
+        (r["E0"] for r in json_results if r["label"].startswith("FD") and r["E0"] is not None),
+        float("nan"))
+
+    lines = [
+        f"# GNN Filter Test — real QD\n",
+        f"run_dir: `{config_meta.get('run_dir', '?')}`  "
+        f"| datetime: {output['datetime']}\n",
+        f"d_sparse={config_meta.get('d_sparse', '?')} Bohr  "
+        f"| N_qd={config_meta.get('N_qd', '?')}  "
+        f"| nc_true={config_meta.get('nc_true', '?')}  "
+        f"| n_random={config_meta.get('n_random', '?')}  "
+        f"| El_list={config_meta.get('El_list', '?')}\n",
+        "| Method | E[0] (Ha) | ΔE vs FD | T_wall (s) | N_H | RR rank |",
+        "|--------|-----------|----------|------------|-----|---------|",
+    ]
+    for r in json_results:
+        e0 = r["E0"] if r["E0"] is not None else float("nan")
+        de = (e0 - fd_E0) if r["E0"] is not None else float("nan")
+        lines.append(
+            f"| {r['label']:8s} | {e0:12.6f} | {de:+.2e} "
+            f"| {r['t_wall']:10.2f} | {r['n_H_total']:8d} | {r['rr_rank']:7d} |"
+        )
+
+    md_text = "\n".join(lines) + "\n"
+    print("\n" + md_text)
+    md_path = out_dir / f"filter_test_{ts}.md"
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(md_text)
+    print(f"  MD   → {md_path}")
+
+
+# ── main function ─────────────────────────────────────────────────────────────
 
 def test_gnn_filter(
     run_dir:         str,
@@ -187,11 +278,11 @@ def test_gnn_filter(
     """
     Run filter diagonalization on the real QD potential.
 
-    The FD Hamiltonian always uses the real QD potential at d_sparse resolution
-    (d_sparse read from run_dir/config.json).
+    Grid spacing d is read from run_dir/config.json (d_sparse field).
+    N_qd = round(QD_box_extent / d_sparse).
 
-    The GNN Hamiltonian is included only when the GNN was trained on the same
-    grid size as the QD grid; otherwise a warning is printed and GNN is skipped.
+    FD runs on the N_qd grid via build_3d_fd_operator (ho3d_solvers_v2).
+    GNN runs only when N_qd == GNN training N_sparse (grids match).
 
     Parameters
     ----------
@@ -200,56 +291,53 @@ def test_gnn_filter(
     el_list        : list of target energies (Ha)
     n_random       : number of random starting vectors
     n_max_energies : max Ritz values to report
-    svd_tol        : SVD rank truncation threshold in Rayleigh-Ritz
-    output_root    : directory for output plots (default: run_dir)
-    device         : torch device for GNN evaluations
-    cube_file      : path to the QD cube file (default: localPot.cube)
-    params_file    : path to the Gaussian fit params JSON (default: gaussian_fit_params.json)
+    svd_tol        : SVD rank truncation threshold
+    output_root    : output directory for results (default: run_dir)
+    device         : torch device for GNN ('cpu' or 'cuda')
+    cube_file      : path to QD cube file (default: localPot.cube)
+    params_file    : path to Gaussian fit params JSON
     """
     if not _HAS_FILTER:
-        raise ImportError(
-            "fft_code not found.  Run from the repo root so that "
-            "fft_code/ is on sys.path.")
+        raise ImportError("fft_code not found — run from repo root.")
+    if not _HAS_HO3D:
+        raise ImportError("ho3d_solvers_v2 not found — run from repo root.")
 
     if el_list is None:
         el_list = [-0.17]
     El_list = np.array(el_list)
     ms      = len(El_list)
+    ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(run_dir if output_root == "." else output_root)
 
-    # ── load config to get d_sparse ───────────────────────────────────────
+    # ── GNN config ────────────────────────────────────────────────────────────
     with open(os.path.join(run_dir, 'config.json')) as f:
         config = json.load(f)
-    d  = config.get('d_sparse', d_sparse)
-    N_gnn = config.get('N_sparse', N_sparse)   # GNN was trained on this grid
+    d         = float(config.get('d_sparse', d_sparse))
+    N_gnn     = int(config.get('N_sparse',   N_sparse))
+    fd_order  = int(config.get('fd_order',   4))
+    model_type = config.get('model_type', 'gnn')
 
     print(f"\n{'='*60}")
-    print(f"  GNN Filter Test (real QD)   run_dir={run_dir}")
-    print(f"  nc={nc}  El_list={El_list.tolist()}  n_random={n_random}")
-    print(f"  d_sparse={d:.4f} Bohr (from config)")
+    print(f"  GNN Filter Test (real QD)")
+    print(f"  run_dir    = {run_dir}")
+    print(f"  El_list    = {El_list.tolist()}")
+    print(f"  nc={nc}  n_random={n_random}  d_sparse={d:.4f} Bohr")
     print(f"{'='*60}")
 
-    # ── load real QD potential ────────────────────────────────────────────
-    print("  Loading real QD potential...")
-    V_qd, N_qd, _ = _load_qd_potential(d, cube_file=cube_file,
-                                        params_file=params_file)
-    print(f"  V_qd: min={V_qd.min():.4f}  max={V_qd.max():.4f} Ha")
+    # ── QD potential at GNN grid spacing ─────────────────────────────────────
+    print("\n  Loading real QD potential...")
+    pot_grid, N_qd, d_actual = _load_qd_potential(
+        d, cube_file=cube_file, params_file=params_file)
 
-    # ── spectral parameters (fixed for real QD) ───────────────────────────
+    # ── spectral parameters (fixed for real QD) ───────────────────────────────
     vmin = _QD_VMIN
     d_e  = _QD_DE
     dt   = (nc / (d_e * 2.5)) ** 2
     par  = PhysParams(dE=d_e, Vmin=vmin, dt=dt)
-    print(f"  Vmin={vmin:.3f}  dE={d_e:.3f}  dt={dt:.6f}")
+    print(f"  Spectral: Vmin={vmin}  dE={d_e}  dt={dt:.6f}")
 
-    # ── GNN applicability check ───────────────────────────────────────────
-    gnn_applicable = (N_qd == N_gnn)
-    if not gnn_applicable:
-        print(f"  WARNING: QD grid N={N_qd} ≠ GNN training grid N={N_gnn}.")
-        print(f"           GNN comparison skipped — retrain GNN on real QD first.")
-
-    # ── Newton filter coefficients ────────────────────────────────────────
+    # ── Newton filter coefficients ────────────────────────────────────────────
     filter_func = lambda x, el_: _filt_func_gaussian(x, el_, dt)
-
     print("  Building Newton filter coefficients...")
     t0 = time.perf_counter()
     an, samp = build_filter_coefficients(
@@ -264,35 +352,38 @@ def test_gnn_filter(
     nodes   = samp
     print(f"  nc_true={nc_true}  ms={ms}  ({time.perf_counter()-t0:.1f}s)")
 
-    # ── plot filter windows ───────────────────────────────────────────────
-    out_dir = run_dir if output_root == "." else output_root
-    _plot_filter_windows(
-        El_list, vmin, d_e, dt, nc_true,
-        os.path.join(out_dir, "filter_windows.png"),
-    )
+    # ── filter window plot ────────────────────────────────────────────────────
+    _plot_filter_windows(El_list, vmin, d_e, dt, nc_true,
+                         out_dir / "filter_windows.png")
 
-    # ── build operators ───────────────────────────────────────────────────
-    print("  Building FD operator (real QD)...")
-    fd_op = build_gnn_operator(run_dir, use_fd=True, device=device,
-                               V_ext=V_qd, N_grid=N_qd)
+    # ── build operators ───────────────────────────────────────────────────────
+    # FD: uses build_3d_fd_operator so it works for any N_qd
+    print(f"\n  Building FD operator (order={fd_order}, N={N_qd})...")
+    fd_h_op, _, _ = build_3d_fd_operator(N_qd, pot_grid, fd_order=fd_order)
+    fd_h_op.label = f"FD-{fd_order}"
+    operators = [("FD", fd_h_op)]
 
-    operators = [("FD", fd_op)]
-
+    # GNN: only applicable when grid matches training grid
+    gnn_applicable = (N_qd == N_gnn)
     if gnn_applicable:
-        print("  Building GNN operator (real QD)...")
-        gnn_op = build_gnn_operator(run_dir, use_fd=False, device=device,
-                                    V_ext=V_qd, N_grid=N_qd)
-        operators = [("GNN", gnn_op)] + operators
+        print(f"  Building GNN operator (N={N_qd}, model={model_type})...")
+        V_qd_flat = pot_grid.potential.ravel().astype(np.float32)
+        gnn_h_op  = build_gnn_operator(run_dir, use_fd=False, device=device,
+                                        V_ext=V_qd_flat, N_grid=N_qd)
+        operators = [("GNN", gnn_h_op)] + operators
+    else:
+        print(f"  NOTE: N_qd={N_qd} ≠ N_gnn={N_gnn}  → GNN skipped.")
+        print(f"        Retrain GNN on real QD with d_sparse={d:.4f} Bohr to enable comparison.")
 
-    # ── run filter ────────────────────────────────────────────────────────
+    # ── filter loop ───────────────────────────────────────────────────────────
     n_grid = N_qd ** 3
-    rng    = np.random.default_rng(42)
-    results = {}
+    results_list = []
 
     for label, H_op in operators:
-        print(f"\n  [{label}] filtering {n_random} random vectors  "
-              f"(nc={nc_true} H-applies each, ms={ms} El centres)...")
-        t0 = time.perf_counter()
+        print(f"\n  [{label}] filtering {n_random} random vectors "
+              f"(nc={nc_true} H-applies, ms={ms} El centres)...")
+        rng = np.random.default_rng(42)   # same seed for all operators
+        t0  = time.perf_counter()
 
         filtered = np.zeros((ms * n_random, n_grid))
         for i in range(n_random):
@@ -307,10 +398,10 @@ def test_gnn_filter(
             if (i + 1) % 10 == 0:
                 print(f"    filtered {i+1}/{n_random}", flush=True)
 
-        t_filter = time.perf_counter() - t0
+        t_filter   = time.perf_counter() - t0
         n_H_filter = nc_true * n_random
-        print(f"  Filtering done: {t_filter:.2f}s  (N_H={n_H_filter}, "
-              f"basis_cols={ms * n_random})")
+        print(f"  Filtering done: {t_filter:.2f}s  N_H={n_H_filter}  "
+              f"basis_cols={ms * n_random}")
 
         print(f"  [{label}] Rayleigh-Ritz...")
         t0 = time.perf_counter()
@@ -318,40 +409,65 @@ def test_gnn_filter(
         t_rr = time.perf_counter() - t0
         print(f"  RR done: {t_rr:.2f}s  rank={rank}  n_energies={len(energies)}")
 
-        results[label] = {
-            'energies':   energies,
-            'rank':       rank,
-            't_filter':   t_filter,
-            't_rr':       t_rr,
-            'n_H_filter': n_H_filter,
-            'n_H_total':  n_H_filter + rank,
-        }
+        results_list.append(dict(
+            label      = label,
+            energies   = energies,
+            rank       = rank,
+            t_filter   = t_filter,
+            t_rr       = t_rr,
+            n_H_filter = n_H_filter,
+            n_H_total  = n_H_filter + rank,
+        ))
 
-    # ── print comparison table ────────────────────────────────────────────
+    # ── print comparison table ────────────────────────────────────────────────
     print(f"\n{'─'*60}")
-    print(f"  {'Method':<6}  {'E[0] (Ha)':>12}  {'T_wall (s)':>10}  "
+    print(f"  {'Method':<10}  {'E[0] (Ha)':>12}  {'T_wall (s)':>10}  "
           f"{'N_H':>8}  {'rank':>5}")
-    print(f"  {'─'*6}  {'─'*12}  {'─'*10}  {'─'*8}  {'─'*5}")
-    fd_ev = results.get('FD', {}).get('energies', np.array([]))
-    fd_e0 = fd_ev[0] if len(fd_ev) > 0 else float('nan')
-    for label, _ in operators:
-        r  = results[label]
-        ev = r['energies']
-        e0 = ev[0] if len(ev) > 0 else float('nan')
-        print(f"  {label:<6}  {e0:>12.6f}  "
+    print(f"  {'─'*10}  {'─'*12}  {'─'*10}  {'─'*8}  {'─'*5}")
+    for r in results_list:
+        ev = r["energies"]
+        e0 = ev[0] if len(ev) > 0 else float("nan")
+        print(f"  {r['label']:<10}  {e0:>12.6f}  "
               f"{r['t_filter']+r['t_rr']:>10.2f}  {r['n_H_total']:>8}  {r['rank']:>5}")
     print(f"{'─'*60}")
 
-    # ── plot ─────────────────────────────────────────────────────────────
-    colors = {"GNN": "steelblue", "FD": "tomato"}
+    # ── save results ──────────────────────────────────────────────────────────
+    config_meta = dict(
+        run_dir       = str(run_dir),
+        cube_file     = str(cube_file),
+        params_file   = str(params_file),
+        d_sparse      = d,
+        d_actual      = d_actual,
+        N_qd          = N_qd,
+        N_gnn         = N_gnn,
+        gnn_applicable= gnn_applicable,
+        nc            = nc,
+        nc_true       = nc_true,
+        ms            = ms,
+        El_list       = El_list.tolist(),
+        n_random      = n_random,
+        svd_tol       = svd_tol,
+        n_max_energies= n_max_energies,
+        fd_order      = fd_order,
+        model_type    = model_type,
+        vmin          = vmin,
+        d_e           = d_e,
+        dt            = dt,
+    )
+    _save_results(results_list, config_meta, out_dir, ts)
+
+    # ── eigenvalue plot ───────────────────────────────────────────────────────
+    colors = {"GNN": "steelblue", "FD": "tomato", "FD-4": "tomato"}
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
     ax = axes[0]
-    for i, (label, _) in enumerate(operators):
-        ev = results[label]['energies']
+    for i, r in enumerate(results_list):
+        ev = r["energies"]
         if len(ev) > 0:
-            ax.scatter(range(len(ev)), ev, color=colors.get(label, "gray"),
-                       label=label, s=30, zorder=3+i, alpha=0.85)
+            color = next((v for k, v in colors.items() if r["label"].startswith(k)),
+                         "gray")
+            ax.scatter(range(len(ev)), ev, color=color, label=r["label"],
+                       s=30, zorder=3+i, alpha=0.85)
     for el in El_list:
         ax.axhline(el, ls='--', color='gray', lw=0.8, alpha=0.6)
     ax.axhline(El_list[0], ls='--', color='gray', lw=0.8, alpha=0.6,
@@ -362,8 +478,11 @@ def test_gnn_filter(
     ax.legend(fontsize=9)
 
     ax = axes[1]
-    if gnn_applicable and 'GNN' in results and 'FD' in results:
-        gnn_ev = results['GNN']['energies']
+    gnn_r = next((r for r in results_list if r["label"] == "GNN"), None)
+    fd_r  = next((r for r in results_list if r["label"].startswith("FD")), None)
+    if gnn_r is not None and fd_r is not None:
+        gnn_ev   = gnn_r["energies"]
+        fd_ev    = fd_r["energies"]
         n_common = min(len(gnn_ev), len(fd_ev))
         if n_common > 0:
             de = gnn_ev[:n_common] - fd_ev[:n_common]
@@ -371,20 +490,21 @@ def test_gnn_filter(
             ax.axhline(0, color='k', lw=0.8)
         ax.set_ylabel("E_GNN − E_FD (Ha)")
         ax.set_title("GNN correction to eigenvalues")
-    else:
+    elif fd_r is not None:
+        fd_ev = fd_r["energies"]
         if len(fd_ev) > 0:
             ax.bar(range(len(fd_ev)), fd_ev, color="tomato", alpha=0.8)
         ax.set_ylabel("Energy (Ha)")
-        ax.set_title("FD eigenvalues (GNN not trained on real QD)")
+        ax.set_title(f"FD eigenvalues  (GNN skipped: N_qd={N_qd} ≠ N_gnn={N_gnn})")
     ax.set_xlabel("Level index")
 
     fig.suptitle(
         f"Filter Diagonalization — real QD  (run: {os.path.basename(run_dir)})",
         fontsize=10)
     fig.tight_layout()
-    save_path = os.path.join(out_dir, "filter_test.png")
-    fig.savefig(save_path, dpi=150)
+    plot_path = out_dir / "filter_test.png"
+    fig.savefig(plot_path, dpi=150)
     plt.close(fig)
-    print(f"  Plot → {save_path}")
+    print(f"  Plot → {plot_path}")
 
-    return results
+    return results_list
