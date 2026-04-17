@@ -7,7 +7,9 @@ plot saved to run_dir/filter_test.png.
 
 Usage (via run_gnn.py):
     python run_gnn.py --mode test_filter --run_dir gnn_models/XXXXXXXX \\
-        --filter_nc 200 --filter_el -0.17 --filter_n_random 30
+        --filter_nc 200 \\
+        --filter_el_list -0.25 -0.243 -0.236 -0.229 -0.18 \\
+        --filter_n_random 30
 
 Physics
 -------
@@ -60,14 +62,20 @@ def _rayleigh_ritz(basis_mat, H_op, svd_tol=1e-3, max_energies=20):
     """SVD + Rayleigh-Ritz on columns of basis_mat.  Returns (energies, rank)."""
     norms = np.linalg.norm(basis_mat, axis=0)
     mask  = norms > 1e-15
-    B     = basis_mat[:, mask] / norms[None, mask]
+    if not mask.any():
+        print("    WARNING: all filtered vectors are zero — no eigenvalues found")
+        return np.array([]), 0
 
-    Q, R         = np.linalg.qr(B, mode='reduced')
-    _, sigma, _  = np.linalg.svd(R, full_matrices=False)
-    # Use U1 from a second SVD to get the orthonormal Ritz basis
-    U1, _, _     = np.linalg.svd(R, full_matrices=False)
+    B = basis_mat[:, mask] / norms[None, mask]
+
+    Q, R        = np.linalg.qr(B, mode='reduced')
+    U1, sigma, _ = np.linalg.svd(R, full_matrices=False)
     r            = max(1, int(np.sum(sigma > svd_tol)))
     Ur           = (Q @ U1)[:, :r]
+
+    if Ur.shape[1] == 0:
+        print("    WARNING: Ritz basis has 0 columns after truncation")
+        return np.array([]), 0
 
     H_tilde = np.zeros((r, r))
     for j in range(r):
@@ -93,17 +101,44 @@ def _estimate_spectral_params():
     return vmin, d_e
 
 
+# ── Gaussian window plot ──────────────────────────────────────────────────────
+
+def _plot_filter_windows(El_list, vmin, d_e, dt, nc_true, out_path):
+    """Plot Gaussian filter windows f(E; El) over the physical energy range."""
+    e_min = vmin
+    e_max = vmin + d_e
+    x_phys = np.linspace(e_min, e_max, 2000)
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    cmap = plt.cm.viridis
+    colors = [cmap(i / max(len(El_list) - 1, 1)) for i in range(len(El_list))]
+
+    for el, color in zip(El_list, colors):
+        w = np.array([_filt_func_gaussian(e, el, dt) for e in x_phys])
+        ax.plot(x_phys, w, color=color, lw=1.5, label=f"El={el:.3f}")
+
+    ax.set_xlabel("Energy (Ha)")
+    ax.set_ylabel("Filter weight")
+    ax.set_title(f"Gaussian filter windows  (nc={nc_true}, dt={dt:.4f})")
+    ax.legend(fontsize=7, ncol=3)
+    ax.axhline(0, color='k', lw=0.5)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"  Filter windows → {out_path}")
+
+
 # ── main test function ────────────────────────────────────────────────────────
 
 def test_gnn_filter(
     run_dir:         str,
-    nc:              int   = 200,
-    el:              float = -0.17,
-    n_random:        int   = 20,
-    n_max_energies:  int   = 10,
-    svd_tol:         float = 1e-3,
-    output_root:     str   = ".",
-    device:          str   = 'cpu',
+    nc:              int        = 200,
+    el_list:         list       = None,
+    n_random:        int        = 20,
+    n_max_energies:  int        = 10,
+    svd_tol:         float      = 1e-3,
+    output_root:     str        = ".",
+    device:          str        = 'cpu',
 ):
     """
     Run filter diagonalization with GNN H and FD H, and compare results.
@@ -112,11 +147,11 @@ def test_gnn_filter(
     ----------
     run_dir        : GNN run directory
     nc             : number of Newton steps (filter order)
-    el             : target energy (Ha); filter centres here
+    el_list        : list of target energies (Ha); one Gaussian window per entry
     n_random       : number of random starting vectors
     n_max_energies : max Ritz values to report
     svd_tol        : SVD rank truncation threshold in Rayleigh-Ritz
-    output_root    : directory for filter_test.png (default: run_dir)
+    output_root    : directory for output plots (default: run_dir)
     device         : torch device for GNN evaluations
     """
     if not _HAS_FILTER:
@@ -124,9 +159,14 @@ def test_gnn_filter(
             "fft_code not found.  Run from the repo root so that "
             "fft_code/ is on sys.path.")
 
+    if el_list is None:
+        el_list = [-0.17]
+    El_list = np.array(el_list)
+    ms = len(El_list)
+
     print(f"\n{'='*60}")
     print(f"  GNN Filter Test   run_dir={run_dir}")
-    print(f"  nc={nc}  El={el}  n_random={n_random}")
+    print(f"  nc={nc}  El_list={El_list.tolist()}  n_random={n_random}")
     print(f"{'='*60}")
 
     # ── spectral parameters ───────────────────────────────────────────────
@@ -136,7 +176,6 @@ def test_gnn_filter(
     print(f"  Vmin={vmin:.3f}  dE={d_e:.3f}  dt={dt:.4f}")
 
     # ── Newton filter coefficients (shared between GNN and FD) ────────────
-    El_list     = np.array([el])
     filter_func = lambda x, el_: _filt_func_gaussian(x, el_, dt)
 
     print("  Building Newton filter coefficients...")
@@ -150,8 +189,15 @@ def test_gnn_filter(
         max_enhance_iters=30,
     )
     nc_true = len(samp)
-    print(f"  nc_true={nc_true}  ({time.perf_counter()-t0:.1f}s)")
+    print(f"  nc_true={nc_true}  ms={ms}  ({time.perf_counter()-t0:.1f}s)")
     nodes = samp   # Newton nodes (scaled coordinates)
+
+    # ── plot filter windows ───────────────────────────────────────────────
+    out_dir = run_dir if output_root == "." else output_root
+    _plot_filter_windows(
+        El_list, vmin, d_e, dt, nc_true,
+        os.path.join(out_dir, "filter_windows.png"),
+    )
 
     # ── operators ────────────────────────────────────────────────────────
     n_grid = N_sparse ** 3
@@ -163,34 +209,40 @@ def test_gnn_filter(
     fd_op  = build_gnn_operator(run_dir, use_fd=True,  device=device)
 
     # ── run filter for each operator ──────────────────────────────────────
+    # filtered basis: one column per (El_index, random_vector) pair
     results = {}
     for label, H_op in [("GNN", gnn_op), ("FD", fd_op)]:
-        print(f"\n  [{label}] filtering {n_random} random vectors  (nc={nc_true} H-applies each)...")
+        print(f"\n  [{label}] filtering {n_random} random vectors  "
+              f"(nc={nc_true} H-applies each, ms={ms} El centres)...")
         t0 = time.perf_counter()
 
-        filtered = np.zeros((n_random, n_grid))
+        # shape: (ms * n_random, n_grid) — all El outputs stacked
+        filtered = np.zeros((ms * n_random, n_grid))
         for i in range(n_random):
             psi_flat = rng.standard_normal(n_grid)
             psi_flat /= np.linalg.norm(psi_flat)
+            # _apply_filter_all returns (ms, n_grid) — one call, nc H-applies
             out = _apply_filter_all(H_op, psi_flat, nodes, an, par)
-            # out shape: (ms, n_grid) with ms=1
-            v = out[0]
-            nrm = np.linalg.norm(v)
-            if nrm > 0:
-                filtered[i] = v / nrm
+            for ie in range(ms):
+                v   = out[ie]
+                nrm = np.linalg.norm(v)
+                if nrm > 0:
+                    filtered[ie * n_random + i] = v / nrm
             if (i + 1) % 10 == 0:
                 print(f"    filtered {i+1}/{n_random}", flush=True)
 
         t_filter = time.perf_counter() - t0
         n_H_filter = nc_true * n_random
-        print(f"  Filtering done: {t_filter:.2f}s  (N_H={n_H_filter})")
+        print(f"  Filtering done: {t_filter:.2f}s  (N_H={n_H_filter}, "
+              f"basis_cols={ms * n_random})")
 
         print(f"  [{label}] Rayleigh-Ritz...")
         t0 = time.perf_counter()
         energies, rank = _rayleigh_ritz(filtered.T, H_op, svd_tol, n_max_energies)
         t_rr = time.perf_counter() - t0
         n_H_rr = rank
-        print(f"  RR done: {t_rr:.2f}s  rank={rank}")
+        print(f"  RR done: {t_rr:.2f}s  rank={rank}  "
+              f"n_energies={len(energies)}")
 
         results[label] = {
             'energies':   energies,
@@ -206,29 +258,34 @@ def test_gnn_filter(
     print(f"  {'Method':<6}  {'E[0] (Ha)':>12}  {'ΔE vs FD':>12}  "
           f"{'T_wall (s)':>10}  {'N_H':>8}  {'rank':>5}")
     print(f"  {'─'*6}  {'─'*12}  {'─'*12}  {'─'*10}  {'─'*8}  {'─'*5}")
-    fd_e0 = results['FD']['energies'][0] if len(results['FD']['energies']) > 0 else float('nan')
+    fd_energies = results['FD']['energies']
+    fd_e0 = fd_energies[0] if len(fd_energies) > 0 else float('nan')
     for label in ("GNN", "FD"):
-        r = results[label]
-        e0 = r['energies'][0] if len(r['energies']) > 0 else float('nan')
+        r  = results[label]
+        ev = r['energies']
+        e0 = ev[0] if len(ev) > 0 else float('nan')
         de = e0 - fd_e0
         print(f"  {label:<6}  {e0:>12.6f}  {de:>+12.2e}  "
               f"{r['t_filter']+r['t_rr']:>10.2f}  {r['n_H_total']:>8}  {r['rank']:>5}")
     print(f"{'─'*60}")
 
     # ── plot ─────────────────────────────────────────────────────────────
-    out_dir = run_dir if output_root == "." else output_root
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
     # Left: energy levels found
     ax = axes[0]
     for i, (label, color) in enumerate([("GNN", "steelblue"), ("FD", "tomato")]):
         ev = results[label]['energies']
-        ax.scatter(range(len(ev)), ev, color=color, label=label,
-                   s=30, zorder=3+i, alpha=0.85)
-    ax.axhline(el, ls='--', color='gray', lw=1, alpha=0.7, label=f"El={el}")
+        if len(ev) > 0:
+            ax.scatter(range(len(ev)), ev, color=color, label=label,
+                       s=30, zorder=3+i, alpha=0.85)
+    for el in El_list:
+        ax.axhline(el, ls='--', color='gray', lw=0.8, alpha=0.6)
+    ax.axhline(El_list[0], ls='--', color='gray', lw=0.8, alpha=0.6,
+               label=f"El targets ({len(El_list)})")
     ax.set_xlabel("Level index")
     ax.set_ylabel("Energy (Ha)")
-    ax.set_title(f"Filter eigenvalues  (nc={nc_true}, El={el})")
+    ax.set_title(f"Filter eigenvalues  (nc={nc_true}, ms={ms})")
     ax.legend(fontsize=9)
 
     # Right: GNN vs FD energy difference per level
@@ -244,8 +301,9 @@ def test_gnn_filter(
     ax.set_ylabel("E_GNN − E_FD (Ha)")
     ax.set_title("GNN correction to eigenvalues")
 
-    fig.suptitle(f"Filter Diagonalization — GNN vs FD  (run: {os.path.basename(run_dir)})",
-                 fontsize=10)
+    fig.suptitle(
+        f"Filter Diagonalization — GNN vs FD  (run: {os.path.basename(run_dir)})",
+        fontsize=10)
     fig.tight_layout()
     save_path = os.path.join(out_dir, "filter_test.png")
     fig.savefig(save_path, dpi=150)

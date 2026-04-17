@@ -107,8 +107,10 @@ def main():
     # filter 测试参数
     parser.add_argument("--filter_nc",       type=int,   default=200,
                         help="test_filter: Newton filter order (H-applies per random vector)")
-    parser.add_argument("--filter_el",       type=float, default=-0.17,
-                        help="test_filter: target energy El (Ha)")
+    parser.add_argument("--filter_el_list",  type=float, nargs='+',
+                        default=[-0.17],
+                        help="test_filter: one or more target energies El (Ha), "
+                             "e.g. --filter_el_list -0.25 -0.243 -0.18")
     parser.add_argument("--filter_n_random", type=int,   default=20,
                         help="test_filter: number of random starting vectors")
     parser.add_argument("--filter_svd_tol",  type=float, default=1e-3,
@@ -185,7 +187,7 @@ def main():
         test_gnn_filter(
             run_dir=run_dir,
             nc=args.filter_nc,
-            el=args.filter_el,
+            el_list=args.filter_el_list,
             n_random=args.filter_n_random,
             svd_tol=args.filter_svd_tol,
             output_root=run_dir,
