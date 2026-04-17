@@ -27,7 +27,8 @@ from scipy.sparse.linalg import LinearOperator
 from .physics import N_sparse, V_sparse
 from .graph   import build_graph, build_star_graph
 from .model   import (HamiltonianGNN,       FiniteDiffHamiltonian,
-                      HamiltonianGNN_Cross, FiniteDiffHamiltonian_Cross)
+                      HamiltonianGNN_Cross, FiniteDiffHamiltonian_Cross,
+                      SO3HamiltonianNet)
 
 
 def build_gnn_operator(run_dir: str,
@@ -67,10 +68,12 @@ def build_gnn_operator(run_dir: str,
     # ── load config ──────────────────────────────────────────────────────────
     with open(os.path.join(run_dir, 'config.json')) as f:
         config = json.load(f)
-    hidden_dim = config.get('hidden_dim', 64)
-    graph_type = config.get('graph_type', 'cube')
-    fd_order   = config.get('fd_order',   4)
-    n_co       = config.get('n_co',       3)
+    hidden_dim         = config.get('hidden_dim',         64)
+    graph_type         = config.get('graph_type',         'cube')
+    fd_order           = config.get('fd_order',           4)
+    n_co               = config.get('n_co',               3)
+    model_type         = config.get('model_type',         'gnn')
+    radial_hidden_dim  = config.get('radial_hidden_dim',  32)
 
     # ── build graph ──────────────────────────────────────────────────────────
     V_t = torch.tensor(V_flat, dtype=torch.float32).unsqueeze(-1).to(dev)
@@ -110,15 +113,18 @@ def build_gnn_operator(run_dir: str,
         ckpt_path = os.path.join(run_dir, ckpts[-1])
         ckpt = torch.load(ckpt_path, map_location=dev)
 
-        if graph_type == 'cross':
+        if model_type == 'so3':
+            model = SO3HamiltonianNet(radial_hidden_dim=radial_hidden_dim).to(dev)
+        elif graph_type == 'cross':
             model = HamiltonianGNN_Cross(hidden_dim=hidden_dim).to(dev)
         else:
             model = HamiltonianGNN(hidden_dim=hidden_dim).to(dev)
         model.load_state_dict(ckpt['model_state_dict'])
         model.eval()
-        print(f"  GNN operator: loaded {ckpts[-1]}")
+        print(f"  GNN operator: loaded {ckpts[-1]}  (model_type={model_type})")
 
-        if graph_type == 'cross':
+        # SO3 and cross GNN share the same (fd+co) call signature
+        if model_type == 'so3' or graph_type == 'cross':
             def _gnn(u_t):
                 return model(u_t, fd_ei, fd_ea, co_ei, co_ea, V_t)
         else:
@@ -132,7 +138,7 @@ def build_gnn_operator(run_dir: str,
             with torch.no_grad():
                 return _gnn(u_t / nrm) * nrm   # preserve scale
 
-        label = f"GNN-{graph_type}"
+        label = f"{model_type.upper()}-{graph_type}"
 
     # ── wrap as scipy LinearOperator ─────────────────────────────────────────
     def _matvec(psi_flat: np.ndarray) -> np.ndarray:

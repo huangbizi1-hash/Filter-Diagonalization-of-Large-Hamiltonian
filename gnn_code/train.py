@@ -26,7 +26,7 @@ from .physics import (
 )
 from .data    import generate_wavefunction_and_target, generate_chain, gen_fine_wavefunction
 from .graph   import build_graph, build_star_graph
-from .model   import (HamiltonianGNN, HamiltonianGNN_Cross,
+from .model   import (HamiltonianGNN, HamiltonianGNN_Cross, SO3HamiltonianNet,
                       FiniteDiffHamiltonian, FiniteDiffHamiltonian_Cross)
 from .dataset import try_load_dataset
 
@@ -47,12 +47,14 @@ def train(
     output_root:     str   = ".",
     device:          str   = "auto",   # "auto" | "cpu" | "cuda"
     dataset_dir:     str   = None,     # pregenerated dataset directory; None = on-the-fly
-    graph_type:      str   = 'cube',   # 'cube' = 3×3×3 Mehrstellen; 'cross' = star+correction
-    fd_order:        int   = 4,        # FD order for graph_type='cross'
-    n_co:            int   = 3,        # correction cube size for graph_type='cross'
+    graph_type:       str   = 'cube',   # 'cube' = 3×3×3 Mehrstellen; 'cross' = star+correction
+    fd_order:         int   = 4,        # FD order for graph_type='cross'
+    n_co:             int   = 3,        # correction cube size for graph_type='cross'
+    model_type:       str   = 'gnn',    # 'gnn' = existing MLP; 'so3' = SO3HamiltonianNet
+    radial_hidden_dim: int  = 32,       # hidden dim of SO3 radial MLP (model_type='so3')
 ):
     """
-    训练 HamiltonianGNN / HamiltonianGNN_Cross，返回 (model, run_dir, loss_history)。
+    训练 HamiltonianGNN / HamiltonianGNN_Cross / SO3HamiltonianNet，返回 (model, run_dir, loss_history)。
 
     Parameters
     ----------
@@ -79,6 +81,7 @@ def train(
         kinetic_cutoff=kinetic_cutoff,
         dataset_dir=dataset_dir,
         graph_type=graph_type, fd_order=fd_order, n_co=n_co,
+        model_type=model_type, radial_hidden_dim=radial_hidden_dim,
         L=L, d_fine=d_fine, d_sparse=d_sparse,
         N_fine=N_fine, N_sparse=N_sparse,
         A_pot=A_pot, sigma_pot=sigma_pot,
@@ -139,7 +142,11 @@ def train(
     print(f"Device: {device}")
 
     # ── 模型与优化器 ──
-    if graph_type == 'cross':
+    if model_type == 'so3':
+        if graph_type != 'cross':
+            raise ValueError("model_type='so3' requires graph_type='cross'.")
+        model = SO3HamiltonianNet(radial_hidden_dim=radial_hidden_dim).to(device)
+    elif graph_type == 'cross':
         model = HamiltonianGNN_Cross(hidden_dim=hidden_dim).to(device)
     else:
         model = HamiltonianGNN(hidden_dim=hidden_dim).to(device)

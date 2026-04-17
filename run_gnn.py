@@ -76,6 +76,14 @@ def main():
     parser.add_argument("--n_co", type=int, default=3,
                         help="graph_type=cross 时，correction 立方体边长（奇数，默认 3）")
 
+    # 模型类型
+    parser.add_argument("--model_type", default="gnn",
+                        choices=["gnn", "so3"],
+                        help="gnn: 原有 MLP correction（HamiltonianGNN / HamiltonianGNN_Cross）; "
+                             "so3: SO(3) 启发的 l=0+l=1 修正（SO3HamiltonianNet，需 graph_type=cross）")
+    parser.add_argument("--radial_hidden_dim", type=int, default=32,
+                        help="model_type=so3 时径向 MLP 隐藏层宽度（默认 32）")
+
     # 训练超参数
     parser.add_argument("--hidden_dim",      type=int,   default=64)
     parser.add_argument("--epochs",          type=int,   default=5000)
@@ -238,6 +246,8 @@ def main():
             graph_type=args.graph_type,
             fd_order=args.fd_order,
             n_co=args.n_co,
+            model_type=args.model_type,
+            radial_hidden_dim=args.radial_hidden_dim,
         )
 
     # ── HO + GNN 测试（能量 + 相似度序列）──

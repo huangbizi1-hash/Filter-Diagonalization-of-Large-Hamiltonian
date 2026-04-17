@@ -36,10 +36,12 @@ from .dataset import generate_k_grid_dataset, WavefunctionDataset, try_load_data
 try:
     from .graph         import build_graph, build_star_graph
     from .model         import (HamiltonianGNN, FiniteDiffHamiltonian,
-                                HamiltonianGNN_Cross, FiniteDiffHamiltonian_Cross)
+                                HamiltonianGNN_Cross, FiniteDiffHamiltonian_Cross,
+                                SO3HamiltonianNet, RadialMLP)
     from .gnn_operator  import build_gnn_operator
     from .train         import train
     from .test          import test_baseline, test_gnn_from_run, test_gnn_ho
     from .test_filter   import test_gnn_filter
+    from .test_so3      import test_so3_sanity
 except ImportError:
     pass   # 无 PyTorch 时跳过；test_fd 模式只需 fd_baseline.py
