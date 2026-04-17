@@ -128,6 +128,12 @@ def main():
     parser.add_argument("--filter_params",   type=str,   default=None,
                         help="test_filter: path to Gaussian fit params JSON "
                              "(default: gaussian_fit_params.json)")
+    parser.add_argument("--filter_vmin",     type=float, default=None,
+                        help="test_filter: spectral window lower bound Vmin (Ha); "
+                             "default: -5.0 (real QD)")
+    parser.add_argument("--filter_de",       type=float, default=None,
+                        help="test_filter: spectral window width dE (Ha); "
+                             "default: 50.0 (real QD)")
 
     # 其他测试参数
     parser.add_argument("--omega", type=float, default=1.0,
@@ -200,6 +206,8 @@ def main():
         kw = {}
         if args.filter_cube   is not None: kw['cube_file']   = args.filter_cube
         if args.filter_params is not None: kw['params_file'] = args.filter_params
+        if args.filter_vmin   is not None: kw['vmin']        = args.filter_vmin
+        if args.filter_de     is not None: kw['d_e']         = args.filter_de
         test_gnn_filter(
             run_dir=run_dir,
             nc=args.filter_nc,

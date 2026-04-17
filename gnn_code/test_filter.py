@@ -274,6 +274,8 @@ def test_gnn_filter(
     device:          str        = 'cpu',
     cube_file:       str        = _DEFAULT_CUBE,
     params_file:     str        = _DEFAULT_PARAMS,
+    vmin:            float      = None,
+    d_e:             float      = None,
 ):
     """
     Run filter diagonalization on the real QD potential.
@@ -329,9 +331,11 @@ def test_gnn_filter(
     pot_grid, N_qd, d_actual = _load_qd_potential(
         d, cube_file=cube_file, params_file=params_file)
 
-    # ── spectral parameters (fixed for real QD) ───────────────────────────────
-    vmin = _QD_VMIN
-    d_e  = _QD_DE
+    # ── spectral parameters ───────────────────────────────────────────────────
+    if vmin is None:
+        vmin = _QD_VMIN
+    if d_e is None:
+        d_e = _QD_DE
     dt   = (nc / (d_e * 2.5)) ** 2
     par  = PhysParams(dE=d_e, Vmin=vmin, dt=dt)
     print(f"  Spectral: Vmin={vmin}  dE={d_e}  dt={dt:.6f}")

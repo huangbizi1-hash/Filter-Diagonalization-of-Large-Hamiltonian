@@ -54,6 +54,10 @@ parser.add_argument("--qd-radius", type=int, default=None,
                          "不指定则使用 localPot.cube（N=64）")
 parser.add_argument("--fft-only", action="store_true",
                     help="只运行 FFT 算符，跳过有限差分阶数比较")
+parser.add_argument("--Vmin", type=float, default=-5.0,
+                    help="滤波窗口下界 Vmin（Ha），默认 -5.0")
+parser.add_argument("--dE", type=float, default=50.0,
+                    help="滤波窗口宽度 dE（Ha），默认 50.0")
 args = parser.parse_args()
 QD_RADIUS = args.qd_radius
 FFT_ONLY  = args.fft_only
@@ -63,8 +67,8 @@ FFT_ONLY  = args.fft_only
 # ──────────────────────────────────────────────
 EL           = -0.17      # 滤波中心（物理单位，Hartree）
 NC           = 5000       # Newton 节点数（初始估计）
-DE           = 50.0       # 滤波窗口宽度
-VMIN         = -5.0       # 窗口下界
+DE           = args.dE    # 滤波窗口宽度
+VMIN         = args.Vmin  # 窗口下界
 N_RANDOM     = 64         # 每个 El 的随机初态数量
 SVD_TOL      = 1e-3       # Rayleigh-Ritz SVD 秩截断
 MAX_ENERGIES = 20         # 输出能级数上限
