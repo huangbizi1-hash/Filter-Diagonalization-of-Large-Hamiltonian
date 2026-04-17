@@ -34,10 +34,12 @@ from .dataset import generate_k_grid_dataset, WavefunctionDataset, try_load_data
 
 # torch 依赖模块：仅在 torch 可用时导入
 try:
-    from .graph import build_graph, build_star_graph
-    from .model import (HamiltonianGNN, FiniteDiffHamiltonian,
-                        HamiltonianGNN_Cross, FiniteDiffHamiltonian_Cross)
-    from .train import train
-    from .test  import test_baseline, test_gnn_from_run, test_gnn_ho
+    from .graph         import build_graph, build_star_graph
+    from .model         import (HamiltonianGNN, FiniteDiffHamiltonian,
+                                HamiltonianGNN_Cross, FiniteDiffHamiltonian_Cross)
+    from .gnn_operator  import build_gnn_operator
+    from .train         import train
+    from .test          import test_baseline, test_gnn_from_run, test_gnn_ho
+    from .test_filter   import test_gnn_filter
 except ImportError:
     pass   # 无 PyTorch 时跳过；test_fd 模式只需 fd_baseline.py

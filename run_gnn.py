@@ -44,12 +44,13 @@ def main():
     parser.add_argument("--mode", default="all",
                         choices=["train", "test_baseline", "test_gnn",
                                  "test_fd", "test_ho", "test_gnn_ho",
-                                 "gen_dataset", "all"],
+                                 "gen_dataset", "test_filter", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
                              "test_ho: HO ground state correctness test (no PyTorch); "
                              "test_gnn_ho: HO ground state test with GNN comparison "
                              "(energy + wavefunction similarity vs n); "
-                             "gen_dataset: generate fixed k-grid sine-wave dataset")
+                             "gen_dataset: generate fixed k-grid sine-wave dataset; "
+                             "test_filter: filter diagonalization with GNN vs FD on sparse grid")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
@@ -103,7 +104,17 @@ def main():
                         help="Device for training: auto=use CUDA if available, "
                              "cpu=force CPU, cuda=force CUDA (fails if unavailable)")
 
-    # 测试参数
+    # filter 测试参数
+    parser.add_argument("--filter_nc",       type=int,   default=200,
+                        help="test_filter: Newton filter order (H-applies per random vector)")
+    parser.add_argument("--filter_el",       type=float, default=-0.17,
+                        help="test_filter: target energy El (Ha)")
+    parser.add_argument("--filter_n_random", type=int,   default=20,
+                        help="test_filter: number of random starting vectors")
+    parser.add_argument("--filter_svd_tol",  type=float, default=1e-3,
+                        help="test_filter: SVD rank truncation threshold for Rayleigh-Ritz")
+
+    # 其他测试参数
     parser.add_argument("--omega", type=float, default=1.0,
                         help="HO frequency for test_ho mode")
     parser.add_argument("--n_steps", type=int, default=8,
@@ -153,6 +164,32 @@ def main():
             omega=args.omega,
             kinetic_cutoff=args.kinetic_cutoff,
             output_root=OUTPUT_ROOT,
+        )
+        return
+
+    # ── filter 测试（GNN vs FD，需要 PyTorch + fft_code）──
+    if args.mode == "test_filter":
+        if args.run_dir is None:
+            gnn_models_dir = os.path.join(OUTPUT_ROOT, "gnn_models")
+            candidates = sorted([
+                d for d in os.listdir(gnn_models_dir)
+                if os.path.isdir(os.path.join(gnn_models_dir, d)) and d[0].isdigit()
+            ])
+            if not candidates:
+                raise RuntimeError("gnn_models/ 下未找到任何 run 目录。")
+            run_dir = os.path.join(gnn_models_dir, candidates[-1])
+            print(f"Auto-selected run_dir: {run_dir}")
+        else:
+            run_dir = args.run_dir
+        from gnn_code.test_filter import test_gnn_filter
+        test_gnn_filter(
+            run_dir=run_dir,
+            nc=args.filter_nc,
+            el=args.filter_el,
+            n_random=args.filter_n_random,
+            svd_tol=args.filter_svd_tol,
+            output_root=run_dir,
+            device=args.device,
         )
         return
 
