@@ -26,7 +26,8 @@ from .physics import (
 )
 from .data    import generate_wavefunction_and_target, generate_chain, gen_fine_wavefunction
 from .graph   import build_graph, build_star_graph
-from .model   import HamiltonianGNN, HamiltonianGNN_Cross
+from .model   import (HamiltonianGNN, HamiltonianGNN_Cross,
+                      FiniteDiffHamiltonian, FiniteDiffHamiltonian_Cross)
 from .dataset import try_load_dataset
 
 
@@ -163,6 +164,46 @@ def train(
         dataset = try_load_dataset(dataset_dir)
         n_ds    = len(dataset)
         print(f"Using fixed dataset ({n_ds} samples) from {dataset_dir}")
+
+    # ── FD baseline losses（训练前评估，chain 各步基准）──
+    if graph_type == 'cross':
+        _fd_ham = FiniteDiffHamiltonian_Cross(fd_edge_index, fd_edge_attr, V_tensor, device)
+    else:
+        _fd_ham = FiniteDiffHamiltonian(edge_index, edge_attr, V_tensor, device)
+
+    _N_FD = 50
+    _fd_step_sum    = [0.0] * chain_len
+    _fd_step_counts = [0]   * chain_len
+
+    with torch.no_grad():
+        for _ in range(_N_FD):
+            if dataset is not None:
+                _pairs = dataset[int(np.random.randint(0, len(dataset)))][:chain_len]
+                _use_np = False
+            elif chain_len == 1:
+                ps, ht  = generate_wavefunction_and_target(wf_type, k_max)
+                _pairs  = [(ps, ht)]
+                _use_np = True
+            else:
+                _pairs  = generate_chain(gen_fine_wavefunction(wf_type, k_max),
+                                         chain_len, kinetic_cutoff)
+                _use_np = True
+
+            for k, _sd in enumerate(_pairs):
+                if _use_np:
+                    _u = torch.tensor(_sd[0].flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
+                    _t = torch.tensor(_sd[1].flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
+                else:
+                    _u, _t = _sd[0].to(device), _sd[1].to(device)
+                _fd_step_sum[k]    += criterion(_fd_ham(_u), _t).item()
+                _fd_step_counts[k] += 1
+
+    fd_baseline_losses = [
+        _fd_step_sum[k] / _fd_step_counts[k] if _fd_step_counts[k] > 0 else float('nan')
+        for k in range(chain_len)
+    ]
+    _fd_str = "  ".join(f"s{k}:{fd_baseline_losses[k]:.3e}" for k in range(chain_len))
+    print(f"FD baseline (N={_N_FD}): [{_fd_str}]")
 
     # ── 训练循环 ──
     bptt_tag   = "+bptt" if (chain_mode == 'auto' and chain_bptt) else ""
@@ -305,25 +346,39 @@ def train(
     # ── 保存 loss ──
     with open(os.path.join(run_dir, "loss_history.json"), "w") as f:
         json.dump({
-            "epoch":       epoch_recorded,
-            "loss":        loss_history,
-            "step_losses": step_loss_history,   # list[epoch][step]
+            "epoch":              epoch_recorded,
+            "loss":               loss_history,
+            "step_losses":        step_loss_history,   # list[epoch][step]
+            "fd_baseline_losses": fd_baseline_losses,  # list[step]
         }, f)
 
     # ── loss 曲线 ──
     fig, ax = plt.subplots(figsize=(7, 4))
+
+    # FD baseline 水平虚线（先画，在训练曲线下方）
+    fd_avg_baseline = float(np.nanmean(fd_baseline_losses))
+    ax.axhline(fd_avg_baseline, ls='--', lw=1.5, color="steelblue",
+               alpha=0.6, label=f"FD avg {fd_avg_baseline:.2e}", zorder=3)
+    if chain_len > 1:
+        step_colors = plt.cm.Reds(np.linspace(0.35, 0.90, chain_len))
+        for k in range(chain_len):
+            if np.isfinite(fd_baseline_losses[k]):
+                ax.axhline(fd_baseline_losses[k], ls='--', lw=1.0,
+                           color=step_colors[k], alpha=0.7,
+                           label=f"FD s{k} {fd_baseline_losses[k]:.2e}", zorder=3)
+
+    # 训练曲线
     ax.semilogy(epoch_recorded, loss_history,
                 lw=2.0, color="steelblue", label="avg", zorder=10)
     if chain_len > 1:
-        colors = plt.cm.Reds(np.linspace(0.35, 0.90, chain_len))
         for k in range(chain_len):
             vals = [step_loss_history[i][k] for i in range(len(step_loss_history))]
             ax.semilogy(epoch_recorded, vals,
-                        lw=1.0, color=colors[k], alpha=0.75, label=f"step {k}")
+                        lw=1.0, color=step_colors[k], alpha=0.75, label=f"step {k}")
+
     ax.set_xlabel("Epoch"); ax.set_ylabel("MSE Loss")
     ax.set_title(f"Training Loss ({wf_type}, hidden={hidden_dim}, chain={chain_len})")
     ax.legend(fontsize=8, loc="upper right")
-    ax.grid(True, which='both', ls='--', alpha=0.5)
     fig.tight_layout()
     fig.savefig(os.path.join(run_dir, "loss_curve.png"), dpi=150)
     plt.close(fig)
