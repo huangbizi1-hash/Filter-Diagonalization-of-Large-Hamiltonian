@@ -105,16 +105,21 @@ def main():
                              "cpu=force CPU, cuda=force CUDA (fails if unavailable)")
 
     # filter 测试参数
-    parser.add_argument("--filter_nc",       type=int,   default=200,
+    parser.add_argument("--filter_nc",       type=int,   default=5000,
                         help="test_filter: Newton filter order (H-applies per random vector)")
     parser.add_argument("--filter_el_list",  type=float, nargs='+',
                         default=[-0.17],
                         help="test_filter: one or more target energies El (Ha), "
                              "e.g. --filter_el_list -0.25 -0.243 -0.18")
-    parser.add_argument("--filter_n_random", type=int,   default=20,
+    parser.add_argument("--filter_n_random", type=int,   default=64,
                         help="test_filter: number of random starting vectors")
     parser.add_argument("--filter_svd_tol",  type=float, default=1e-3,
                         help="test_filter: SVD rank truncation threshold for Rayleigh-Ritz")
+    parser.add_argument("--filter_cube",     type=str,   default=None,
+                        help="test_filter: path to QD cube file (default: localPot.cube)")
+    parser.add_argument("--filter_params",   type=str,   default=None,
+                        help="test_filter: path to Gaussian fit params JSON "
+                             "(default: gaussian_fit_params.json)")
 
     # 其他测试参数
     parser.add_argument("--omega", type=float, default=1.0,
@@ -184,6 +189,9 @@ def main():
         else:
             run_dir = args.run_dir
         from gnn_code.test_filter import test_gnn_filter
+        kw = {}
+        if args.filter_cube   is not None: kw['cube_file']   = args.filter_cube
+        if args.filter_params is not None: kw['params_file'] = args.filter_params
         test_gnn_filter(
             run_dir=run_dir,
             nc=args.filter_nc,
@@ -192,6 +200,7 @@ def main():
             svd_tol=args.filter_svd_tol,
             output_root=run_dir,
             device=args.device,
+            **kw,
         )
         return
 

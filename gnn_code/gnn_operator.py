@@ -8,6 +8,13 @@ a normalized input, so we implement the scale-preserving identity:
 
 When use_fd=True the operator falls back to the pure FiniteDiffHamiltonian
 (no NN, same graph) so the caller can compare filter results directly.
+
+V_ext
+-----
+If provided (shape (N³,) float64), overrides the default V_sparse from
+physics.py.  N_grid must then equal len(V_ext); the caller is responsible
+for consistency between V_ext and the GNN model (the GNN must have been
+trained on the same potential).
 """
 
 import json
@@ -25,7 +32,9 @@ from .model   import (HamiltonianGNN,       FiniteDiffHamiltonian,
 
 def build_gnn_operator(run_dir: str,
                        use_fd:  bool = False,
-                       device:  str  = 'cpu') -> LinearOperator:
+                       device:  str  = 'cpu',
+                       V_ext:   np.ndarray = None,
+                       N_grid:  int  = None) -> LinearOperator:
     """
     Return a scipy LinearOperator that applies H on the sparse grid.
 
@@ -35,13 +44,25 @@ def build_gnn_operator(run_dir: str,
     use_fd  : True  → pure FD Hamiltonian, no NN (for baseline comparison)
               False → GNN Hamiltonian with normalisation trick (default)
     device  : torch device string ('cpu' or 'cuda')
+    V_ext   : optional external potential, shape (N³,).  If given, overrides
+              V_sparse from physics.py.  N_grid must also be provided.
+    N_grid  : number of grid points per axis when using V_ext.
 
     Returns
     -------
-    LinearOperator of shape (N_sparse³, N_sparse³), dtype float64.
+    LinearOperator of shape (n_grid, n_grid), dtype float64.
     """
-    dev    = torch.device(device)
-    n_grid = N_sparse ** 3
+    dev = torch.device(device)
+
+    # ── resolve potential and grid size ──────────────────────────────────────
+    if V_ext is not None:
+        if N_grid is None:
+            raise ValueError("N_grid must be provided when V_ext is given")
+        V_flat = np.asarray(V_ext, dtype=np.float32).ravel()
+        n_grid = N_grid ** 3
+    else:
+        V_flat = V_sparse.flatten().astype(np.float32)
+        n_grid = N_sparse ** 3
 
     # ── load config ──────────────────────────────────────────────────────────
     with open(os.path.join(run_dir, 'config.json')) as f:
@@ -52,8 +73,7 @@ def build_gnn_operator(run_dir: str,
     n_co       = config.get('n_co',       3)
 
     # ── build graph ──────────────────────────────────────────────────────────
-    V_t = torch.tensor(V_sparse.flatten(),
-                       dtype=torch.float32).unsqueeze(-1).to(dev)
+    V_t = torch.tensor(V_flat, dtype=torch.float32).unsqueeze(-1).to(dev)
 
     if graph_type == 'cross':
         fd_ei, fd_ea, co_ei, co_ea = build_star_graph(fd_order, n_co)
@@ -122,5 +142,5 @@ def build_gnn_operator(run_dir: str,
         return out.cpu().numpy().flatten().astype(np.float64)
 
     op = LinearOperator(shape=(n_grid, n_grid), matvec=_matvec, dtype=np.float64)
-    op.label = label   # attach label for printing
+    op.label = label
     return op
