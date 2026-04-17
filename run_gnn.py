@@ -65,6 +65,16 @@ def main():
     parser.add_argument("--n_k", type=int, default=10,
                         help="gen_dataset 模式：每轴 k 取值点数（共 n_k³ 个态）")
 
+    # 图结构
+    parser.add_argument("--graph_type", default="cube",
+                        choices=["cube", "cross"],
+                        help="cube: 3×3×3 Mehrstellen（原有）; "
+                             "cross: 高阶十字星FD + correction立方体（两套边）")
+    parser.add_argument("--fd_order", type=int, default=4,
+                        help="graph_type=cross 时，FD 差分阶数（偶数，默认 4）")
+    parser.add_argument("--n_co", type=int, default=3,
+                        help="graph_type=cross 时，correction 立方体边长（奇数，默认 3）")
+
     # 训练超参数
     parser.add_argument("--hidden_dim",      type=int,   default=64)
     parser.add_argument("--epochs",          type=int,   default=5000)
@@ -177,6 +187,9 @@ def main():
             output_root=OUTPUT_ROOT,
             device=args.device,
             dataset_dir=args.dataset_dir,
+            graph_type=args.graph_type,
+            fd_order=args.fd_order,
+            n_co=args.n_co,
         )
 
     # ── HO + GNN 测试（能量 + 相似度序列）──

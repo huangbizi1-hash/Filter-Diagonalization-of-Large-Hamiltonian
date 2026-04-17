@@ -25,8 +25,8 @@ from .physics import (
     L, d_fine, d_sparse, N_fine, N_sparse, A_pot, sigma_pot, V_sparse,
 )
 from .data    import generate_wavefunction_and_target, generate_chain, gen_fine_wavefunction
-from .graph   import build_graph
-from .model   import HamiltonianGNN
+from .graph   import build_graph, build_star_graph
+from .model   import HamiltonianGNN, HamiltonianGNN_Cross
 from .dataset import try_load_dataset
 
 
@@ -46,15 +46,22 @@ def train(
     output_root:     str   = ".",
     device:          str   = "auto",   # "auto" | "cpu" | "cuda"
     dataset_dir:     str   = None,     # pregenerated dataset directory; None = on-the-fly
+    graph_type:      str   = 'cube',   # 'cube' = 3×3×3 Mehrstellen; 'cross' = star+correction
+    fd_order:        int   = 4,        # FD order for graph_type='cross'
+    n_co:            int   = 3,        # correction cube size for graph_type='cross'
 ):
     """
-    训练 HamiltonianGNN，返回 (model, run_dir, loss_history)。
+    训练 HamiltonianGNN / HamiltonianGNN_Cross，返回 (model, run_dir, loss_history)。
 
     Parameters
     ----------
     output_root  : gnn_models/ 将创建在此目录下（默认"."即仓库根目录）。
     dataset_dir  : 预生成数据集目录（由 gen_dataset 模式产生）。
                    提供时从磁盘/内存加载固定样本，忽略 wf_type/k_max 的随机生成。
+    graph_type   : 'cube' 使用 3×3×3 Mehrstellen 图（原有），
+                   'cross' 使用高阶十字星+correction 两套边图。
+    fd_order     : graph_type='cross' 时，FD 差分阶数（偶数，默认 4）。
+    n_co         : graph_type='cross' 时，correction 立方体边长（奇数，默认 3）。
     """
     # ── 建立输出目录 ──
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -70,6 +77,7 @@ def train(
         chain_len=chain_len, chain_mode=chain_mode, chain_bptt=chain_bptt,
         kinetic_cutoff=kinetic_cutoff,
         dataset_dir=dataset_dir,
+        graph_type=graph_type, fd_order=fd_order, n_co=n_co,
         L=L, d_fine=d_fine, d_sparse=d_sparse,
         N_fine=N_fine, N_sparse=N_sparse,
         A_pot=A_pot, sigma_pot=sigma_pot,
@@ -80,41 +88,74 @@ def train(
     print(f"Config saved → {run_dir}/config.json")
 
     # ── 构建图 ──
-    print("Building graph...")
-    edge_index, edge_attr = build_graph()
-    V_tensor = torch.tensor(
-        V_sparse.flatten(), dtype=torch.float32).unsqueeze(-1)
+    print(f"Building graph (graph_type={graph_type}" +
+          (f", fd_order={fd_order}, n_co={n_co}" if graph_type == 'cross' else "") + ")...")
+    V_tensor = torch.tensor(V_sparse.flatten(), dtype=torch.float32).unsqueeze(-1)
+
+    if graph_type == 'cross':
+        fd_edge_index, fd_edge_attr, co_edge_index, co_edge_attr = build_star_graph(fd_order, n_co)
+        edge_index = edge_attr = None          # not used in cross mode
+    else:
+        edge_index, edge_attr = build_graph()
+        fd_edge_index = fd_edge_attr = co_edge_index = co_edge_attr = None
 
     if device == "auto":
         _dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     else:
         _dev = torch.device(device)
+
     # Try the requested device; if CUDA OOM at graph loading, fall back to CPU
+    def _to_dev(t, d):
+        return t.to(d) if t is not None else None
+
     try:
-        edge_index = edge_index.to(_dev)
-        edge_attr  = edge_attr.to(_dev)
-        V_tensor   = V_tensor.to(_dev)
-        device     = _dev
+        if graph_type == 'cross':
+            fd_edge_index = fd_edge_index.to(_dev)
+            fd_edge_attr  = fd_edge_attr.to(_dev)
+            co_edge_index = co_edge_index.to(_dev)
+            co_edge_attr  = co_edge_attr.to(_dev)
+        else:
+            edge_index = edge_index.to(_dev)
+            edge_attr  = edge_attr.to(_dev)
+        V_tensor = V_tensor.to(_dev)
+        device   = _dev
     except RuntimeError as e:
         if 'out of memory' in str(e).lower() and _dev.type == 'cuda':
             print(f"WARNING: CUDA OOM when loading graph ({e}). Falling back to CPU.")
             torch.cuda.empty_cache()
-            device     = torch.device('cpu')
-            edge_index = edge_index.to(device)
-            edge_attr  = edge_attr.to(device)
-            V_tensor   = V_tensor.to(device)
+            device = torch.device('cpu')
+            if graph_type == 'cross':
+                fd_edge_index = fd_edge_index.to(device)
+                fd_edge_attr  = fd_edge_attr.to(device)
+                co_edge_index = co_edge_index.to(device)
+                co_edge_attr  = co_edge_attr.to(device)
+            else:
+                edge_index = edge_index.to(device)
+                edge_attr  = edge_attr.to(device)
+            V_tensor = V_tensor.to(device)
         else:
             raise
     print(f"Device: {device}")
 
     # ── 模型与优化器 ──
-    model     = HamiltonianGNN(hidden_dim=hidden_dim).to(device)
+    if graph_type == 'cross':
+        model = HamiltonianGNN_Cross(hidden_dim=hidden_dim).to(device)
+    else:
+        model = HamiltonianGNN(hidden_dim=hidden_dim).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
     loss_history      = []
     step_loss_history = []   # list of lists: [epoch][step]
     epoch_recorded    = []
+
+    # ── 封装 forward（屏蔽两种图类型的接口差异）──
+    if graph_type == 'cross':
+        def apply_model(u):
+            return model(u, fd_edge_index, fd_edge_attr, co_edge_index, co_edge_attr, V_tensor)
+    else:
+        def apply_model(u):
+            return model(u, edge_index, edge_attr, V_tensor)
 
     # ── 加载数据集（如有）──
     dataset = None
@@ -127,7 +168,7 @@ def train(
     bptt_tag   = "+bptt" if (chain_mode == 'auto' and chain_bptt) else ""
     chain_info = (f"chain_len={chain_len}, mode={chain_mode}{bptt_tag}, kinetic_cutoff={kinetic_cutoff}"
                   if chain_len > 1 else "single-step")
-    data_src = f"dataset({n_ds})" if dataset is not None else "on-the-fly"
+    data_src = f"dataset({len(dataset)})" if dataset is not None else "on-the-fly"
     print(f"Training for {epochs} epochs "
           f"({batch_per_epoch} steps/epoch, batch_size={batch_size}, "
           f"{chain_info}, data={data_src})...")
@@ -170,7 +211,7 @@ def train(
                             psi_s.flatten(),    dtype=torch.float32).unsqueeze(-1).to(device)
                         target = torch.tensor(
                             H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
-                    pred = model(u_in, edge_index, edge_attr, V_tensor)
+                    pred = apply_model(u_in)
                     sl = criterion(pred, target)
                     batch_loss     = batch_loss + sl
                     step_sum[0]    = step_sum[0] + sl.detach()
@@ -216,7 +257,7 @@ def train(
                         else:
                             target = H_target.to(device)
 
-                        pred = model(u_in, edge_index, edge_attr, V_tensor)
+                        pred = apply_model(u_in)
                         prev_pred = pred
                         sl = criterion(pred, target)
                         psi_chain_loss = psi_chain_loss + sl

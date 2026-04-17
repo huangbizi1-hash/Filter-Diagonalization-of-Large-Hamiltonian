@@ -23,8 +23,9 @@ from .physics import (
     d_fine, d_sparse, V_sparse, fft_hamiltonian,
 )
 from .data  import gen_fine_wavefunction
-from .graph import build_graph
-from .model import HamiltonianGNN, FiniteDiffHamiltonian
+from .graph import build_graph, build_star_graph
+from .model import (HamiltonianGNN, FiniteDiffHamiltonian,
+                    HamiltonianGNN_Cross, FiniteDiffHamiltonian_Cross)
 
 
 # ──────────────────────────────────────────────
@@ -82,14 +83,24 @@ def _fft_energy_series(psi_fine: np.ndarray, n_steps: int) -> list:
     return energies
 
 
-def _build_shared_graph(device):
-    """构建图并移动到 device，返回 (edge_index, edge_attr, V_tensor)。"""
-    edge_index, edge_attr = build_graph()
+def _build_shared_graph(device, graph_type='cube', fd_order=4, n_co=3):
+    """
+    构建图并移动到 device。
+
+    Returns
+    -------
+    cube : (edge_index, edge_attr, V_tensor)
+    cross: (fd_edge_index, fd_edge_attr, co_edge_index, co_edge_attr, V_tensor)
+    """
     V_tensor = torch.tensor(
-        V_sparse.flatten(), dtype=torch.float32).unsqueeze(-1)
-    return (edge_index.to(device),
-            edge_attr.to(device),
-            V_tensor.to(device))
+        V_sparse.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
+    if graph_type == 'cross':
+        fd_ei, fd_ea, co_ei, co_ea = build_star_graph(fd_order, n_co)
+        return (fd_ei.to(device), fd_ea.to(device),
+                co_ei.to(device), co_ea.to(device), V_tensor)
+    else:
+        edge_index, edge_attr = build_graph()
+        return (edge_index.to(device), edge_attr.to(device), V_tensor)
 
 
 # ──────────────────────────────────────────────
@@ -187,7 +198,10 @@ def test_gnn_from_run(
 
     with open(os.path.join(run_dir, "config.json")) as f:
         config = json.load(f)
-    hidden_dim = config.get('hidden_dim', 64)
+    hidden_dim  = config.get('hidden_dim',  64)
+    graph_type  = config.get('graph_type',  'cube')
+    fd_order    = config.get('fd_order',    4)
+    n_co        = config.get('n_co',        3)
 
     ckpt_files = sorted(
         [fn for fn in os.listdir(run_dir)
@@ -200,10 +214,18 @@ def test_gnn_from_run(
 
     selected = ckpt_files[::d_test]
     print(f"Checkpoints: {len(ckpt_files)} total, {len(selected)} selected (d_test={d_test})")
+    print(f"Graph type: {graph_type}" +
+          (f" (fd_order={fd_order}, n_co={n_co})" if graph_type == 'cross' else ""))
 
-    device = torch.device('cpu')
-    edge_index, edge_attr, V_tensor = _build_shared_graph(device)
-    fd_ham = FiniteDiffHamiltonian(edge_index, edge_attr, V_tensor, device)
+    device    = torch.device('cpu')
+    graph_tup = _build_shared_graph(device, graph_type, fd_order, n_co)
+
+    if graph_type == 'cross':
+        fd_ei, fd_ea, co_ei, co_ea, V_tensor = graph_tup
+        fd_ham = FiniteDiffHamiltonian_Cross(fd_ei, fd_ea, V_tensor, device)
+    else:
+        edge_index, edge_attr, V_tensor = graph_tup
+        fd_ham = FiniteDiffHamiltonian(edge_index, edge_attr, V_tensor, device)
 
     # ── 生成固定测试集 ──
     np.random.seed(42)
@@ -233,13 +255,21 @@ def test_gnn_from_run(
     for ckpt_fn in selected:
         ckpt      = torch.load(os.path.join(run_dir, ckpt_fn), map_location=device)
         epoch_num = ckpt['epoch']
-        model = HamiltonianGNN(hidden_dim=hidden_dim).to(device)
+        if graph_type == 'cross':
+            model = HamiltonianGNN_Cross(hidden_dim=hidden_dim).to(device)
+        else:
+            model = HamiltonianGNN(hidden_dim=hidden_dim).to(device)
         model.load_state_dict(ckpt['model_state_dict'])
         model.eval()
 
-        def apply_H(u, _model=model):
-            with torch.no_grad():
-                return _model(u, edge_index, edge_attr, V_tensor)
+        if graph_type == 'cross':
+            def apply_H(u, _m=model):
+                with torch.no_grad():
+                    return _m(u, fd_ei, fd_ea, co_ei, co_ea, V_tensor)
+        else:
+            def apply_H(u, _m=model):
+                with torch.no_grad():
+                    return _m(u, edge_index, edge_attr, V_tensor)
 
         gnn_e_all = np.array([
             _gnn_energy_series(ps, apply_H, n_steps, device)
