@@ -44,13 +44,14 @@ def main():
     parser.add_argument("--mode", default="all",
                         choices=["train", "test_baseline", "test_gnn",
                                  "test_fd", "test_ho", "test_gnn_ho",
-                                 "gen_dataset", "test_filter", "all"],
+                                 "gen_dataset", "test_filter", "benchmark", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
                              "test_ho: HO ground state correctness test (no PyTorch); "
                              "test_gnn_ho: HO ground state test with GNN comparison "
                              "(energy + wavefunction similarity vs n); "
                              "gen_dataset: generate fixed k-grid sine-wave dataset; "
-                             "test_filter: filter diagonalization with GNN vs FD on sparse grid")
+                             "test_filter: filter diagonalization with GNN vs FD on sparse grid; "
+                             "benchmark: compare multiple GNN models (--run_dirs) vs FFT/FD baseline")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
@@ -151,8 +152,13 @@ def main():
     parser.add_argument("--d_test",  type=int, default=1,
                         help="checkpoint 选取间隔")
     parser.add_argument("--run_dir", type=str, default=None,
-                        help="test_gnn 模式下指定已有 run 目录；"
+                        help="test_gnn / test_filter 模式下指定已有 run 目录；"
                              "不指定则自动选最新 run")
+    parser.add_argument("--run_dirs", nargs="+", default=None,
+                        help="benchmark 模式：要比较的 GNN run 目录列表，"
+                             "例如 gnn_models/chain1_teacher gnn_models/chain2_teacher")
+    parser.add_argument("--n_timing_reps", type=int, default=20,
+                        help="benchmark 模式：单次 H-apply 计时重复次数（取中位数）")
 
     args = parser.parse_args()
 
@@ -238,6 +244,33 @@ def main():
             svd_tol=args.filter_svd_tol,
             output_root=run_dir,
             device=args.device,
+            **kw,
+        )
+        return
+
+    # ── benchmark 模式：多模型精度-效率对比 ──
+    if args.mode == "benchmark":
+        if not args.run_dirs:
+            raise ValueError(
+                "--run_dirs 必须指定至少一个 GNN run 目录，"
+                "例如：--run_dirs gnn_models/chain1_teacher gnn_models/chain2_teacher")
+        from gnn_code.benchmark import benchmark_models
+        vmin_val = args.Vmin if args.Vmin is not None else args.filter_vmin
+        de_val   = args.dE   if args.dE   is not None else args.filter_de
+        kw = {}
+        if args.filter_cube   is not None: kw["cube_file"]   = args.filter_cube
+        if args.filter_params is not None: kw["params_file"] = args.filter_params
+        if vmin_val is not None: kw["vmin"] = vmin_val
+        if de_val   is not None: kw["d_e"]  = de_val
+        benchmark_models(
+            run_dirs      = args.run_dirs,
+            nc            = args.filter_nc,
+            el            = args.filter_el_list[0],
+            n_random      = args.filter_n_random,
+            svd_tol       = args.filter_svd_tol,
+            n_timing_reps = args.n_timing_reps,
+            device        = args.device,
+            output_root   = OUTPUT_ROOT,
             **kw,
         )
         return
