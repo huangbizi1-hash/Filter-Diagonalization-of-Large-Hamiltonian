@@ -64,7 +64,11 @@ def main():
                         help="预生成数据集目录；训练时指定则从磁盘加载，"
                              "不指定则按 wf_type 动态生成")
     parser.add_argument("--n_k", type=int, default=10,
-                        help="gen_dataset 模式：每轴 k 取值点数（共 n_k³ 个态）")
+                        help="gen_dataset 模式（wf_type=sine/k-grid）：每轴 k 取值点数（共 n_k³ 个态）")
+    parser.add_argument("--n_samples", type=int, default=1000,
+                        help="gen_dataset 模式（wf_type=pm1/gaussian/sine 随机）：生成样本数")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="gen_dataset 随机数据集的随机种子（默认不固定）")
 
     # 图结构
     parser.add_argument("--graph_type", default="cube",
@@ -166,15 +170,28 @@ def main():
 
     # ── 生成固定数据集（无 PyTorch）──
     if args.mode == "gen_dataset":
-        from gnn_code.dataset import generate_k_grid_dataset
         out_dir = args.dataset_dir or os.path.join(OUTPUT_ROOT, "gnn_dataset")
-        generate_k_grid_dataset(
-            k_max=args.k_max,
-            n_k=args.n_k,
-            chain_len=args.chain_len,
-            kinetic_cutoff=args.kinetic_cutoff,
-            out_dir=out_dir,
-        )
+        if args.wf_type == 'pm1' or (args.wf_type in ('gaussian', 'sine') and args.n_samples):
+            # 随机态数据集：pm1 / gaussian / sine，共 n_samples 个独立样本
+            from gnn_code.dataset import generate_random_dataset
+            generate_random_dataset(
+                wf_type=args.wf_type,
+                n_samples=args.n_samples,
+                chain_len=args.chain_len,
+                kinetic_cutoff=args.kinetic_cutoff,
+                out_dir=out_dir,
+                seed=args.seed,
+            )
+        else:
+            # 默认：均匀 k-grid 正弦波（n_k³ 个固定态）
+            from gnn_code.dataset import generate_k_grid_dataset
+            generate_k_grid_dataset(
+                k_max=args.k_max,
+                n_k=args.n_k,
+                chain_len=args.chain_len,
+                kinetic_cutoff=args.kinetic_cutoff,
+                out_dir=out_dir,
+            )
         return
 
     # ── HO ground state correctness test (no PyTorch) ──
