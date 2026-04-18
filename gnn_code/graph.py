@@ -21,7 +21,7 @@ build_star_graph(fd_order, n_co, N, d, grid_L)
 
 import numpy as np
 import torch
-from .physics import d_sparse, N_sparse, L
+from .physics import d_sparse, N_sparse
 
 
 # ─────────────────────────────────────────────────────────────────────────────

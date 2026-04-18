@@ -328,7 +328,11 @@ def test_gnn_filter(
     print(f"{'='*60}")
 
     # ── QD potential at GNN grid spacing ─────────────────────────────────────
+    # Always use d_sparse from the GNN config, not the cube file's natural d.
+    # The Gaussian-based QD potential can be re-evaluated at any spacing,
+    # so we rebuild the grid at d_sparse to match the trained GNN stencil.
     print("\n  Loading real QD potential...")
+    print(f"  Using d_sparse={d:.4f} Bohr from GNN config to build QD grid")
     pot_grid, N_qd, d_actual = _load_qd_potential(
         d, cube_file=cube_file, params_file=params_file)
 
