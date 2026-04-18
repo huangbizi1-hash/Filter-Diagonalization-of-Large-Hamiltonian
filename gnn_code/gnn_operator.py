@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from scipy.sparse.linalg import LinearOperator
 
-from .physics import N_sparse, V_sparse
+from .physics import N_sparse, V_sparse, d_sparse
 from .graph   import build_graph, build_star_graph
 from .model   import (HamiltonianGNN,       FiniteDiffHamiltonian,
                       HamiltonianGNN_Cross, FiniteDiffHamiltonian_Cross,
@@ -64,6 +64,7 @@ def build_gnn_operator(run_dir: str,
     else:
         V_flat = V_sparse.flatten().astype(np.float32)
         n_grid = N_sparse ** 3
+        N_grid = N_sparse
 
     # ── load config ──────────────────────────────────────────────────────────
     with open(os.path.join(run_dir, 'config.json')) as f:
@@ -74,17 +75,23 @@ def build_gnn_operator(run_dir: str,
     n_co               = config.get('n_co',               3)
     model_type         = config.get('model_type',         'gnn')
     radial_hidden_dim  = config.get('radial_hidden_dim',  32)
+    d_cfg              = float(config.get('d_sparse',     d_sparse))
+    grid_L_cfg         = N_grid * d_cfg
 
     # ── build graph ──────────────────────────────────────────────────────────
+    # Graph is rebuilt for the actual N_grid (may differ from training N_sparse).
+    # The GNN is a local operator whose MLP weights depend only on d, so it
+    # generalises to any N as long as the grid spacing d_sparse is the same.
     V_t = torch.tensor(V_flat, dtype=torch.float32).unsqueeze(-1).to(dev)
 
     if graph_type == 'cross':
-        fd_ei, fd_ea, co_ei, co_ea = build_star_graph(fd_order, n_co)
+        fd_ei, fd_ea, co_ei, co_ea = build_star_graph(
+            fd_order, n_co, N=N_grid, d=d_cfg, grid_L=grid_L_cfg)
         fd_ei = fd_ei.to(dev);  fd_ea = fd_ea.to(dev)
         co_ei = co_ei.to(dev);  co_ea = co_ea.to(dev)
         edge_index = edge_attr = None
     else:
-        edge_index, edge_attr = build_graph()
+        edge_index, edge_attr = build_graph(N=N_grid, d=d_cfg, grid_L=grid_L_cfg)
         edge_index = edge_index.to(dev);  edge_attr = edge_attr.to(dev)
         fd_ei = fd_ea = co_ei = co_ea = None
 
