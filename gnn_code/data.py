@@ -1,7 +1,7 @@
 """
 data.py — 波函数生成
 
-提供两种波函数类型（高斯波包叠加 / 正弦波叠加）及统一接口。
+提供三种波函数类型（高斯波包叠加 / 正弦波叠加 / 格点随机 ±1）及统一接口。
 所有函数返回 (psi_sparse, H_psi_target)：
   psi_sparse   : 稀疏网格上的波函数值  (N_sparse, N_sparse, N_sparse)
   H_psi_target : 精确 H|ψ⟩ 在稀疏网格上的值（用 FFT 精细网格计算后下采样）
@@ -55,7 +55,27 @@ def gen_sine_wavefunction(k_max: int = 2):
     return psi_sparse, H_psi_target
 
 
-def gen_fine_wavefunction(wf_type: str = 'gaussian', k_max: int = 2) -> np.ndarray:
+def gen_pm1_wavefunction(rng: np.random.Generator = None):
+    """
+    细网格格点独立随机 ±1 波函数（flat 随机态），
+    返回 (psi_sparse, H_psi_target)。
+
+    每个细网格格点独立取 ±1，通过 FFT 精确计算 H|ψ⟩，
+    再下采样到稀疏网格。稀疏格点上的值仍为 ±1（细网格每隔一点取一个）。
+    """
+    if rng is not None:
+        signs = rng.choice(np.array([-1.0, 1.0]), size=X_f.shape)
+    else:
+        signs = np.random.choice([-1.0, 1.0], size=X_f.shape)
+    psi_fine     = signs.astype(np.float64)
+    H_psi_fine   = fft_hamiltonian(psi_fine)
+    psi_sparse   = psi_fine[::2, ::2, ::2]
+    H_psi_target = H_psi_fine[::2, ::2, ::2]
+    return psi_sparse, H_psi_target
+
+
+def gen_fine_wavefunction(wf_type: str = 'gaussian', k_max: int = 2,
+                          rng: np.random.Generator = None) -> np.ndarray:
     """
     Generate a wavefunction on the fine grid (N_fine³) without downsampling.
     Returns psi_fine of shape (N_fine, N_fine, N_fine).
@@ -79,8 +99,12 @@ def gen_fine_wavefunction(wf_type: str = 'gaussian', k_max: int = 2) -> np.ndarr
             kz = np.random.randint(-k_max, k_max + 1) * dk
             b = np.random.rand() * 2 * np.pi
             psi_fine += np.sin(kx * X_f + ky * Y_f + kz * Z_f + b)
+    elif wf_type == 'pm1':
+        gen = rng if rng is not None else np.random.default_rng()
+        psi_fine = gen.choice(np.array([-1.0, 1.0]),
+                              size=X_f.shape).astype(np.float64)
     else:
-        raise ValueError(f"Unknown wf_type: {wf_type!r}. Choose 'gaussian' or 'sine'.")
+        raise ValueError(f"Unknown wf_type: {wf_type!r}. Choose 'gaussian', 'sine', or 'pm1'.")
     return psi_fine
 
 
@@ -128,14 +152,17 @@ def generate_chain(psi_0_fine: np.ndarray,
     return pairs
 
 
-def generate_wavefunction_and_target(wf_type: str = 'gaussian', k_max: int = 2):
+def generate_wavefunction_and_target(wf_type: str = 'gaussian', k_max: int = 2,
+                                     rng: np.random.Generator = None):
     """
-    统一接口：wf_type ∈ {'gaussian', 'sine'}
+    统一接口：wf_type ∈ {'gaussian', 'sine', 'pm1'}
     返回 (psi_sparse, H_psi_target)。
     """
     if wf_type == 'gaussian':
         return gen_gaussian_wavefunction()
     elif wf_type == 'sine':
         return gen_sine_wavefunction(k_max=k_max)
+    elif wf_type == 'pm1':
+        return gen_pm1_wavefunction(rng=rng)
     else:
-        raise ValueError(f"Unknown wf_type: {wf_type!r}. Choose 'gaussian' or 'sine'.")
+        raise ValueError(f"Unknown wf_type: {wf_type!r}. Choose 'gaussian', 'sine', or 'pm1'.")
