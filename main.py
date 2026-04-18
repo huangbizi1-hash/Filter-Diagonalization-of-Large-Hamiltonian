@@ -82,7 +82,7 @@ matplotlib.use("Agg")
 # ============================================================
 from fft_code.params       import IstParams, PhysParams
 from fft_code.grid         import build_k_diagonal
-from fft_code.wavefunction import random_sine_psi, normalize_psi
+from fft_code.wavefunction import random_sine_psi, random_pm1_psi, normalize_psi
 from fft_code.hamiltonian  import apply_H, apply_filter_H, apply_filter_H_all
 from fft_code.filter_coeff import build_filter_coefficients, make_filter_func
 from fft_code.rayleigh_ritz import svd_rayleigh_ritz
@@ -173,6 +173,9 @@ CONFIG: Dict[str, Any] = {
     # ---------- 随机态 ----------
     "n_random": 1,
     "seed": 42,
+    # "sine" : 随机正弦叠加波 sin(kx·X + ky·Y + kz·Z + b)（默认）
+    # "pm1"  : 每个格点独立随机取 ±1 后归一化
+    "initial_state_type": "sine",
 
     # ---------- SVD / Rayleigh-Ritz ----------
     "svd_tol": 1e-3,
@@ -476,8 +479,15 @@ def run(cfg: Dict[str, Any]) -> None:
     E_temp_all  = [[] for _ in range(ist.ms)]
     print_every = cfg.get("print_every_filter", 1)
 
+    _init_type = cfg.get("initial_state_type", "sine")
+    _psi_generators = {"sine": random_sine_psi, "pm1": random_pm1_psi}
+    if _init_type not in _psi_generators:
+        raise ValueError(f"Unknown initial_state_type={_init_type!r}; choose 'sine' or 'pm1'")
+    _make_psi = _psi_generators[_init_type]
+    print(f"   Initial state type: {_init_type}")
+
     for i in range(n_random):
-        psi_rand = random_sine_psi(X, Y, Z, rng=rng)
+        psi_rand = _make_psi(X, Y, Z, rng=rng)
 
         if filter_type == "split_bandpass":
             # 两步：先高通（批量共享基底），再低通（每个 El 单独作用）
