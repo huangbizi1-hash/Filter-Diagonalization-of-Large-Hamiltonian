@@ -45,6 +45,7 @@ def train(
     chain_bptt:      bool  = False,      # True: no detach in auto → full BPTT across steps
     kinetic_cutoff:  float = 30.0,
     output_root:     str   = ".",
+    run_name:        str   = None,     # custom folder name; None = timestamp
     device:          str   = "auto",   # "auto" | "cpu" | "cuda"
     dataset_dir:     str   = None,     # pregenerated dataset directory; None = on-the-fly
     graph_type:       str   = 'cube',   # 'cube' = 3×3×3 Mehrstellen; 'cross' = star+correction
@@ -68,7 +69,8 @@ def train(
     """
     # ── 建立输出目录 ──
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir   = os.path.join(output_root, "gnn_models", timestamp)
+    folder    = run_name if run_name else timestamp
+    run_dir   = os.path.join(output_root, "gnn_models", folder)
     os.makedirs(run_dir, exist_ok=True)
 
     # ── 保存超参数 ──

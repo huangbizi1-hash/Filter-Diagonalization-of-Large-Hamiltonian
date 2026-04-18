@@ -151,6 +151,9 @@ def main():
                         help="测试波函数数量")
     parser.add_argument("--d_test",  type=int, default=1,
                         help="checkpoint 选取间隔")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="训练输出文件夹名（gnn_models/<run_name>）；"
+                             "不指定则使用时间戳")
     parser.add_argument("--run_dir", type=str, default=None,
                         help="test_gnn / test_filter 模式下指定已有 run 目录；"
                              "不指定则自动选最新 run")
@@ -304,6 +307,7 @@ def main():
             chain_bptt=args.chain_bptt,
             kinetic_cutoff=args.kinetic_cutoff,
             output_root=OUTPUT_ROOT,
+            run_name=args.run_name,
             device=args.device,
             dataset_dir=args.dataset_dir,
             graph_type=args.graph_type,
