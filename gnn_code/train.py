@@ -259,7 +259,8 @@ def train(
                             psi_s.flatten(),    dtype=torch.float32).unsqueeze(-1).to(device)
                         target = torch.tensor(
                             H_target.flatten(), dtype=torch.float32).unsqueeze(-1).to(device)
-                    pred = apply_model(u_in)
+                    _nrm = torch.norm(u_in) + 1e-30
+                    pred = apply_model(u_in / _nrm) * _nrm
                     sl = criterion(pred, target)
                     batch_loss     = batch_loss + sl
                     step_sum[0]    = step_sum[0] + sl.detach()
@@ -305,7 +306,8 @@ def train(
                         else:
                             target = H_target.to(device)
 
-                        pred = apply_model(u_in)
+                        _nrm = torch.norm(u_in) + 1e-30
+                        pred = apply_model(u_in / _nrm) * _nrm
                         prev_pred = pred
                         sl = criterion(pred, target)
                         psi_chain_loss = psi_chain_loss + sl
