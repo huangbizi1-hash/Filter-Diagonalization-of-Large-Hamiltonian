@@ -44,14 +44,16 @@ def main():
     parser.add_argument("--mode", default="all",
                         choices=["train", "test_baseline", "test_gnn",
                                  "test_fd", "test_ho", "test_gnn_ho",
-                                 "gen_dataset", "test_filter", "benchmark", "all"],
+                                 "gen_dataset", "test_filter", "benchmark",
+                                 "timing", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
                              "test_ho: HO ground state correctness test (no PyTorch); "
                              "test_gnn_ho: HO ground state test with GNN comparison "
                              "(energy + wavefunction similarity vs n); "
                              "gen_dataset: generate fixed k-grid sine-wave dataset; "
                              "test_filter: filter diagonalization with GNN vs FD on sparse grid; "
-                             "benchmark: compare multiple GNN models (--run_dirs) vs FFT/FD baseline")
+                             "benchmark: compare multiple GNN models (--run_dirs) vs FFT/FD baseline; "
+                             "timing: measure single H-apply time for all architectures (no training)")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
@@ -162,6 +164,21 @@ def main():
                              "例如 gnn_models/chain1_teacher gnn_models/chain2_teacher")
     parser.add_argument("--n_timing_reps", type=int, default=20,
                         help="benchmark 模式：单次 H-apply 计时重复次数（取中位数）")
+
+    # timing 模式专用参数
+    parser.add_argument("--timing_hidden_dims", type=int, nargs="+",
+                        default=[8, 16, 32, 64, 128, 256],
+                        help="timing 模式：测试的 hidden_dim 列表（GNN-cube / GNN-cross）")
+    parser.add_argument("--timing_radial_hidden_dims", type=int, nargs="+",
+                        default=None,
+                        help="timing 模式：SO3 radial_hidden_dim 列表；"
+                             "不指定则与 --timing_hidden_dims 相同")
+    parser.add_argument("--timing_n_reps", type=int, default=100,
+                        help="timing 模式：计时重复次数（均值，默认 100）")
+    parser.add_argument("--timing_n_warmup", type=int, default=10,
+                        help="timing 模式：热身次数（不计入统计，默认 10）")
+    parser.add_argument("--timing_description", type=str, default="",
+                        help="timing 模式：写入 JSON description 字段的说明文字")
 
     args = parser.parse_args()
 
@@ -274,6 +291,26 @@ def main():
             n_timing_reps = args.n_timing_reps,
             device        = args.device,
             output_root   = OUTPUT_ROOT,
+            **kw,
+        )
+        return
+
+    # ── timing 模式：H-apply 计时基准 ──
+    if args.mode == "timing":
+        from gnn_code.timing_benchmark import time_h_apply
+        kw = {}
+        if args.filter_cube   is not None: kw["cube_file"]   = args.filter_cube
+        if args.filter_params is not None: kw["params_file"] = args.filter_params
+        time_h_apply(
+            n_reps             = args.timing_n_reps,
+            n_warmup           = args.timing_n_warmup,
+            hidden_dims        = args.timing_hidden_dims,
+            radial_hidden_dims = args.timing_radial_hidden_dims,
+            fd_order           = args.fd_order,
+            n_co               = args.n_co,
+            device             = args.device,
+            output_root        = OUTPUT_ROOT,
+            description        = args.timing_description,
             **kw,
         )
         return
