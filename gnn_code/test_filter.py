@@ -42,6 +42,7 @@ import numpy as np
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.linalg import eigh
+from scipy.sparse.linalg import LinearOperator
 
 from .physics  import N_sparse, d_sparse
 from .gnn_operator import build_gnn_operator
@@ -50,6 +51,7 @@ from .gnn_operator import build_gnn_operator
 try:
     from fft_code.params       import PhysParams
     from fft_code.filter_coeff import build_filter_coefficients, _filt_func_gaussian
+    from fft_code.hamiltonian  import apply_H as _fft_apply_H
     _HAS_FILTER = True
 except ImportError:
     _HAS_FILTER = False
@@ -160,6 +162,98 @@ def _rayleigh_ritz(basis_mat, H_op, svd_tol=1e-3, max_energies=20):
     return np.sort(evals.real)[:max_energies], r
 
 
+# ── FFT operator ──────────────────────────────────────────────────────────────
+
+def _build_fft_qd_operator(V_qd_3d: np.ndarray, N_qd: int,
+                            d_actual: float) -> LinearOperator:
+    """
+    Wrap apply_H (pyfftw, PBC) as a scipy LinearOperator for the QD grid.
+    No kinetic cutoff: full continuous-space kinetic spectrum.
+    """
+    kx_1d = 2 * np.pi * np.fft.fftfreq(N_qd, d=d_actual)
+    Kx, Ky, Kz = np.meshgrid(kx_1d, kx_1d, kx_1d, indexing='ij')
+    T_k_diag = ((Kx**2 + Ky**2 + Kz**2) / 2.0).astype(np.float64)
+    V_3d  = V_qd_3d.reshape(N_qd, N_qd, N_qd).astype(np.float64)
+    n_grid = N_qd ** 3
+
+    def _matvec(psi_flat: np.ndarray) -> np.ndarray:
+        psi_3d = np.asarray(psi_flat, dtype=np.complex128).reshape(N_qd, N_qd, N_qd)
+        return _fft_apply_H(psi_3d, V_3d, T_k_diag).real.ravel().astype(np.float64)
+
+    op = LinearOperator(shape=(n_grid, n_grid), matvec=_matvec, dtype=np.float64)
+    op.label = "FFT"
+    return op
+
+
+# ── k=0 保真度测试 ────────────────────────────────────────────────────────────
+
+def _k0_fidelity_test(operators: list, nodes: np.ndarray, an: np.ndarray,
+                      par, n_grid: int, El_list: np.ndarray) -> dict:
+    """
+    用 k=0（常数归一化态）作为初始滤波态，比较三种算符的结果。
+
+    对每个 El 中心返回：
+      energies   — 滤波后态的 Rayleigh 商
+      fidelities — |<ψ_FFT | ψ_method>|（以 FFT 为基准，FFT 自身为 1.0）
+
+    Parameters
+    ----------
+    operators : list of (label, H_op)，FFT 须排在首位以作参照
+    """
+    ms     = an.shape[0]
+    psi_k0 = np.ones(n_grid, dtype=np.float64) / np.sqrt(n_grid)
+
+    # 先对所有算符滤波，归一化
+    filtered_by_label: dict[str, list] = {}
+    for label, H_op in operators:
+        out  = _apply_filter_all(H_op, psi_k0, nodes, an, par)  # (ms, n_grid)
+        vecs = []
+        for ie in range(ms):
+            v   = out[ie]
+            nrm = np.linalg.norm(v)
+            vecs.append(v / nrm if nrm > 1e-15 else None)
+        filtered_by_label[label] = vecs
+
+    # FFT 滤波态作为参照
+    fft_vecs = filtered_by_label.get("FFT")
+
+    results = {}
+    for label, H_op in operators:
+        vecs       = filtered_by_label[label]
+        energies   = []
+        fidelities = []
+        for ie in range(ms):
+            v = vecs[ie]
+            if v is None:
+                energies.append(float('nan'))
+                fidelities.append(float('nan'))
+                continue
+            # Rayleigh 商
+            Hv = H_op.matvec(v)
+            energies.append(float(np.dot(v, Hv)))
+            # 保真度
+            if fft_vecs is not None and fft_vecs[ie] is not None:
+                fidelities.append(float(abs(np.dot(v, fft_vecs[ie]))))
+            else:
+                fidelities.append(float('nan'))
+        results[label] = {"energies": energies, "fidelities": fidelities}
+
+    # 打印结果
+    print(f"\n  k=0 fidelity test  (El_list={El_list.tolist()})")
+    header = f"  {'Method':<8}  " + "  ".join(
+        f"El={el:.3f}:E/Fid" for el in El_list)
+    print(header)
+    for label, res in results.items():
+        cols = []
+        for ie in range(ms):
+            e   = res["energies"][ie]
+            fid = res["fidelities"][ie]
+            cols.append(f"{e:+.4f}/{fid:.4f}")
+        print(f"  {label:<8}  " + "  ".join(cols))
+
+    return results
+
+
 # ── filter window plot ────────────────────────────────────────────────────────
 
 def _plot_filter_windows(El_list, vmin, d_e, dt, nc_true, out_path):
@@ -187,15 +281,15 @@ def _plot_filter_windows(El_list, vmin, d_e, dt, nc_true, out_path):
 
 # ── result storage ────────────────────────────────────────────────────────────
 
-def _save_results(results_list, config_meta, out_dir, ts):
+def _save_results(results_list, config_meta, out_dir, ts,
+                  k0_results: dict = None):
     """
-    Save filter results to JSON and Markdown (mirrors compare_fd_filter.py).
+    Save filter results to JSON and Markdown.
 
     results_list : list of dicts with keys
-                   label, energies, rank, t_filter, t_rr, n_H_filter, n_H_total
-    config_meta  : dict of run metadata
-    out_dir      : Path or str to output directory
-    ts           : timestamp string for file names
+                   label, energies, El_list, E_mean, E_std,
+                   rank, t_filter, t_rr, n_H_filter, n_H_total
+    k0_results   : dict returned by _k0_fidelity_test (optional)
     """
     out_dir = Path(out_dir)
 
@@ -203,6 +297,8 @@ def _save_results(results_list, config_meta, out_dir, ts):
     def _to_list(arr):
         if hasattr(arr, 'tolist'):
             return arr.tolist()
+        if arr is None:
+            return None
         return list(arr)
 
     json_results = []
@@ -210,8 +306,12 @@ def _save_results(results_list, config_meta, out_dir, ts):
         ev = r["energies"]
         json_results.append({
             "label":     r["label"],
+            "El_list":   _to_list(r.get("El_list", [])),
             "E0":        float(ev[0]) if len(ev) > 0 else None,
+            "E_mean":    _to_list(r.get("E_mean")),   # per-El mean Rayleigh quotient
+            "E_std":     _to_list(r.get("E_std")),    # per-El std
             "t_wall":    r["t_filter"] + r["t_rr"],
+            "n_H_filter": r["n_H_filter"],
             "n_H_total": r["n_H_total"],
             "rr_rank":   r["rank"],
             "energies":  _to_list(ev),
@@ -223,6 +323,7 @@ def _save_results(results_list, config_meta, out_dir, ts):
         "datetime": datetime.datetime.now().isoformat(),
         "config":   config_meta,
         "results":  json_results,
+        "k0_test":  k0_results,   # None if not requested
     }
     json_path = out_dir / f"filter_test_{ts}.json"
     with open(json_path, "w", encoding="utf-8") as f:
@@ -243,16 +344,35 @@ def _save_results(results_list, config_meta, out_dir, ts):
         f"| nc_true={config_meta.get('nc_true', '?')}  "
         f"| n_random={config_meta.get('n_random', '?')}  "
         f"| El_list={config_meta.get('El_list', '?')}\n",
-        "| Method | E[0] (Ha) | ΔE vs FD | T_wall (s) | N_H | RR rank |",
-        "|--------|-----------|----------|------------|-----|---------|",
+        "| Method | E[0] (Ha) | E_mean (Ha) | E_std (Ha) | ΔE vs FD | T_wall (s) | N_H | RR rank |",
+        "|--------|-----------|-------------|------------|----------|------------|-----|---------|",
     ]
     for r in json_results:
-        e0 = r["E0"] if r["E0"] is not None else float("nan")
-        de = (e0 - fd_E0) if r["E0"] is not None else float("nan")
+        e0    = r["E0"] if r["E0"] is not None else float("nan")
+        de    = (e0 - fd_E0) if r["E0"] is not None else float("nan")
+        emean = r["E_mean"]
+        emean_s = f"{float(emean[0]):.4f}" if emean else "  nan  "
+        estd  = r["E_std"]
+        estd_s  = f"{float(estd[0]):.4f}"  if estd  else "  nan  "
         lines.append(
-            f"| {r['label']:8s} | {e0:12.6f} | {de:+.2e} "
-            f"| {r['t_wall']:10.2f} | {r['n_H_total']:8d} | {r['rr_rank']:7d} |"
+            f"| {r['label']:8s} | {e0:12.6f} | {emean_s:>11s} | {estd_s:>10s} "
+            f"| {de:+.2e} | {r['t_wall']:10.2f} | {r['n_H_total']:8d} | {r['rr_rank']:7d} |"
         )
+
+    # k=0 fidelity table
+    if k0_results:
+        El_cfg = config_meta.get('El_list', [])
+        lines += ["", "## k=0 fidelity test\n",
+                  "| Method | " + " | ".join(f"El={el:.3f} E(Ha)" for el in El_cfg) +
+                  " | " + " | ".join(f"El={el:.3f} Fid" for el in El_cfg) + " |",
+                  "|--------|" + "|".join("--------" for _ in El_cfg) + "|" +
+                  "|".join("--------" for _ in El_cfg) + "|"]
+        for label, res in k0_results.items():
+            e_cols   = " | ".join(f"{e:+.4f}" for e in res["energies"])
+            fid_cols = " | ".join(
+                f"{f:.4f}" if not np.isnan(f) else "  nan  "
+                for f in res["fidelities"])
+            lines.append(f"| {label:<8} | {e_cols} | {fid_cols} |")
 
     md_text = "\n".join(lines) + "\n"
     print("\n" + md_text)
@@ -365,12 +485,25 @@ def test_gnn_filter(
     _plot_filter_windows(El_list, vmin, d_e, dt, nc_true,
                          out_dir / "filter_windows.png")
 
-    # ── build operators ───────────────────────────────────────────────────────
+    # ── build operators (order: FFT → FD → GNN) ──────────────────────────────
+    V_qd_3d   = pot_grid.potential.reshape(N_qd, N_qd, N_qd)
+    V_qd_flat = pot_grid.potential.ravel().astype(np.float32)
+    operators: list = []
+
+    # FFT: 精确参照（pyfftw, PBC, 无截断），始终排第一
+    print(f"\n  Building FFT operator (N={N_qd}, pyfftw)...")
+    try:
+        fft_h_op = _build_fft_qd_operator(V_qd_3d, N_qd, d_actual)
+        operators.append(("FFT", fft_h_op))
+        print(f"  FFT operator ready.")
+    except Exception as exc:
+        print(f"  WARNING: FFT operator failed ({exc}) → FFT skipped.")
+
     # FD: uses build_3d_fd_operator so it works for any N_qd
     print(f"\n  Building FD operator (order={fd_order}, N={N_qd})...")
     fd_h_op, _, _ = build_3d_fd_operator(N_qd, pot_grid, fd_order=fd_order)
     fd_h_op.label = f"FD-{fd_order}"
-    operators = [("FD", fd_h_op)]
+    operators.append(("FD", fd_h_op))
 
     # GNN: rebuild graph for N_qd; the GNN is a local operator whose MLP weights
     # depend only on d_sparse, so it generalises to any grid size.
@@ -379,10 +512,9 @@ def test_gnn_filter(
         print(f"  NOTE: N_qd={N_qd} ≠ N_gnn={N_gnn}  → rebuilding graph for N={N_qd}.")
     print(f"  Building GNN operator (N={N_qd}, model={model_type})...")
     try:
-        V_qd_flat = pot_grid.potential.ravel().astype(np.float32)
-        gnn_h_op  = build_gnn_operator(run_dir, use_fd=False, device=device,
-                                        V_ext=V_qd_flat, N_grid=N_qd)
-        operators = [("GNN", gnn_h_op)] + operators
+        gnn_h_op = build_gnn_operator(run_dir, use_fd=False, device=device,
+                                       V_ext=V_qd_flat, N_grid=N_qd)
+        operators.append(("GNN", gnn_h_op))
     except Exception as exc:
         print(f"  WARNING: GNN operator failed ({exc}) → GNN skipped.")
         gnn_applicable = False
@@ -393,11 +525,14 @@ def test_gnn_filter(
 
     for label, H_op in operators:
         print(f"\n  [{label}] filtering {n_random} random vectors "
-              f"(nc={nc_true} H-applies, ms={ms} El centres)...")
+              f"(nc_true={nc_true}, H-applies/vec={nc_true-1}, ms={ms} El centres)...")
         rng = np.random.default_rng(42)   # same seed for all operators
         t0  = time.perf_counter()
 
-        filtered = np.zeros((ms * n_random, n_grid))
+        filtered   = np.zeros((ms * n_random, n_grid))
+        # E_temp[ie] accumulates per-vector Rayleigh quotients for El centre ie
+        E_temp = [[] for _ in range(ms)]
+
         for i in range(n_random):
             psi_flat = rng.standard_normal(n_grid)
             psi_flat /= np.linalg.norm(psi_flat)
@@ -405,15 +540,31 @@ def test_gnn_filter(
             for ie in range(ms):
                 v   = out[ie]
                 nrm = np.linalg.norm(v)
-                if nrm > 0:
-                    filtered[ie * n_random + i] = v / nrm
+                if nrm > 1e-15:
+                    v_n = v / nrm
+                    filtered[ie * n_random + i] = v_n
+                    # Rayleigh 商：<v|H|v>（参照 main.py 的 E_exp 计算）
+                    Hv = H_op.matvec(v_n)
+                    E_temp[ie].append(float(np.dot(v_n, Hv)))
             if (i + 1) % 10 == 0:
                 print(f"    filtered {i+1}/{n_random}", flush=True)
 
         t_filter   = time.perf_counter() - t0
-        n_H_filter = nc_true * n_random
-        print(f"  Filtering done: {t_filter:.2f}s  N_H={n_H_filter}  "
-              f"basis_cols={ms * n_random}")
+        # _apply_filter_all 循环 range(1, nc_true) = nc_true-1 次 H·apply
+        n_H_filter = (nc_true - 1) * n_random
+        # +ms*n_random 次来自 Rayleigh 商计算
+        n_H_rq     = sum(len(v) for v in E_temp)
+        print(f"  Filtering done: {t_filter:.2f}s  N_H_filter={n_H_filter}  "
+              f"N_H_RQ={n_H_rq}  basis_cols={ms * n_random}")
+
+        # per-El E_mean / E_std
+        E_mean_list = [float(np.mean(E_temp[ie])) if E_temp[ie] else float('nan')
+                       for ie in range(ms)]
+        E_std_list  = [float(np.std(E_temp[ie]))  if E_temp[ie] else float('nan')
+                       for ie in range(ms)]
+        for ie in range(ms):
+            print(f"    El={El_list[ie]:.3f}  E_mean={E_mean_list[ie]:.4f}  "
+                  f"E_std={E_std_list[ie]:.4f}")
 
         print(f"  [{label}] Rayleigh-Ritz...")
         t0 = time.perf_counter()
@@ -424,24 +575,32 @@ def test_gnn_filter(
         results_list.append(dict(
             label      = label,
             energies   = energies,
+            El_list    = El_list.tolist(),
+            E_mean     = E_mean_list,
+            E_std      = E_std_list,
             rank       = rank,
             t_filter   = t_filter,
             t_rr       = t_rr,
             n_H_filter = n_H_filter,
-            n_H_total  = n_H_filter + rank,
+            n_H_total  = n_H_filter + n_H_rq + rank,
         ))
 
+    # ── k=0 保真度测试 ────────────────────────────────────────────────────────
+    k0_results = _k0_fidelity_test(operators, nodes, an, par, n_grid, El_list)
+
     # ── print comparison table ────────────────────────────────────────────────
-    print(f"\n{'─'*60}")
-    print(f"  {'Method':<10}  {'E[0] (Ha)':>12}  {'T_wall (s)':>10}  "
-          f"{'N_H':>8}  {'rank':>5}")
-    print(f"  {'─'*10}  {'─'*12}  {'─'*10}  {'─'*8}  {'─'*5}")
+    print(f"\n{'─'*72}")
+    print(f"  {'Method':<8}  {'E[0] (Ha)':>12}  {'E_mean[0]':>10}  "
+          f"{'E_std[0]':>9}  {'N_H':>8}  {'rank':>5}")
+    print(f"  {'─'*8}  {'─'*12}  {'─'*10}  {'─'*9}  {'─'*8}  {'─'*5}")
     for r in results_list:
-        ev = r["energies"]
-        e0 = ev[0] if len(ev) > 0 else float("nan")
-        print(f"  {r['label']:<10}  {e0:>12.6f}  "
-              f"{r['t_filter']+r['t_rr']:>10.2f}  {r['n_H_total']:>8}  {r['rank']:>5}")
-    print(f"{'─'*60}")
+        ev    = r["energies"]
+        e0    = ev[0] if len(ev) > 0 else float("nan")
+        em    = r["E_mean"][0] if r["E_mean"] else float("nan")
+        es    = r["E_std"][0]  if r["E_std"]  else float("nan")
+        print(f"  {r['label']:<8}  {e0:>12.6f}  {em:>10.4f}  "
+              f"{es:>9.4f}  {r['n_H_total']:>8}  {r['rank']:>5}")
+    print(f"{'─'*72}")
 
     # ── save results ──────────────────────────────────────────────────────────
     config_meta = dict(
@@ -466,7 +625,7 @@ def test_gnn_filter(
         d_e           = d_e,
         dt            = dt,
     )
-    _save_results(results_list, config_meta, out_dir, ts)
+    _save_results(results_list, config_meta, out_dir, ts, k0_results=k0_results)
 
     # ── eigenvalue plot ───────────────────────────────────────────────────────
     colors = {"GNN": "steelblue", "FD": "tomato", "FD-4": "tomato"}
