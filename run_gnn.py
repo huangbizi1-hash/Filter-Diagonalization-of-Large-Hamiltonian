@@ -54,8 +54,8 @@ def main():
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
-                        choices=["gaussian", "sine"],
-                        help="训练/测试波函数类型（on-the-fly 模式）")
+                        choices=["gaussian", "sine", "pm1"],
+                        help="波函数类型：gaussian/sine 用于训练/测试；pm1 仅用于 gen_dataset")
     parser.add_argument("--k_max", type=int, default=2,
                         help="正弦波最大波数（仅 wf_type=sine 或 gen_dataset 时有效）")
 
