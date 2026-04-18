@@ -9,9 +9,10 @@ The QD potential is reconstructed via GaussianPotentialBuilder at the grid
 spacing d_sparse read from the GNN run's config.json.  N_qd is then derived
 as round(box_extent / d_sparse), making the grid consistent with the training.
 
-When the GNN was trained on the real QD at the same d_sparse the grids match
-and both FD and GNN are compared.  If they differ (e.g., GNN trained on the
-toy Gaussian), GNN is skipped with a note.
+The GNN is a local operator (MLP on nearest-neighbour edges) whose weights
+depend only on the grid spacing d_sparse.  build_gnn_operator now rebuilds
+the graph for the actual N_qd, so the GNN can run on any grid size as long
+as d_sparse matches the training value.
 
 Results are stored as:
   <out_dir>/filter_test_<TIMESTAMP>.json    — full metadata + energies
@@ -367,17 +368,20 @@ def test_gnn_filter(
     fd_h_op.label = f"FD-{fd_order}"
     operators = [("FD", fd_h_op)]
 
-    # GNN: only applicable when grid matches training grid
-    gnn_applicable = (N_qd == N_gnn)
-    if gnn_applicable:
-        print(f"  Building GNN operator (N={N_qd}, model={model_type})...")
+    # GNN: rebuild graph for N_qd; the GNN is a local operator whose MLP weights
+    # depend only on d_sparse, so it generalises to any grid size.
+    gnn_applicable = True
+    if N_qd != N_gnn:
+        print(f"  NOTE: N_qd={N_qd} ≠ N_gnn={N_gnn}  → rebuilding graph for N={N_qd}.")
+    print(f"  Building GNN operator (N={N_qd}, model={model_type})...")
+    try:
         V_qd_flat = pot_grid.potential.ravel().astype(np.float32)
         gnn_h_op  = build_gnn_operator(run_dir, use_fd=False, device=device,
                                         V_ext=V_qd_flat, N_grid=N_qd)
         operators = [("GNN", gnn_h_op)] + operators
-    else:
-        print(f"  NOTE: N_qd={N_qd} ≠ N_gnn={N_gnn}  → GNN skipped.")
-        print(f"        Retrain GNN on real QD with d_sparse={d:.4f} Bohr to enable comparison.")
+    except Exception as exc:
+        print(f"  WARNING: GNN operator failed ({exc}) → GNN skipped.")
+        gnn_applicable = False
 
     # ── filter loop ───────────────────────────────────────────────────────────
     n_grid = N_qd ** 3
