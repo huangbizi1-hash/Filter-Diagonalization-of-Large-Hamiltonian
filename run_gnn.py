@@ -133,11 +133,13 @@ def main():
                         help="test_filter: path to Gaussian fit params JSON "
                              "(default: gaussian_fit_params.json)")
     parser.add_argument("--filter_vmin",     type=float, default=None,
-                        help="test_filter: spectral window lower bound Vmin (Ha); "
-                             "default: -5.0 (real QD)")
+                        help="test_filter: 谱窗口下界 Vmin (Ha)；默认 -5.0（与 --Vmin 等价）")
     parser.add_argument("--filter_de",       type=float, default=None,
-                        help="test_filter: spectral window width dE (Ha); "
-                             "default: 50.0 (real QD)")
+                        help="test_filter: 谱窗口宽度 dE (Ha)；默认 50.0（与 --dE 等价）")
+    parser.add_argument("--Vmin",            type=float, default=None,
+                        help="test_filter: 谱窗口下界（Ha），同 --filter_vmin，与 fft filter 保持一致")
+    parser.add_argument("--dE",              type=float, default=None,
+                        help="test_filter: 谱窗口宽度（Ha），同 --filter_de，与 fft filter 保持一致")
 
     # 其他测试参数
     parser.add_argument("--omega", type=float, default=1.0,
@@ -220,11 +222,14 @@ def main():
         else:
             run_dir = args.run_dir
         from gnn_code.test_filter import test_gnn_filter
+        # --Vmin/--dE 与 --filter_vmin/--filter_de 等价，短名优先
+        vmin_val = args.Vmin if args.Vmin is not None else args.filter_vmin
+        de_val   = args.dE   if args.dE   is not None else args.filter_de
         kw = {}
-        if args.filter_cube   is not None: kw['cube_file']   = args.filter_cube
+        if args.filter_cube is not None: kw['cube_file']   = args.filter_cube
         if args.filter_params is not None: kw['params_file'] = args.filter_params
-        if args.filter_vmin   is not None: kw['vmin']        = args.filter_vmin
-        if args.filter_de     is not None: kw['d_e']         = args.filter_de
+        if vmin_val is not None: kw['vmin'] = vmin_val
+        if de_val   is not None: kw['d_e']  = de_val
         test_gnn_filter(
             run_dir=run_dir,
             nc=args.filter_nc,
