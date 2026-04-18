@@ -552,10 +552,9 @@ def test_gnn_filter(
         t_filter   = time.perf_counter() - t0
         # _apply_filter_all 循环 range(1, nc_true) = nc_true-1 次 H·apply
         n_H_filter = (nc_true - 1) * n_random
-        # +ms*n_random 次来自 Rayleigh 商计算
         n_H_rq     = sum(len(v) for v in E_temp)
-        print(f"  Filtering done: {t_filter:.2f}s  N_H_filter={n_H_filter}  "
-              f"N_H_RQ={n_H_rq}  basis_cols={ms * n_random}")
+        print(f"  Filtering done: {t_filter:.2f}s  N_H={n_H_filter}  "
+              f"(+{n_H_rq} RQ, +rank RR 不计入)  basis_cols={ms * n_random}")
 
         # per-El E_mean / E_std
         E_mean_list = [float(np.mean(E_temp[ie])) if E_temp[ie] else float('nan')
@@ -582,7 +581,7 @@ def test_gnn_filter(
             t_filter   = t_filter,
             t_rr       = t_rr,
             n_H_filter = n_H_filter,
-            n_H_total  = n_H_filter + n_H_rq + rank,
+            n_H_total  = n_H_filter,   # 仅 f(H) 中的 H-apply 次数
         ))
 
     # ── k=0 保真度测试 ────────────────────────────────────────────────────────
