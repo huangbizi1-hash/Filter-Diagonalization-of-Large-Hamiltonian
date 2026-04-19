@@ -45,7 +45,7 @@ def main():
                         choices=["train", "test_baseline", "test_gnn",
                                  "test_fd", "test_ho", "test_gnn_ho",
                                  "gen_dataset", "test_filter", "benchmark",
-                                 "timing", "all"],
+                                 "timing", "stability", "fd_compare", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
                              "test_ho: HO ground state correctness test (no PyTorch); "
                              "test_gnn_ho: HO ground state test with GNN comparison "
@@ -53,7 +53,9 @@ def main():
                              "gen_dataset: generate fixed k-grid sine-wave dataset; "
                              "test_filter: filter diagonalization with GNN vs FD on sparse grid; "
                              "benchmark: compare multiple GNN models (--run_dirs) vs FFT/FD baseline; "
-                             "timing: measure single H-apply time for all architectures (no training)")
+                             "timing: measure single H-apply time for all architectures (no training); "
+                             "stability: test how many repeated H-applies until NaN/Inf (--run_dirs); "
+                             "fd_compare: FD orders 2/4/6/8/10 vs FFT — time + accuracy on QD")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
@@ -160,25 +162,35 @@ def main():
                         help="test_gnn / test_filter 模式下指定已有 run 目录；"
                              "不指定则自动选最新 run")
     parser.add_argument("--run_dirs", nargs="+", default=None,
-                        help="benchmark 模式：要比较的 GNN run 目录列表，"
+                        help="benchmark / stability 模式：要比较的 GNN run 目录列表，"
                              "例如 gnn_models/chain1_teacher gnn_models/chain2_teacher")
     parser.add_argument("--n_timing_reps", type=int, default=20,
                         help="benchmark 模式：单次 H-apply 计时重复次数（取中位数）")
 
     # timing 模式专用参数
-    parser.add_argument("--timing_hidden_dims", type=int, nargs="+",
-                        default=[8, 16, 32, 64, 128, 256],
-                        help="timing 模式：测试的 hidden_dim 列表（GNN-cube / GNN-cross）")
-    parser.add_argument("--timing_radial_hidden_dims", type=int, nargs="+",
-                        default=None,
-                        help="timing 模式：SO3 radial_hidden_dim 列表；"
-                             "不指定则与 --timing_hidden_dims 相同")
+    parser.add_argument("--timing_hidden_dim", type=int, default=64,
+                        help="timing 模式：所有 GNN 架构使用的 hidden_dim（默认 64）")
+    parser.add_argument("--timing_radial_hidden_dim", type=int, default=32,
+                        help="timing 模式：SO3HamiltonianNet 使用的 radial_hidden_dim（默认 32）")
+    parser.add_argument("--timing_fd_orders", type=int, nargs="+",
+                        default=[2, 4, 6, 8],
+                        help="timing 模式：cross 架构测试的 fd_order 列表（默认 2 4 6 8）")
+    parser.add_argument("--timing_n_cos", type=int, nargs="+",
+                        default=[1, 3, 3, 5],
+                        help="timing 模式：与 --timing_fd_orders 配对的 n_co 列表（默认 1 3 3 5）")
     parser.add_argument("--timing_n_reps", type=int, default=100,
                         help="timing 模式：计时重复次数（均值，默认 100）")
     parser.add_argument("--timing_n_warmup", type=int, default=10,
                         help="timing 模式：热身次数（不计入统计，默认 10）")
     parser.add_argument("--timing_description", type=str, default="",
-                        help="timing 模式：写入 JSON description 字段的说明文字")
+                        help="timing / stability 模式：写入 JSON description 字段的说明文字")
+    parser.add_argument("--stability_max_steps", type=int, default=200,
+                        help="stability 模式：最多重复作用 H 的次数（默认 200）")
+
+    # fd_compare 模式专用参数
+    parser.add_argument("--fd_compare_orders", type=int, nargs="+",
+                        default=[2, 4, 6, 8, 10],
+                        help="fd_compare 模式：测试的 FD 阶数列表（默认 2 4 6 8 10）")
 
     args = parser.parse_args()
 
@@ -304,13 +316,50 @@ def main():
         time_h_apply(
             n_reps             = args.timing_n_reps,
             n_warmup           = args.timing_n_warmup,
-            hidden_dims        = args.timing_hidden_dims,
-            radial_hidden_dims = args.timing_radial_hidden_dims,
-            fd_order           = args.fd_order,
-            n_co               = args.n_co,
+            hidden_dim         = args.timing_hidden_dim,
+            radial_hidden_dim  = args.timing_radial_hidden_dim,
+            fd_orders          = args.timing_fd_orders,
+            n_cos              = args.timing_n_cos,
             device             = args.device,
             output_root        = OUTPUT_ROOT,
             description        = args.timing_description,
+            **kw,
+        )
+        return
+
+    # ── fd_compare 模式：FD 阶数 vs FFT 时间与精度对比 ──
+    if args.mode == "fd_compare":
+        from gnn_code.fd_benchmark import fd_accuracy_timing
+        kw = {}
+        if args.filter_cube   is not None: kw["cube_file"]   = args.filter_cube
+        if args.filter_params is not None: kw["params_file"] = args.filter_params
+        fd_accuracy_timing(
+            fd_orders   = args.fd_compare_orders,
+            n_reps      = args.timing_n_reps,
+            n_warmup    = args.timing_n_warmup,
+            device      = args.device,
+            output_root = OUTPUT_ROOT,
+            description = args.timing_description,
+            **kw,
+        )
+        return
+
+    # ── stability 模式：重复 H-apply NaN 检测 ──
+    if args.mode == "stability":
+        if not args.run_dirs:
+            raise ValueError(
+                "--run_dirs 必须指定至少一个 GNN run 目录，"
+                "例如：--run_dirs gnn_models/chain4_auto_bptt_false")
+        from gnn_code.stability_test import nan_stability_test
+        kw = {}
+        if args.filter_cube   is not None: kw["cube_file"]   = args.filter_cube
+        if args.filter_params is not None: kw["params_file"] = args.filter_params
+        nan_stability_test(
+            run_dirs    = args.run_dirs,
+            max_steps   = args.stability_max_steps,
+            device      = args.device,
+            output_root = OUTPUT_ROOT,
+            description = args.timing_description,
             **kw,
         )
         return

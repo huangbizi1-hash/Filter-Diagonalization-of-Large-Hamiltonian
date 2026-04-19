@@ -1,27 +1,26 @@
 """
-gnn_code/timing_benchmark.py — H-apply 计时基准
+gnn_code/timing_benchmark.py — Architecture comparison: H-apply wall time
 
-比较不同 H 实现在 QD 上作用一次 H 的耗时（不需要训练好的模型）：
+比较不同架构 GNN/FD/FFT 在 QD 上单次 H-apply 的平均耗时。
 
-  · FFT（细网格，d_fine = d_coarse/2）：精确参照，结果输出为水平虚线
-  · FD-cube   ：FiniteDiffHamiltonian，3×3×3 Mehrstellen，0 参数
-  · FD-cross  ：FiniteDiffHamiltonian_Cross，高阶十字星，0 参数
-  · GNN-cube  ：HamiltonianGNN，hidden_dim 可变
-  · GNN-cross ：HamiltonianGNN_Cross，hidden_dim 可变
-  · SO3-cross ：SO3HamiltonianNet，radial_hidden_dim 可变
-
-模型使用随机初始化权重（eval 模式），不加载 checkpoint。
-每种配置先热身 n_warmup 次，再计时 n_reps 次，取均值与标准差。
+固定 hidden_dim 与 radial_hidden_dim，随机初始权重（无需训练）。
+对以下架构各自计时（coarse grid，d = d_sparse）：
+  · gnn-cube             : HamiltonianGNN    (3×3×3 Mehrstellen, 26 近邻)
+  · fd-cube              : FiniteDiffHamiltonian    (同图，0 参数)
+  · gnn-cross(pP,cC)     : HamiltonianGNN_Cross     (fd_order=P, n_co=C)
+  · fd-cross(pP,cC)      : FiniteDiffHamiltonian_Cross (同图，0 参数)
+  · so3-cross(pP,cC)     : SO3HamiltonianNet         (同图，l=0+l=1 修正)
+  · fft-fine             : FFT (d = d_sparse/2)，作为水平参考虚线
 
 用法（通过 run_gnn.py）：
     python run_gnn.py --mode timing \\
-        --timing_hidden_dims 8 16 32 64 128 256 \\
-        --timing_n_reps 100 --timing_n_warmup 10 \\
-        --device cpu \\
-        --timing_description "cube vs cross vs so3 on QD"
-
-输出：
-    <output_root>/timing_<timestamp>.json
+        --timing_hidden_dim 64 \\
+        --timing_radial_hidden_dim 32 \\
+        --timing_fd_orders 2 4 6 8 \\
+        --timing_n_cos 1 3 3 5 \\
+        --timing_n_reps 100 \\
+        --timing_n_warmup 10 \\
+        --timing_description "architecture comparison on QD"
 """
 
 import datetime
@@ -33,326 +32,337 @@ import numpy as np
 import torch
 
 from .physics import d_sparse
-from .graph import build_graph, build_star_graph
-from .model import (
-    HamiltonianGNN, FiniteDiffHamiltonian,
-    HamiltonianGNN_Cross, FiniteDiffHamiltonian_Cross,
-    SO3HamiltonianNet,
-)
-from .test_filter import (
-    _DEFAULT_CUBE, _DEFAULT_PARAMS,
-    _load_qd_potential, _build_fft_qd_operator,
-)
+from .graph   import build_graph, build_star_graph
+from .model   import (HamiltonianGNN,       FiniteDiffHamiltonian,
+                      HamiltonianGNN_Cross, FiniteDiffHamiltonian_Cross,
+                      SO3HamiltonianNet)
+from .test_filter import _DEFAULT_CUBE, _DEFAULT_PARAMS, _load_qd_potential
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 工具
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _count_params(model) -> int:
-    if model is None:
-        return 0
-    if isinstance(model, torch.nn.Module):
-        return sum(p.numel() for p in model.parameters())
-    return 0
+def _count_params(model: torch.nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
 
 
-def _sync(device):
-    if device.type == "cuda":
-        torch.cuda.synchronize()
+def _time_fn(fn, psi: torch.Tensor, n_reps: int, n_warmup: int,
+             device: torch.device) -> tuple:
+    """Run fn(psi) n_warmup+n_reps times; return (mean_ms, std_ms)."""
+    is_cuda = device.type == 'cuda'
 
-
-def _time_fn(fn, n_reps: int, n_warmup: int, device: torch.device):
-    """
-    Call fn() n_warmup times (discard), then n_reps times (record wall time).
-    Returns (mean_s, std_s, list_of_times_s).
-    """
     for _ in range(n_warmup):
-        fn()
-    _sync(device)
+        with torch.no_grad():
+            fn(psi)
+    if is_cuda:
+        torch.cuda.synchronize()
 
     times = []
     for _ in range(n_reps):
-        _sync(device)
+        if is_cuda:
+            torch.cuda.synchronize()
         t0 = time.perf_counter()
-        fn()
-        _sync(device)
-        times.append(time.perf_counter() - t0)
+        with torch.no_grad():
+            fn(psi)
+        if is_cuda:
+            torch.cuda.synchronize()
+        times.append((time.perf_counter() - t0) * 1000.0)
 
-    return float(np.mean(times)), float(np.std(times)), [float(t) for t in times]
+    return float(np.mean(times)), float(np.std(times))
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 主函数
-# ─────────────────────────────────────────────────────────────────────────────
 
 def time_h_apply(
-    n_reps:              int   = 100,
-    n_warmup:            int   = 10,
-    hidden_dims:         list  = None,
-    radial_hidden_dims:  list  = None,
-    fd_order:            int   = 4,
-    n_co:                int   = 3,
-    device:              str   = "cpu",
-    cube_file:           str   = _DEFAULT_CUBE,
-    params_file:         str   = _DEFAULT_PARAMS,
-    d_coarse:            float = None,
-    output_root:         str   = ".",
-    description:         str   = "",
+    n_reps:            int   = 100,
+    n_warmup:          int   = 10,
+    hidden_dim:        int   = 64,
+    radial_hidden_dim: int   = 32,
+    fd_orders:         list  = None,
+    n_cos:             list  = None,
+    device:            str   = 'cpu',
+    cube_file:         str   = _DEFAULT_CUBE,
+    params_file:       str   = _DEFAULT_PARAMS,
+    output_root:       str   = '.',
+    description:       str   = '',
 ):
     """
-    Measure single H-apply wall time for all model architectures.
+    Benchmark single H-apply time across architectures with fixed hidden_dim.
 
     Parameters
     ----------
-    n_reps             : timing repetitions (after warmup)
-    n_warmup           : warmup calls before timing
-    hidden_dims        : list of hidden_dim values for GNN-cube / GNN-cross
-    radial_hidden_dims : list of radial_hidden_dim for SO3; defaults to hidden_dims
-    fd_order           : FD accuracy order for cross/SO3 graphs
-    n_co               : correction cube side length for cross/SO3 graphs
-    device             : 'cpu' or 'cuda'
-    d_coarse           : grid spacing for GNN/FD; None → use d_sparse from physics.py
-    output_root        : directory for output JSON
-    description        : free-text description stored in JSON
+    fd_orders : fd_order values for cross-type configs (default [2, 4, 6, 8])
+    n_cos     : paired n_co values, same length as fd_orders (default [1,3,3,5])
     """
-    if hidden_dims is None:
-        hidden_dims = [8, 16, 32, 64, 128, 256]
-    if radial_hidden_dims is None:
-        radial_hidden_dims = hidden_dims
+    if fd_orders is None:
+        fd_orders = [2, 4, 6, 8]
+    if n_cos is None:
+        n_cos = [1, 3, 3, 5]
+    if len(fd_orders) != len(n_cos):
+        raise ValueError("fd_orders and n_cos must have the same length")
 
-    d_coarse = d_coarse if d_coarse is not None else d_sparse
-    d_fine   = d_coarse / 2.0
-
-    dev = (torch.device("cuda") if device == "cuda" and torch.cuda.is_available()
-           else torch.device("cpu"))
     ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(output_root)
     out_dir.mkdir(parents=True, exist_ok=True)
+    dev     = torch.device(device if device != 'auto' else
+                           ('cuda' if torch.cuda.is_available() else 'cpu'))
 
-    print(f"\n{'='*64}")
-    print(f"  H-apply timing benchmark")
-    print(f"  d_coarse={d_coarse}  d_fine={d_fine}  device={dev}")
-    print(f"  n_reps={n_reps}  n_warmup={n_warmup}")
-    print(f"{'='*64}")
+    print(f"\n{'='*62}")
+    print(f"  Timing benchmark — architecture comparison")
+    print(f"  hidden_dim={hidden_dim}  radial_hidden_dim={radial_hidden_dim}")
+    print(f"  n_reps={n_reps}  n_warmup={n_warmup}  device={dev}")
+    print(f"{'='*62}")
 
-    # ── QD 势能（粗/细两套网格） ───────────────────────────────────────────
+    # ── Coarse QD grid ────────────────────────────────────────────────────────
     print("\n  Loading QD potential (coarse grid)...")
-    pot_coarse, N_qd, d_actual_c = _load_qd_potential(
-        d_coarse, cube_file=cube_file, params_file=params_file)
-    n_grid_c = N_qd ** 3
-    V_flat_c = pot_coarse.potential.ravel().astype(np.float32)
-    V_3d_c   = pot_coarse.potential.reshape(N_qd, N_qd, N_qd)
+    pot_c, N_c, d_c = _load_qd_potential(
+        d_sparse, cube_file=cube_file, params_file=params_file)
+    n_c     = N_c ** 3
+    V_flat_c = pot_c.potential.ravel().astype(np.float32)
+    grid_L_c = N_c * d_c
 
-    print("\n  Loading QD potential (fine grid)...")
-    pot_fine, N_qd_f, d_actual_f = _load_qd_potential(
+    # ── Fine QD grid (FFT reference) ──────────────────────────────────────────
+    d_fine = d_c / 2.0
+    print(f"\n  Loading QD potential (fine grid, d={d_fine:.4f} Bohr)...")
+    pot_f, N_f, d_f = _load_qd_potential(
         d_fine, cube_file=cube_file, params_file=params_file)
-    n_grid_f = N_qd_f ** 3
-    V_3d_f   = pot_fine.potential.reshape(N_qd_f, N_qd_f, N_qd_f)
+    n_f = N_f ** 3
 
-    print(f"\n  Coarse grid: N={N_qd}  n_grid={n_grid_c:,}  d_actual={d_actual_c:.4f}")
-    print(f"  Fine   grid: N={N_qd_f}  n_grid={n_grid_f:,}  d_actual={d_actual_f:.4f}")
+    # ── Random test vectors ───────────────────────────────────────────────────
+    rng   = np.random.default_rng(42)
+    psi_c = torch.tensor(rng.standard_normal(n_c).astype(np.float32),
+                         dtype=torch.float32, device=dev).unsqueeze(-1)
+    psi_f = torch.tensor(rng.standard_normal(n_f).astype(np.float32),
+                         dtype=torch.float32, device=dev).unsqueeze(-1)
 
-    # ── 预先构建图结构 ─────────────────────────────────────────────────────
-    grid_L_c = N_qd   * d_actual_c
-    grid_L_f = N_qd_f * d_actual_f
+    V_t_c = torch.tensor(V_flat_c, dtype=torch.float32).unsqueeze(-1).to(dev)
 
-    print("\n  Building cube graph (coarse)...")
-    ei_cube, ea_cube = build_graph(N=N_qd, d=d_actual_c, grid_L=grid_L_c)
-    ei_cube = ei_cube.to(dev); ea_cube = ea_cube.to(dev)
+    methods  = []
+    fft_ref  = None
 
-    print("  Building star graph (coarse)...")
-    fd_ei, fd_ea, co_ei, co_ea = build_star_graph(
-        fd_order, n_co, N=N_qd, d=d_actual_c, grid_L=grid_L_c)
-    fd_ei = fd_ei.to(dev); fd_ea = fd_ea.to(dev)
-    co_ei = co_ei.to(dev); co_ea = co_ea.to(dev)
+    # ── FFT fine grid (reference) ─────────────────────────────────────────────
+    try:
+        from fft_code.hamiltonian import apply_H as _fft_apply_H
+        V_3d_f = pot_f.potential.astype(np.float32)
+        kx = np.fft.fftfreq(N_f, d=d_f) * 2 * np.pi
+        ky = np.fft.fftfreq(N_f, d=d_f) * 2 * np.pi
+        kz = np.fft.fftfreq(N_f, d=d_f) * 2 * np.pi
+        KX, KY, KZ = np.meshgrid(kx, ky, kz, indexing='ij')
+        T_k = (KX**2 + KY**2 + KZ**2) / 2.0
 
-    V_t = torch.tensor(V_flat_c, dtype=torch.float32).unsqueeze(-1).to(dev)
+        def _fft_fn(psi_t):
+            psi_np = psi_t.cpu().numpy().reshape(N_f, N_f, N_f)
+            out_np = _fft_apply_H(psi_np, T_k, V_3d_f)
+            return torch.tensor(out_np.ravel(), dtype=torch.float32,
+                                device=dev).unsqueeze(-1)
 
-    # ── 随机测试向量 ───────────────────────────────────────────────────────
-    rng     = np.random.default_rng(42)
-    psi_np  = rng.standard_normal(n_grid_c).astype(np.float32)
-    psi_np /= np.linalg.norm(psi_np)
-    psi_t   = torch.tensor(psi_np, dtype=torch.float32).unsqueeze(-1).to(dev)
+        t_mean, t_std = _time_fn(_fft_fn, psi_f, n_reps, n_warmup, dev)
+        fft_ref = {
+            "label":     "fft-fine",
+            "N_grid":    N_f,
+            "n_grid":    n_f,
+            "d_bohr":    float(d_f),
+            "t_mean_ms": t_mean,
+            "t_std_ms":  t_std,
+        }
+        print(f"\n  [fft-fine]  N={N_f}  n_grid={n_f:,}"
+              f"  t={t_mean:.3f}±{t_std:.3f} ms")
+    except Exception as exc:
+        fft_ref = {"label": "fft-fine", "error": str(exc)}
+        print(f"\n  [fft-fine] SKIP: {exc}")
 
-    psi_f_np  = rng.standard_normal(n_grid_f).astype(np.float32)
-    psi_f_np /= np.linalg.norm(psi_f_np)
+    # ── Cube architectures ────────────────────────────────────────────────────
+    print(f"\n  Building cube graph (N={N_c})...")
+    ei_c, ea_c = build_graph(N=N_c, d=d_c, grid_L=grid_L_c)
+    ei_c = ei_c.to(dev); ea_c = ea_c.to(dev)
+    n_cube_edges = ei_c.shape[1]
 
-    results = []  # list of dicts
+    # gnn-cube
+    model_gcube = HamiltonianGNN(hidden_dim=hidden_dim).to(dev)
+    model_gcube.eval()
+    n_p_gcube = _count_params(model_gcube)
 
-    # ── FFT 细网格（参照） ─────────────────────────────────────────────────
-    print("\n  [FFT-fine] building & timing...")
-    fft_op = _build_fft_qd_operator(V_3d_f, N_qd_f, d_actual_f)
-    t_mean, t_std, t_all = _time_fn(
-        lambda: fft_op.matvec(psi_f_np), n_reps, n_warmup, dev)
-    results.append({
-        "label":       "FFT-fine",
-        "type":        "FFT",
-        "grid":        "fine",
-        "n_grid":      n_grid_f,
-        "n_params":    0,
+    def _fn_gnn_cube(psi):
+        nrm = torch.norm(psi) + 1e-30
+        return model_gcube(psi / nrm, ei_c, ea_c, V_t_c) * nrm
+
+    t_mean, t_std = _time_fn(_fn_gnn_cube, psi_c, n_reps, n_warmup, dev)
+    r = {
+        "label":       "gnn-cube",
+        "model_type":  "gnn",
+        "graph_type":  "cube",
+        "fd_order":    None,
+        "n_co":        None,
+        "hidden_dim":  hidden_dim,
+        "n_params":    n_p_gcube,
+        "n_fd_edges":  n_cube_edges,
+        "n_co_edges":  0,
+        "t_mean_ms":   t_mean,
+        "t_std_ms":    t_std,
+    }
+    methods.append(r)
+    print(f"  [gnn-cube]  n_params={n_p_gcube}  edges={n_cube_edges:,}"
+          f"  t={t_mean:.3f}±{t_std:.3f} ms")
+
+    # fd-cube
+    fd_cube = FiniteDiffHamiltonian(ei_c, ea_c, V_t_c, dev)
+
+    def _fn_fd_cube(psi):
+        return fd_cube(psi)
+
+    t_mean, t_std = _time_fn(_fn_fd_cube, psi_c, n_reps, n_warmup, dev)
+    r = {
+        "label":       "fd-cube",
+        "model_type":  "fd",
+        "graph_type":  "cube",
+        "fd_order":    None,
+        "n_co":        None,
         "hidden_dim":  None,
-        "t_mean_ms":   t_mean * 1e3,
-        "t_std_ms":    t_std  * 1e3,
-        "t_all_ms":    [t * 1e3 for t in t_all],
-    })
-    print(f"    {t_mean*1e3:.2f} ± {t_std*1e3:.2f} ms")
+        "n_params":    0,
+        "n_fd_edges":  n_cube_edges,
+        "n_co_edges":  0,
+        "t_mean_ms":   t_mean,
+        "t_std_ms":    t_std,
+    }
+    methods.append(r)
+    print(f"  [fd-cube]   n_params=0         edges={n_cube_edges:,}"
+          f"  t={t_mean:.3f}±{t_std:.3f} ms")
 
-    # ── FD-cube（无参数） ──────────────────────────────────────────────────
-    print("\n  [FD-cube] timing...")
-    fd_cube = FiniteDiffHamiltonian(ei_cube, ea_cube, V_t, dev)
-    t_mean, t_std, t_all = _time_fn(
-        lambda: fd_cube(psi_t), n_reps, n_warmup, dev)
-    results.append({
-        "label":      "FD-cube",
-        "type":       "FD",
-        "grid":       "coarse",
-        "n_grid":     n_grid_c,
-        "n_params":   0,
-        "hidden_dim": None,
-        "t_mean_ms":  t_mean * 1e3,
-        "t_std_ms":   t_std  * 1e3,
-        "t_all_ms":   [t * 1e3 for t in t_all],
-    })
-    print(f"    {t_mean*1e3:.2f} ± {t_std*1e3:.2f} ms")
+    # ── Cross architectures ───────────────────────────────────────────────────
+    for fd_order, n_co in zip(fd_orders, n_cos):
+        print(f"\n  Building cross graph (N={N_c}, fd_order={fd_order}, n_co={n_co})...")
+        try:
+            fd_ei, fd_ea, co_ei, co_ea = build_star_graph(
+                fd_order, n_co, N=N_c, d=d_c, grid_L=grid_L_c)
+            fd_ei = fd_ei.to(dev); fd_ea = fd_ea.to(dev)
+            co_ei = co_ei.to(dev); co_ea = co_ea.to(dev)
+            n_fd_e = fd_ei.shape[1]
+            n_co_e = co_ei.shape[1]
+            print(f"  fd_edges={n_fd_e:,}  co_edges={n_co_e:,}")
+        except Exception as exc:
+            print(f"  ERROR building graph: {exc}")
+            for arch in ("gnn-cross", "fd-cross", "so3-cross"):
+                methods.append({
+                    "label":      f"{arch}(p{fd_order},c{n_co})",
+                    "model_type": arch,
+                    "graph_type": "cross",
+                    "fd_order":   fd_order,
+                    "n_co":       n_co,
+                    "error":      str(exc),
+                })
+            continue
 
-    # ── FD-cross（无参数） ─────────────────────────────────────────────────
-    print("\n  [FD-cross] timing...")
-    fd_cross = FiniteDiffHamiltonian_Cross(fd_ei, fd_ea, V_t, dev)
-    t_mean, t_std, t_all = _time_fn(
-        lambda: fd_cross(psi_t), n_reps, n_warmup, dev)
-    results.append({
-        "label":      "FD-cross",
-        "type":       "FD",
-        "grid":       "coarse",
-        "n_grid":     n_grid_c,
-        "n_params":   0,
-        "hidden_dim": None,
-        "t_mean_ms":  t_mean * 1e3,
-        "t_std_ms":   t_std  * 1e3,
-        "t_all_ms":   [t * 1e3 for t in t_all],
-    })
-    print(f"    {t_mean*1e3:.2f} ± {t_std*1e3:.2f} ms")
+        # gnn-cross
+        model_gx = HamiltonianGNN_Cross(hidden_dim=hidden_dim).to(dev)
+        model_gx.eval()
+        n_p_gx = _count_params(model_gx)
 
-    # ── GNN-cube（随机初始化，hidden_dim 可变） ────────────────────────────
-    for h in hidden_dims:
-        label = f"GNN-cube-h{h}"
-        print(f"\n  [{label}] building & timing...")
-        model = HamiltonianGNN(hidden_dim=h).to(dev)
-        model.eval()
-        n_p = _count_params(model)
+        def _fn_gnn_cross(psi, _m=model_gx):
+            nrm = torch.norm(psi) + 1e-30
+            return _m(psi / nrm, fd_ei, fd_ea, co_ei, co_ea, V_t_c) * nrm
 
-        def _fn_cube(m=model):
-            with torch.no_grad():
-                nrm = torch.norm(psi_t) + 1e-30
-                return m(psi_t / nrm, ei_cube, ea_cube, V_t) * nrm
+        t_mean, t_std = _time_fn(_fn_gnn_cross, psi_c, n_reps, n_warmup, dev)
+        r = {
+            "label":       f"gnn-cross(p{fd_order},c{n_co})",
+            "model_type":  "gnn-cross",
+            "graph_type":  "cross",
+            "fd_order":    fd_order,
+            "n_co":        n_co,
+            "hidden_dim":  hidden_dim,
+            "n_params":    n_p_gx,
+            "n_fd_edges":  n_fd_e,
+            "n_co_edges":  n_co_e,
+            "t_mean_ms":   t_mean,
+            "t_std_ms":    t_std,
+        }
+        methods.append(r)
+        print(f"  [gnn-cross(p{fd_order},c{n_co})]  n_params={n_p_gx}"
+              f"  t={t_mean:.3f}±{t_std:.3f} ms")
 
-        t_mean, t_std, t_all = _time_fn(_fn_cube, n_reps, n_warmup, dev)
-        results.append({
-            "label":      label,
-            "type":       "GNN-cube",
-            "grid":       "coarse",
-            "n_grid":     n_grid_c,
-            "n_params":   n_p,
-            "hidden_dim": h,
-            "t_mean_ms":  t_mean * 1e3,
-            "t_std_ms":   t_std  * 1e3,
-            "t_all_ms":   [t * 1e3 for t in t_all],
-        })
-        print(f"    n_params={n_p}  {t_mean*1e3:.2f} ± {t_std*1e3:.2f} ms")
+        # fd-cross
+        fd_cross = FiniteDiffHamiltonian_Cross(fd_ei, fd_ea, V_t_c, dev)
 
-    # ── GNN-cross（随机初始化，hidden_dim 可变） ───────────────────────────
-    for h in hidden_dims:
-        label = f"GNN-cross-h{h}"
-        print(f"\n  [{label}] building & timing...")
-        model = HamiltonianGNN_Cross(hidden_dim=h).to(dev)
-        model.eval()
-        n_p = _count_params(model)
+        def _fn_fd_cross(psi, _fd=fd_cross):
+            return _fd(psi)
 
-        def _fn_cross(m=model):
-            with torch.no_grad():
-                nrm = torch.norm(psi_t) + 1e-30
-                return m(psi_t / nrm, fd_ei, fd_ea, co_ei, co_ea, V_t) * nrm
+        t_mean, t_std = _time_fn(_fn_fd_cross, psi_c, n_reps, n_warmup, dev)
+        r = {
+            "label":       f"fd-cross(p{fd_order},c{n_co})",
+            "model_type":  "fd-cross",
+            "graph_type":  "cross",
+            "fd_order":    fd_order,
+            "n_co":        n_co,
+            "hidden_dim":  None,
+            "n_params":    0,
+            "n_fd_edges":  n_fd_e,
+            "n_co_edges":  0,
+            "t_mean_ms":   t_mean,
+            "t_std_ms":    t_std,
+        }
+        methods.append(r)
+        print(f"  [fd-cross(p{fd_order},c{n_co})]   n_params=0"
+              f"  t={t_mean:.3f}±{t_std:.3f} ms")
 
-        t_mean, t_std, t_all = _time_fn(_fn_cross, n_reps, n_warmup, dev)
-        results.append({
-            "label":      label,
-            "type":       "GNN-cross",
-            "grid":       "coarse",
-            "n_grid":     n_grid_c,
-            "n_params":   n_p,
-            "hidden_dim": h,
-            "t_mean_ms":  t_mean * 1e3,
-            "t_std_ms":   t_std  * 1e3,
-            "t_all_ms":   [t * 1e3 for t in t_all],
-        })
-        print(f"    n_params={n_p}  {t_mean*1e3:.2f} ± {t_std*1e3:.2f} ms")
+        # so3-cross
+        model_so3 = SO3HamiltonianNet(radial_hidden_dim=radial_hidden_dim).to(dev)
+        model_so3.eval()
+        n_p_so3 = _count_params(model_so3)
 
-    # ── SO3-cross（随机初始化，radial_hidden_dim 可变） ────────────────────
-    for rh in radial_hidden_dims:
-        label = f"SO3-cross-rh{rh}"
-        print(f"\n  [{label}] building & timing...")
-        model = SO3HamiltonianNet(radial_hidden_dim=rh).to(dev)
-        model.eval()
-        n_p = _count_params(model)
+        def _fn_so3(psi, _m=model_so3):
+            nrm = torch.norm(psi) + 1e-30
+            return _m(psi / nrm, fd_ei, fd_ea, co_ei, co_ea, V_t_c) * nrm
 
-        def _fn_so3(m=model):
-            with torch.no_grad():
-                nrm = torch.norm(psi_t) + 1e-30
-                return m(psi_t / nrm, fd_ei, fd_ea, co_ei, co_ea, V_t) * nrm
+        t_mean, t_std = _time_fn(_fn_so3, psi_c, n_reps, n_warmup, dev)
+        r = {
+            "label":            f"so3-cross(p{fd_order},c{n_co})",
+            "model_type":       "so3",
+            "graph_type":       "cross",
+            "fd_order":         fd_order,
+            "n_co":             n_co,
+            "radial_hidden_dim": radial_hidden_dim,
+            "n_params":         n_p_so3,
+            "n_fd_edges":       n_fd_e,
+            "n_co_edges":       n_co_e,
+            "t_mean_ms":        t_mean,
+            "t_std_ms":         t_std,
+        }
+        methods.append(r)
+        print(f"  [so3-cross(p{fd_order},c{n_co})]  n_params={n_p_so3}"
+              f"  t={t_mean:.3f}±{t_std:.3f} ms")
 
-        t_mean, t_std, t_all = _time_fn(_fn_so3, n_reps, n_warmup, dev)
-        results.append({
-            "label":          label,
-            "type":           "SO3-cross",
-            "grid":           "coarse",
-            "n_grid":         n_grid_c,
-            "n_params":       n_p,
-            "radial_hidden_dim": rh,
-            "hidden_dim":     None,
-            "t_mean_ms":      t_mean * 1e3,
-            "t_std_ms":       t_std  * 1e3,
-            "t_all_ms":       [t * 1e3 for t in t_all],
-        })
-        print(f"    n_params={n_p}  {t_mean*1e3:.2f} ± {t_std*1e3:.2f} ms")
+    # ── Summary table ─────────────────────────────────────────────────────────
+    print(f"\n{'─'*70}")
+    print(f"  {'Label':<34} {'n_params':>10}  {'t_mean_ms':>10}  {'t_std_ms':>9}")
+    print(f"  {'─'*34} {'─'*10}  {'─'*10}  {'─'*9}")
+    if fft_ref and 't_mean_ms' in fft_ref:
+        print(f"  {'fft-fine (reference)':<34} {'—':>10}  "
+              f"{fft_ref['t_mean_ms']:>10.3f}  {fft_ref['t_std_ms']:>9.3f}")
+    for m in methods:
+        if 'error' in m:
+            print(f"  {m['label']:<34}  ERROR: {m['error']}")
+        else:
+            np_str = str(m.get('n_params', 0))
+            print(f"  {m['label']:<34} {np_str:>10}  "
+                  f"{m['t_mean_ms']:>10.3f}  {m['t_std_ms']:>9.3f}")
+    print(f"{'─'*70}")
 
-    # ── 汇总打印 ───────────────────────────────────────────────────────────
-    fft_t = next((r["t_mean_ms"] for r in results if r["label"] == "FFT-fine"), float("nan"))
-    print(f"\n{'─'*72}")
-    print(f"  {'Label':<26} {'n_params':>9} {'t_mean(ms)':>11} {'t/FFT':>7}")
-    print(f"  {'─'*26} {'─'*9} {'─'*11} {'─'*7}")
-    for r in results:
-        ratio = r["t_mean_ms"] / fft_t if fft_t > 0 else float("nan")
-        print(f"  {r['label']:<26} {r['n_params']:>9} "
-              f"{r['t_mean_ms']:>11.3f} {ratio:>7.3f}")
-    print(f"{'─'*72}")
-
-    # ── 保存 JSON ──────────────────────────────────────────────────────────
+    # ── Save JSON ─────────────────────────────────────────────────────────────
     output = {
         "description": description,
-        "script":   "gnn_code/timing_benchmark.py",
-        "datetime": datetime.datetime.now().isoformat(),
+        "script":      "gnn_code/timing_benchmark.py",
+        "datetime":    datetime.datetime.now().isoformat(),
         "config": {
-            "d_coarse":          d_coarse,
-            "d_fine":            d_fine,
-            "d_actual_coarse":   float(d_actual_c),
-            "d_actual_fine":     float(d_actual_f),
-            "N_qd_coarse":       N_qd,
-            "N_qd_fine":         N_qd_f,
-            "n_grid_coarse":     n_grid_c,
-            "n_grid_fine":       n_grid_f,
-            "fd_order":          fd_order,
-            "n_co":              n_co,
             "n_reps":            n_reps,
             "n_warmup":          n_warmup,
+            "hidden_dim":        hidden_dim,
+            "radial_hidden_dim": radial_hidden_dim,
+            "fd_orders_tested":  fd_orders,
+            "n_cos_tested":      n_cos,
             "device":            str(dev),
-            "hidden_dims":       hidden_dims,
-            "radial_hidden_dims": radial_hidden_dims,
-            "fft_fine_t_mean_ms": fft_t,
+            "N_qd_coarse":       N_c,
+            "d_coarse_bohr":     float(d_c),
+            "n_grid_coarse":     n_c,
+            "N_qd_fine":         N_f,
+            "d_fine_bohr":       float(d_f),
+            "n_grid_fine":       n_f,
         },
-        "fft_fine_reference": next(
-            (r for r in results if r["label"] == "FFT-fine"), {}),
-        "methods": [r for r in results if r["label"] != "FFT-fine"],
+        "fft_fine_reference": fft_ref,
+        "methods":             methods,
     }
 
     json_path = out_dir / f"timing_{ts}.json"
