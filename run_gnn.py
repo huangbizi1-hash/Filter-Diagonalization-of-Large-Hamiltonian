@@ -45,7 +45,7 @@ def main():
                         choices=["train", "test_baseline", "test_gnn",
                                  "test_fd", "test_ho", "test_gnn_ho",
                                  "gen_dataset", "test_filter", "benchmark",
-                                 "timing", "stability", "fd_compare", "all"],
+                                 "timing", "stability", "fd_compare", "compare", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
                              "test_ho: HO ground state correctness test (no PyTorch); "
                              "test_gnn_ho: HO ground state test with GNN comparison "
@@ -55,7 +55,8 @@ def main():
                              "benchmark: compare multiple GNN models (--run_dirs) vs FFT/FD baseline; "
                              "timing: measure single H-apply time for all architectures (no training); "
                              "stability: test how many repeated H-applies until NaN/Inf (--run_dirs); "
-                             "fd_compare: FD orders 2/4/6/8/10 vs FFT — time + accuracy on QD")
+                             "fd_compare: FD orders 2/4/6/8/10 vs FFT — time + accuracy on QD; "
+                             "compare: compare trained models (--run_dirs) — loss curves + k=0 fidelity vs FFT")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
@@ -162,7 +163,7 @@ def main():
                         help="test_gnn / test_filter 模式下指定已有 run 目录；"
                              "不指定则自动选最新 run")
     parser.add_argument("--run_dirs", nargs="+", default=None,
-                        help="benchmark / stability 模式：要比较的 GNN run 目录列表，"
+                        help="benchmark / stability / compare 模式：要比较的 GNN run 目录列表，"
                              "例如 gnn_models/chain1_teacher gnn_models/chain2_teacher")
     parser.add_argument("--n_timing_reps", type=int, default=20,
                         help="benchmark 模式：单次 H-apply 计时重复次数（取中位数）")
@@ -360,6 +361,25 @@ def main():
         nan_stability_test(
             run_dirs    = args.run_dirs,
             max_steps   = args.stability_max_steps,
+            device      = args.device,
+            output_root = OUTPUT_ROOT,
+            description = args.timing_description,
+            **kw,
+        )
+        return
+
+    # ── compare 模式：训练模型对比（loss 曲线 + k=0 保真度）──
+    if args.mode == "compare":
+        if not args.run_dirs:
+            raise ValueError(
+                "--run_dirs 必须指定至少一个 GNN run 目录，"
+                "例如：--run_dirs gnn_models/c1_teacher_pm1000 gnn_models/c1_teacher_sin1000")
+        from gnn_code.model_compare import compare_models
+        kw = {}
+        if args.filter_cube   is not None: kw["cube_file"]   = args.filter_cube
+        if args.filter_params is not None: kw["params_file"] = args.filter_params
+        compare_models(
+            run_dirs    = args.run_dirs,
             device      = args.device,
             output_root = OUTPUT_ROOT,
             description = args.timing_description,
