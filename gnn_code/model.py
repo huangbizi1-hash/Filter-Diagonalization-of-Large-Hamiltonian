@@ -50,9 +50,9 @@ class HamiltonianGNN(MessagePassing):
         # 输入维度: ψ_i(1) + ψ_j(1) + dx,dy,dz(3) + r(1) = 6
         self.phi_mlp = nn.Sequential(
             nn.Linear(6, hidden_dim),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
 
@@ -143,9 +143,9 @@ class HamiltonianGNN_Cross(MessagePassing):
         # correction MLP: [ψ_i, ψ_j, dx, dy, dz, r] → scalar
         self.phi_mlp = nn.Sequential(
             nn.Linear(6, hidden_dim),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
 
@@ -202,9 +202,9 @@ class RadialMLP(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(1, hidden_dim),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, out_dim),
         )
 
