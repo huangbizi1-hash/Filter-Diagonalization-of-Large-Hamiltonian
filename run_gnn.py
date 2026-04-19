@@ -44,18 +44,22 @@ def main():
     parser.add_argument("--mode", default="all",
                         choices=["train", "test_baseline", "test_gnn",
                                  "test_fd", "test_ho", "test_gnn_ho",
-                                 "gen_dataset", "test_filter", "all"],
+                                 "gen_dataset", "test_filter", "benchmark",
+                                 "timing", "stability", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
                              "test_ho: HO ground state correctness test (no PyTorch); "
                              "test_gnn_ho: HO ground state test with GNN comparison "
                              "(energy + wavefunction similarity vs n); "
                              "gen_dataset: generate fixed k-grid sine-wave dataset; "
-                             "test_filter: filter diagonalization with GNN vs FD on sparse grid")
+                             "test_filter: filter diagonalization with GNN vs FD on sparse grid; "
+                             "benchmark: compare multiple GNN models (--run_dirs) vs FFT/FD baseline; "
+                             "timing: measure single H-apply time for all architectures (no training); "
+                             "stability: test how many repeated H-applies until NaN/Inf (--run_dirs)")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
-                        choices=["gaussian", "sine"],
-                        help="训练/测试波函数类型（on-the-fly 模式）")
+                        choices=["gaussian", "sine", "pm1"],
+                        help="波函数类型：gaussian/sine 用于训练/测试；pm1 仅用于 gen_dataset")
     parser.add_argument("--k_max", type=int, default=2,
                         help="正弦波最大波数（仅 wf_type=sine 或 gen_dataset 时有效）")
 
@@ -133,11 +137,13 @@ def main():
                         help="test_filter: path to Gaussian fit params JSON "
                              "(default: gaussian_fit_params.json)")
     parser.add_argument("--filter_vmin",     type=float, default=None,
-                        help="test_filter: spectral window lower bound Vmin (Ha); "
-                             "default: -5.0 (real QD)")
+                        help="test_filter: 谱窗口下界 Vmin (Ha)；默认 -5.0（与 --Vmin 等价）")
     parser.add_argument("--filter_de",       type=float, default=None,
-                        help="test_filter: spectral window width dE (Ha); "
-                             "default: 50.0 (real QD)")
+                        help="test_filter: 谱窗口宽度 dE (Ha)；默认 50.0（与 --dE 等价）")
+    parser.add_argument("--Vmin",            type=float, default=None,
+                        help="test_filter: 谱窗口下界（Ha），同 --filter_vmin，与 fft filter 保持一致")
+    parser.add_argument("--dE",              type=float, default=None,
+                        help="test_filter: 谱窗口宽度（Ha），同 --filter_de，与 fft filter 保持一致")
 
     # 其他测试参数
     parser.add_argument("--omega", type=float, default=1.0,
@@ -148,9 +154,34 @@ def main():
                         help="测试波函数数量")
     parser.add_argument("--d_test",  type=int, default=1,
                         help="checkpoint 选取间隔")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="训练输出文件夹名（gnn_models/<run_name>）；"
+                             "不指定则使用时间戳")
     parser.add_argument("--run_dir", type=str, default=None,
-                        help="test_gnn 模式下指定已有 run 目录；"
+                        help="test_gnn / test_filter 模式下指定已有 run 目录；"
                              "不指定则自动选最新 run")
+    parser.add_argument("--run_dirs", nargs="+", default=None,
+                        help="benchmark / stability 模式：要比较的 GNN run 目录列表，"
+                             "例如 gnn_models/chain1_teacher gnn_models/chain2_teacher")
+    parser.add_argument("--n_timing_reps", type=int, default=20,
+                        help="benchmark 模式：单次 H-apply 计时重复次数（取中位数）")
+
+    # timing 模式专用参数
+    parser.add_argument("--timing_hidden_dims", type=int, nargs="+",
+                        default=[8, 16, 32, 64, 128, 256],
+                        help="timing 模式：测试的 hidden_dim 列表（GNN-cube / GNN-cross）")
+    parser.add_argument("--timing_radial_hidden_dims", type=int, nargs="+",
+                        default=None,
+                        help="timing 模式：SO3 radial_hidden_dim 列表；"
+                             "不指定则与 --timing_hidden_dims 相同")
+    parser.add_argument("--timing_n_reps", type=int, default=100,
+                        help="timing 模式：计时重复次数（均值，默认 100）")
+    parser.add_argument("--timing_n_warmup", type=int, default=10,
+                        help="timing 模式：热身次数（不计入统计，默认 10）")
+    parser.add_argument("--timing_description", type=str, default="",
+                        help="timing / stability 模式：写入 JSON description 字段的说明文字")
+    parser.add_argument("--stability_max_steps", type=int, default=200,
+                        help="stability 模式：最多重复作用 H 的次数（默认 200）")
 
     args = parser.parse_args()
 
@@ -220,11 +251,14 @@ def main():
         else:
             run_dir = args.run_dir
         from gnn_code.test_filter import test_gnn_filter
+        # --Vmin/--dE 与 --filter_vmin/--filter_de 等价，短名优先
+        vmin_val = args.Vmin if args.Vmin is not None else args.filter_vmin
+        de_val   = args.dE   if args.dE   is not None else args.filter_de
         kw = {}
-        if args.filter_cube   is not None: kw['cube_file']   = args.filter_cube
+        if args.filter_cube is not None: kw['cube_file']   = args.filter_cube
         if args.filter_params is not None: kw['params_file'] = args.filter_params
-        if args.filter_vmin   is not None: kw['vmin']        = args.filter_vmin
-        if args.filter_de     is not None: kw['d_e']         = args.filter_de
+        if vmin_val is not None: kw['vmin'] = vmin_val
+        if de_val   is not None: kw['d_e']  = de_val
         test_gnn_filter(
             run_dir=run_dir,
             nc=args.filter_nc,
@@ -233,6 +267,73 @@ def main():
             svd_tol=args.filter_svd_tol,
             output_root=run_dir,
             device=args.device,
+            **kw,
+        )
+        return
+
+    # ── benchmark 模式：多模型精度-效率对比 ──
+    if args.mode == "benchmark":
+        if not args.run_dirs:
+            raise ValueError(
+                "--run_dirs 必须指定至少一个 GNN run 目录，"
+                "例如：--run_dirs gnn_models/chain1_teacher gnn_models/chain2_teacher")
+        from gnn_code.benchmark import benchmark_models
+        vmin_val = args.Vmin if args.Vmin is not None else args.filter_vmin
+        de_val   = args.dE   if args.dE   is not None else args.filter_de
+        kw = {}
+        if args.filter_cube   is not None: kw["cube_file"]   = args.filter_cube
+        if args.filter_params is not None: kw["params_file"] = args.filter_params
+        if vmin_val is not None: kw["vmin"] = vmin_val
+        if de_val   is not None: kw["d_e"]  = de_val
+        benchmark_models(
+            run_dirs      = args.run_dirs,
+            nc            = args.filter_nc,
+            el            = args.filter_el_list[0],
+            n_random      = args.filter_n_random,
+            svd_tol       = args.filter_svd_tol,
+            n_timing_reps = args.n_timing_reps,
+            device        = args.device,
+            output_root   = OUTPUT_ROOT,
+            **kw,
+        )
+        return
+
+    # ── timing 模式：H-apply 计时基准 ──
+    if args.mode == "timing":
+        from gnn_code.timing_benchmark import time_h_apply
+        kw = {}
+        if args.filter_cube   is not None: kw["cube_file"]   = args.filter_cube
+        if args.filter_params is not None: kw["params_file"] = args.filter_params
+        time_h_apply(
+            n_reps             = args.timing_n_reps,
+            n_warmup           = args.timing_n_warmup,
+            hidden_dims        = args.timing_hidden_dims,
+            radial_hidden_dims = args.timing_radial_hidden_dims,
+            fd_order           = args.fd_order,
+            n_co               = args.n_co,
+            device             = args.device,
+            output_root        = OUTPUT_ROOT,
+            description        = args.timing_description,
+            **kw,
+        )
+        return
+
+    # ── stability 模式：重复 H-apply NaN 检测 ──
+    if args.mode == "stability":
+        if not args.run_dirs:
+            raise ValueError(
+                "--run_dirs 必须指定至少一个 GNN run 目录，"
+                "例如：--run_dirs gnn_models/chain4_auto_bptt_false")
+        from gnn_code.stability_test import nan_stability_test
+        kw = {}
+        if args.filter_cube   is not None: kw["cube_file"]   = args.filter_cube
+        if args.filter_params is not None: kw["params_file"] = args.filter_params
+        nan_stability_test(
+            run_dirs    = args.run_dirs,
+            max_steps   = args.stability_max_steps,
+            device      = args.device,
+            output_root = OUTPUT_ROOT,
+            description = args.timing_description,
             **kw,
         )
         return
@@ -266,6 +367,7 @@ def main():
             chain_bptt=args.chain_bptt,
             kinetic_cutoff=args.kinetic_cutoff,
             output_root=OUTPUT_ROOT,
+            run_name=args.run_name,
             device=args.device,
             dataset_dir=args.dataset_dir,
             graph_type=args.graph_type,
