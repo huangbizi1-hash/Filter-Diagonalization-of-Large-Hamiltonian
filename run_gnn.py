@@ -45,7 +45,7 @@ def main():
                         choices=["train", "test_baseline", "test_gnn",
                                  "test_fd", "test_ho", "test_gnn_ho",
                                  "gen_dataset", "test_filter", "benchmark",
-                                 "timing", "stability", "all"],
+                                 "timing", "stability", "fd_compare", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
                              "test_ho: HO ground state correctness test (no PyTorch); "
                              "test_gnn_ho: HO ground state test with GNN comparison "
@@ -54,7 +54,8 @@ def main():
                              "test_filter: filter diagonalization with GNN vs FD on sparse grid; "
                              "benchmark: compare multiple GNN models (--run_dirs) vs FFT/FD baseline; "
                              "timing: measure single H-apply time for all architectures (no training); "
-                             "stability: test how many repeated H-applies until NaN/Inf (--run_dirs)")
+                             "stability: test how many repeated H-applies until NaN/Inf (--run_dirs); "
+                             "fd_compare: FD orders 2/4/6/8/10 vs FFT — time + accuracy on QD")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
@@ -185,6 +186,11 @@ def main():
                         help="timing / stability 模式：写入 JSON description 字段的说明文字")
     parser.add_argument("--stability_max_steps", type=int, default=200,
                         help="stability 模式：最多重复作用 H 的次数（默认 200）")
+
+    # fd_compare 模式专用参数
+    parser.add_argument("--fd_compare_orders", type=int, nargs="+",
+                        default=[2, 4, 6, 8, 10],
+                        help="fd_compare 模式：测试的 FD 阶数列表（默认 2 4 6 8 10）")
 
     args = parser.parse_args()
 
@@ -317,6 +323,23 @@ def main():
             device             = args.device,
             output_root        = OUTPUT_ROOT,
             description        = args.timing_description,
+            **kw,
+        )
+        return
+
+    # ── fd_compare 模式：FD 阶数 vs FFT 时间与精度对比 ──
+    if args.mode == "fd_compare":
+        from gnn_code.fd_benchmark import fd_accuracy_timing
+        kw = {}
+        if args.filter_cube   is not None: kw["cube_file"]   = args.filter_cube
+        if args.filter_params is not None: kw["params_file"] = args.filter_params
+        fd_accuracy_timing(
+            fd_orders   = args.fd_compare_orders,
+            n_reps      = args.timing_n_reps,
+            n_warmup    = args.timing_n_warmup,
+            device      = args.device,
+            output_root = OUTPUT_ROOT,
+            description = args.timing_description,
             **kw,
         )
         return
