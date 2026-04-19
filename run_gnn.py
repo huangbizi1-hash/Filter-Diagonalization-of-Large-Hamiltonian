@@ -167,13 +167,16 @@ def main():
                         help="benchmark 模式：单次 H-apply 计时重复次数（取中位数）")
 
     # timing 模式专用参数
-    parser.add_argument("--timing_hidden_dims", type=int, nargs="+",
-                        default=[8, 16, 32, 64, 128, 256],
-                        help="timing 模式：测试的 hidden_dim 列表（GNN-cube / GNN-cross）")
-    parser.add_argument("--timing_radial_hidden_dims", type=int, nargs="+",
-                        default=None,
-                        help="timing 模式：SO3 radial_hidden_dim 列表；"
-                             "不指定则与 --timing_hidden_dims 相同")
+    parser.add_argument("--timing_hidden_dim", type=int, default=64,
+                        help="timing 模式：所有 GNN 架构使用的 hidden_dim（默认 64）")
+    parser.add_argument("--timing_radial_hidden_dim", type=int, default=32,
+                        help="timing 模式：SO3HamiltonianNet 使用的 radial_hidden_dim（默认 32）")
+    parser.add_argument("--timing_fd_orders", type=int, nargs="+",
+                        default=[2, 4, 6, 8],
+                        help="timing 模式：cross 架构测试的 fd_order 列表（默认 2 4 6 8）")
+    parser.add_argument("--timing_n_cos", type=int, nargs="+",
+                        default=[1, 3, 3, 5],
+                        help="timing 模式：与 --timing_fd_orders 配对的 n_co 列表（默认 1 3 3 5）")
     parser.add_argument("--timing_n_reps", type=int, default=100,
                         help="timing 模式：计时重复次数（均值，默认 100）")
     parser.add_argument("--timing_n_warmup", type=int, default=10,
@@ -307,10 +310,10 @@ def main():
         time_h_apply(
             n_reps             = args.timing_n_reps,
             n_warmup           = args.timing_n_warmup,
-            hidden_dims        = args.timing_hidden_dims,
-            radial_hidden_dims = args.timing_radial_hidden_dims,
-            fd_order           = args.fd_order,
-            n_co               = args.n_co,
+            hidden_dim         = args.timing_hidden_dim,
+            radial_hidden_dim  = args.timing_radial_hidden_dim,
+            fd_orders          = args.timing_fd_orders,
+            n_cos              = args.timing_n_cos,
             device             = args.device,
             output_root        = OUTPUT_ROOT,
             description        = args.timing_description,
