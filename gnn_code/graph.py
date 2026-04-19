@@ -195,7 +195,11 @@ def build_star_graph(fd_order: int = 4, n_co: int = 3,
 
     fd_ei = torch.tensor(np.concatenate(fd_ei_list, axis=1), dtype=torch.long)
     fd_ea = torch.tensor(np.concatenate(fd_ea_list, axis=0), dtype=torch.float32)
-    co_ei = torch.tensor(np.concatenate(co_ei_list, axis=1), dtype=torch.long)
-    co_ea = torch.tensor(np.concatenate(co_ea_list, axis=0), dtype=torch.float32)
+    if co_ei_list:
+        co_ei = torch.tensor(np.concatenate(co_ei_list, axis=1), dtype=torch.long)
+        co_ea = torch.tensor(np.concatenate(co_ea_list, axis=0), dtype=torch.float32)
+    else:
+        co_ei = torch.zeros((2, 0), dtype=torch.long)
+        co_ea = torch.zeros((0, 4), dtype=torch.float32)
 
     return fd_ei, fd_ea, co_ei, co_ea

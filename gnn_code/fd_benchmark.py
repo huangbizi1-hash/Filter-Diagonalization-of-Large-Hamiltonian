@@ -180,7 +180,7 @@ def fd_accuracy_timing(
         def _fft_fine_fn(psi_t):
             psi_np = psi_t.cpu().numpy().reshape(N_f, N_f, N_f)
             out    = _fft_apply_H(psi_np, T_k_f, V_3d_f)
-            return torch.tensor(out.ravel(), dtype=torch.float32,
+            return torch.tensor(np.real(out).ravel(), dtype=torch.float32,
                                 device=dev).unsqueeze(-1)
 
         t_mean, t_std = _time_fn(_fft_fine_fn, psi_t_f, n_reps, n_warmup, dev)
