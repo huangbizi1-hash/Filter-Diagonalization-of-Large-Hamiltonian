@@ -44,6 +44,10 @@ def compare_models(
     output_root : directory for output JSON + PNG
     description : written to JSON
     """
+    if device == "auto":
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
     ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(output_root)
     out_dir.mkdir(parents=True, exist_ok=True)
