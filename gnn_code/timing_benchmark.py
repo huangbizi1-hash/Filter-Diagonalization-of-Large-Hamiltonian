@@ -75,6 +75,7 @@ def time_h_apply(
     radial_hidden_dim: int   = 32,
     fd_orders:         list  = None,
     n_cos:             list  = None,
+    cube_only:         bool  = False,
     device:            str   = 'cpu',
     cube_file:         str   = _DEFAULT_CUBE,
     params_file:       str   = _DEFAULT_PARAMS,
@@ -89,12 +90,15 @@ def time_h_apply(
     fd_orders : fd_order values for cross-type configs (default [2, 4, 6, 8])
     n_cos     : paired n_co values, same length as fd_orders (default [1,3,3,5])
     """
-    if fd_orders is None:
-        fd_orders = [2, 4, 6, 8]
-    if n_cos is None:
-        n_cos = [1, 3, 3, 5]
-    if len(fd_orders) != len(n_cos):
-        raise ValueError("fd_orders and n_cos must have the same length")
+    if cube_only:
+        fd_orders, n_cos = [], []
+    else:
+        if fd_orders is None:
+            fd_orders = [2, 4, 6, 8]
+        if n_cos is None:
+            n_cos = [1, 3, 3, 5]
+        if len(fd_orders) != len(n_cos):
+            raise ValueError("fd_orders and n_cos must have the same length")
 
     ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(output_root)

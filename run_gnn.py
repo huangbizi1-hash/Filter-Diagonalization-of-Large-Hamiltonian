@@ -178,6 +178,8 @@ def main():
     parser.add_argument("--timing_n_cos", type=int, nargs="+",
                         default=[1, 3, 3, 5],
                         help="timing 模式：与 --timing_fd_orders 配对的 n_co 列表（默认 1 3 3 5）")
+    parser.add_argument("--timing_cube_only", action="store_true", default=False,
+                        help="timing 模式：只测 cube 架构（gnn-cube + fd-cube），跳过 cross/SO3")
     parser.add_argument("--timing_n_reps", type=int, default=100,
                         help="timing 模式：计时重复次数（均值，默认 100）")
     parser.add_argument("--timing_n_warmup", type=int, default=10,
@@ -320,6 +322,7 @@ def main():
             radial_hidden_dim  = args.timing_radial_hidden_dim,
             fd_orders          = args.timing_fd_orders,
             n_cos              = args.timing_n_cos,
+            cube_only          = args.timing_cube_only,
             device             = args.device,
             output_root        = OUTPUT_ROOT,
             description        = args.timing_description,
