@@ -46,7 +46,7 @@ def main():
                                  "test_fd", "test_ho", "test_gnn_ho",
                                  "gen_dataset", "test_filter", "benchmark",
                                  "timing", "stability", "fd_compare", "compare",
-                                 "iter_test", "all"],
+                                 "iter_test", "loss_compare", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
                              "test_ho: HO ground state correctness test (no PyTorch); "
                              "test_gnn_ho: HO ground state test with GNN comparison "
@@ -395,6 +395,21 @@ def main():
             output_root     = OUTPUT_ROOT,
             description     = args.timing_description,
             **kw,
+        )
+        return
+
+    # ── loss_compare 模式：仅绘制平均 chain loss 曲线（轻量，无 FFT/GNN 推断）──
+    if args.mode == "loss_compare":
+        if not args.run_dirs:
+            raise ValueError(
+                "--run_dirs 必须指定至少一个 GNN run 目录，"
+                "例如：--run_dirs gnn_models/chain4_auto_bptt_true "
+                "gnn_models/chain4_auto_bptt_false")
+        from gnn_code.loss_compare import compare_loss_curves
+        compare_loss_curves(
+            run_dirs    = args.run_dirs,
+            output_root = OUTPUT_ROOT,
+            description = args.timing_description,
         )
         return
 
