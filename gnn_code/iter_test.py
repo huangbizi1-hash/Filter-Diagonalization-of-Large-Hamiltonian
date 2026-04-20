@@ -218,7 +218,7 @@ def iter_fidelity_test(
         print(f"  Initial state: {state_label}")
         print(f"  {'─'*60}")
 
-        # 每个方法的当前向量（未归一化）
+        # 每个方法的当前向量（每步归一化，避免 |λ_max|^n 溢出；等价于 power iteration）
         psi_fd    = {o: states["coarse"].copy() for o in active_orders}
         psi_fft_c = states["coarse"].copy()
         psi_fft_f = states["fine"].copy()
@@ -226,21 +226,21 @@ def iter_fidelity_test(
         step_results = {str(n): {} for n in checkpoints}
 
         for step in range(1, n_max + 1):
-            # 推进一步
+            # 推进一步并立即归一化（H^n 模随 |λ_max|^n 指数增长，不归一化会溢出）
             for o in active_orders:
-                psi_fd[o] = fd_ops[o](psi_fd[o])
-            psi_fft_c = _fft_apply(psi_fft_c, N_c, T_k_c, V_flat_c)
-            psi_fft_f = _fft_apply(psi_fft_f, N_f, T_k_f, V_flat_f)
+                v = fd_ops[o](psi_fd[o])
+                psi_fd[o] = _normalize(v)
+            psi_fft_c = _normalize(_fft_apply(psi_fft_c, N_c, T_k_c, V_flat_c))
+            psi_fft_f = _normalize(_fft_apply(psi_fft_f, N_f, T_k_f, V_flat_f))
 
             if step not in checkpoints:
                 continue
 
             print(f"  step={step}")
 
-            # 归一化参考态
-            ref_c   = _normalize(psi_fft_c.copy())
-            ref_f_ds = _normalize(
-                _downsample_fourier(psi_fft_f, N_c, N_f))
+            # 参考态已归一化
+            ref_c    = psi_fft_c
+            ref_f_ds = _normalize(_downsample_fourier(psi_fft_f, N_c, N_f))
 
             # FFT-fine vs FFT-coarse（网格差异）
             fid_fine_vs_coarse = float(abs(np.dot(ref_f_ds, ref_c)))
