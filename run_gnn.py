@@ -45,7 +45,8 @@ def main():
                         choices=["train", "test_baseline", "test_gnn",
                                  "test_fd", "test_ho", "test_gnn_ho",
                                  "gen_dataset", "test_filter", "benchmark",
-                                 "timing", "stability", "fd_compare", "compare", "all"],
+                                 "timing", "stability", "fd_compare", "compare",
+                                 "iter_test", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
                              "test_ho: HO ground state correctness test (no PyTorch); "
                              "test_gnn_ho: HO ground state test with GNN comparison "
@@ -56,7 +57,9 @@ def main():
                              "timing: measure single H-apply time for all architectures (no training); "
                              "stability: test how many repeated H-applies until NaN/Inf (--run_dirs); "
                              "fd_compare: FD orders 2/4/6/8/10 vs FFT — time + accuracy on QD; "
-                             "compare: compare trained models (--run_dirs) — loss curves + k=0 fidelity vs FFT")
+                             "compare: compare trained models (--run_dirs) — loss curves + k=0 fidelity vs FFT; "
+                             "iter_test: repeated H-apply fidelity & energy test: FD orders vs "
+                             "FFT-coarse and FFT-fine (downsampled), for k=0 and k=1 initial states")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
@@ -194,6 +197,17 @@ def main():
     parser.add_argument("--fd_compare_orders", type=int, nargs="+",
                         default=[2, 4, 6, 8, 10],
                         help="fd_compare 模式：测试的 FD 阶数列表（默认 2 4 6 8 10）")
+
+    # iter_test 模式专用参数
+    parser.add_argument("--iter_fd_orders", type=int, nargs="+",
+                        default=[2, 4, 6, 8, 10],
+                        help="iter_test 模式：测试的 FD 阶数列表（默认 2 4 6 8 10）")
+    parser.add_argument("--iter_n_steps", type=int, nargs="+",
+                        default=[1, 10, 50, 100, 200, 500],
+                        help="iter_test 模式：记录保真度的 H-apply 次数 checkpoint 列表"
+                             "（默认 1 10 50 100 200 500）")
+    parser.add_argument("--iter_kinetic_cutoff", type=float, default=30.0,
+                        help="iter_test 模式：FFT 动能截断（Ha，默认 30.0）")
 
     args = parser.parse_args()
 
@@ -364,6 +378,22 @@ def main():
             device      = args.device,
             output_root = OUTPUT_ROOT,
             description = args.timing_description,
+            **kw,
+        )
+        return
+
+    # ── iter_test 模式：重复 H-apply 保真度 & 能量测试 ──
+    if args.mode == "iter_test":
+        from gnn_code.iter_test import iter_fidelity_test
+        kw = {}
+        if args.filter_cube   is not None: kw["cube_file"]   = args.filter_cube
+        if args.filter_params is not None: kw["params_file"] = args.filter_params
+        iter_fidelity_test(
+            fd_orders       = args.iter_fd_orders,
+            n_steps_list    = args.iter_n_steps,
+            kinetic_cutoff  = args.iter_kinetic_cutoff,
+            output_root     = OUTPUT_ROOT,
+            description     = args.timing_description,
             **kw,
         )
         return
