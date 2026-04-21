@@ -138,10 +138,13 @@ def data_scaling_experiment(
     print(f"{'='*64}")
 
     # ── 生成测试集（一次性，固定）──────────────────────────────────────────────
-    k_shift_test = float(2 * k_max + 0.5)   # test k 在 [k_max+0.5, 3*k_max+0.5]*dk
-    test_dir = str(ds_root / f"test_nk{test_n_k}_shift{k_shift_test}")
+    # k_shift = 半个测试网格间距：测试 k 值插入训练 k 值之间，
+    # 频率范围相同（都在 [-k_max, k_max]*dk 附近），只是具体点位不重叠。
+    # 避免 k_shift 过大（如 2*k_max）导致测试集频率远超训练范围（分布外推）。
+    k_shift_test = float(k_max / max(test_n_k - 1, 1) / 2)
+    test_dir = str(ds_root / f"test_nk{test_n_k}_halfshift")
     if not os.path.exists(os.path.join(test_dir, "metadata.json")):
-        print(f"\n  Generating test dataset (N_k'={test_n_k}, k_shift={k_shift_test})...")
+        print(f"\n  Generating test dataset (N_k'={test_n_k}, k_shift={k_shift_test:.3f})...")
         generate_k_grid_dataset(
             k_max=k_max, n_k=test_n_k, chain_len=1,
             k_shift=k_shift_test, out_dir=test_dir)
