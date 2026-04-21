@@ -41,21 +41,25 @@ def generate_k_grid_dataset(
     chain_len:      int   = 1,
     kinetic_cutoff: float = 30.0,
     out_dir:        str   = "dataset",
+    k_shift:        float = 0.0,
 ) -> int:
     """
     Generate n_k³ sine-wave wavefunctions on a uniform k-grid and save to out_dir.
 
     k vectors: all (kx, ky, kz) with each component in
-               np.linspace(-k_max, k_max, n_k) * 2π/L.
+               (np.linspace(-k_max, k_max, n_k) + k_shift) * 2π/L.
 
-    The zero wavefunction (kx=ky=kz=0) is skipped automatically.
+    k_shift (in the same units as k_max) shifts the entire k-grid, allowing
+    non-overlapping test sets when set to 2*k_max + small_epsilon.
+
+    The zero wavefunction (all k=0 after shift) is skipped automatically.
 
     Returns the number of samples actually saved.
     """
     os.makedirs(out_dir, exist_ok=True)
 
     dk     = 2 * np.pi / L
-    k_vals = np.linspace(-k_max, k_max, n_k) * dk
+    k_vals = (np.linspace(-k_max, k_max, n_k) + k_shift) * dk
 
     count = 0
     for kx in k_vals:
@@ -80,7 +84,7 @@ def generate_k_grid_dataset(
                 count += 1
 
     meta = dict(
-        k_max=k_max, n_k=n_k,
+        k_max=k_max, n_k=n_k, k_shift=k_shift,
         chain_len=chain_len, kinetic_cutoff=kinetic_cutoff,
         n_samples=count, N_sparse=N_sparse,
     )

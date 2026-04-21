@@ -46,11 +46,11 @@ def main():
                                  "test_fd", "test_ho", "test_gnn_ho",
                                  "gen_dataset", "test_filter", "benchmark",
                                  "timing", "stability", "fd_compare", "compare",
-                                 "iter_test", "loss_compare", "all"],
+                                 "iter_test", "loss_compare",
+                                 "data_scaling", "arch_sweep", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
                              "test_ho: HO ground state correctness test (no PyTorch); "
-                             "test_gnn_ho: HO ground state test with GNN comparison "
-                             "(energy + wavefunction similarity vs n); "
+                             "test_gnn_ho: HO ground state test with GNN comparison; "
                              "gen_dataset: generate fixed k-grid sine-wave dataset; "
                              "test_filter: filter diagonalization with GNN vs FD on sparse grid; "
                              "benchmark: compare multiple GNN models (--run_dirs) vs FFT/FD baseline; "
@@ -58,8 +58,10 @@ def main():
                              "stability: test how many repeated H-applies until NaN/Inf (--run_dirs); "
                              "fd_compare: FD orders 2/4/6/8/10 vs FFT — time + accuracy on QD; "
                              "compare: compare trained models (--run_dirs) — loss curves + k=0 fidelity vs FFT; "
-                             "iter_test: repeated H-apply fidelity & energy test: FD orders vs "
-                             "FFT-coarse and FFT-fine (downsampled), for k=0 and k=1 initial states")
+                             "iter_test: repeated H-apply fidelity & energy test; "
+                             "loss_compare: compare avg chain loss curves for multiple run_dirs; "
+                             "data_scaling: Exp-1 train data size vs test loss (n_k sweep, fixed arch); "
+                             "arch_sweep: Exp-2 n_co / model_type sweep vs k=0 fidelity (fixed data)")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
@@ -208,6 +210,42 @@ def main():
                              "（默认 1 10 50 100 200 500）")
     parser.add_argument("--iter_kinetic_cutoff", type=float, default=30.0,
                         help="iter_test 模式：FFT 动能截断（Ha，默认 30.0）")
+
+    # data_scaling 模式专用参数（实验1：数据量 vs test loss）
+    parser.add_argument("--scaling_n_k_list", type=int, nargs="+",
+                        default=[4, 5, 6, 8, 10],
+                        help="data_scaling: 训练集 N_k 列表（默认 4 5 6 8 10）")
+    parser.add_argument("--scaling_k_max", type=int, default=5,
+                        help="data_scaling: 训练集 k_max（默认 5；测试集自动偏移 2*k_max+0.5）")
+    parser.add_argument("--scaling_test_n_k", type=int, default=10,
+                        help="data_scaling: 测试集 n_k（默认 10）")
+    parser.add_argument("--scaling_fd_order", type=int, default=6,
+                        help="data_scaling: FD 阶数（默认 6）")
+    parser.add_argument("--scaling_n_co", type=int, default=3,
+                        help="data_scaling: correction 立方体边长（默认 3）")
+    parser.add_argument("--scaling_hidden_dim", type=int, default=16,
+                        help="data_scaling: hidden_dim（默认 16）")
+    parser.add_argument("--scaling_epochs", type=int, default=5000,
+                        help="data_scaling: 训练 epochs（默认 5000）")
+
+    # arch_sweep 模式专用参数（实验2：架构 vs k=0 保真度）
+    parser.add_argument("--arch_n_co_list", type=int, nargs="+",
+                        default=[3, 4, 5],
+                        help="arch_sweep: n_co 列表（默认 3 4 5）")
+    parser.add_argument("--arch_use_so3", action="store_true", default=False,
+                        help="arch_sweep: 同时测试 SO3 模型")
+    parser.add_argument("--arch_fd_order", type=int, default=6,
+                        help="arch_sweep: FD 阶数（默认 6）")
+    parser.add_argument("--arch_n_k", type=int, default=10,
+                        help="arch_sweep: 训练集 N_k（默认 10）")
+    parser.add_argument("--arch_k_max", type=int, default=5,
+                        help="arch_sweep: 训练集 k_max（默认 5）")
+    parser.add_argument("--arch_hidden_dim", type=int, default=16,
+                        help="arch_sweep: hidden_dim（默认 16）")
+    parser.add_argument("--arch_epochs", type=int, default=5000,
+                        help="arch_sweep: 训练 epochs（默认 5000）")
+    parser.add_argument("--arch_kinetic_cutoff", type=float, default=30.0,
+                        help="arch_sweep: FFT 动能截断（Ha，默认 30.0）")
 
     args = parser.parse_args()
 
@@ -410,6 +448,42 @@ def main():
             run_dirs    = args.run_dirs,
             output_root = OUTPUT_ROOT,
             description = args.timing_description,
+        )
+        return
+
+    # ── data_scaling 模式：实验1 数据量 vs test loss ──
+    if args.mode == "data_scaling":
+        from gnn_code.data_scaling import data_scaling_experiment
+        data_scaling_experiment(
+            n_k_list        = args.scaling_n_k_list,
+            k_max           = args.scaling_k_max,
+            test_n_k        = args.scaling_test_n_k,
+            fd_order        = args.scaling_fd_order,
+            n_co            = args.scaling_n_co,
+            hidden_dim      = args.scaling_hidden_dim,
+            epochs          = args.scaling_epochs,
+            device          = args.device,
+            output_root     = OUTPUT_ROOT,
+            description     = args.timing_description,
+        )
+        return
+
+    # ── arch_sweep 模式：实验2 架构 vs k=0 保真度 ──
+    if args.mode == "arch_sweep":
+        from gnn_code.arch_sweep import arch_sweep_experiment
+        arch_sweep_experiment(
+            n_co_list         = args.arch_n_co_list,
+            use_so3           = args.arch_use_so3,
+            fd_order          = args.arch_fd_order,
+            n_k               = args.arch_n_k,
+            k_max             = args.arch_k_max,
+            hidden_dim        = args.arch_hidden_dim,
+            radial_hidden_dim = args.radial_hidden_dim,
+            epochs            = args.arch_epochs,
+            kinetic_cutoff    = args.arch_kinetic_cutoff,
+            device            = args.device,
+            output_root       = OUTPUT_ROOT,
+            description       = args.timing_description,
         )
         return
 
