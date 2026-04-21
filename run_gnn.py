@@ -533,6 +533,9 @@ def main():
         model_types = ['gnn']
         if args.arch_use_so3:
             model_types.append('so3')
+        kw = {}
+        if args.filter_cube   is not None: kw["cube_file"]   = args.filter_cube
+        if args.filter_params is not None: kw["params_file"] = args.filter_params
         time_random_cross(
             n_co_list         = args.arch_n_co_list,
             model_types       = model_types,
@@ -541,9 +544,11 @@ def main():
             radial_hidden_dim = args.timing_radial_hidden_dim,
             n_reps            = args.timing_n_reps,
             n_warmup          = args.timing_n_warmup,
+            use_qd            = args.arch_timing_use_qd,
             device            = args.device,
             output_root       = OUTPUT_ROOT,
             description       = args.timing_description,
+            **kw,
         )
         return
 

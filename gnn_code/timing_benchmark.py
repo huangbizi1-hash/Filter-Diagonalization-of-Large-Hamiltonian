@@ -388,15 +388,18 @@ def time_random_cross(
     radial_hidden_dim: int   = 32,
     n_reps:            int   = 10,
     n_warmup:          int   = 3,
+    use_qd:            bool  = False,
+    cube_file:         str   = None,
+    params_file:       str   = None,
     device:            str   = 'cpu',
     output_root:       str   = '.',
     description:       str   = '',
 ):
     """
-    对随机初始化（未训练）的 GNN-cross / SO3-cross 模型在 V_sparse 上计时。
+    对随机初始化（未训练）的 GNN-cross / SO3-cross 模型计时。
 
-    用途：测试不同 n_co 带来的图规模（co 边数量）对 H-apply 耗时的影响，
-    与训练权重无关。
+    use_qd=False → 在 V_sparse 训练势（N_sparse³）上计时
+    use_qd=True  → 在真实 QD 势（d_sparse 重采样，N_qd³）上计时
 
     Parameters
     ----------
@@ -422,18 +425,34 @@ def time_random_cross(
                ('cuda' if torch.cuda.is_available() else 'cpu'))
     dev     = torch.device(dev_str)
 
-    n_grid  = N_sparse ** 3
-    grid_L  = N_sparse * d_sparse
-    V_t     = torch.tensor(V_sparse.flatten(), dtype=torch.float32).unsqueeze(-1).to(dev)
+    # ── 确定势能和网格 ─────────────────────────────────────────────────────────
+    if use_qd:
+        from .test_filter import _load_qd_potential, _DEFAULT_CUBE, _DEFAULT_PARAMS
+        _cube   = cube_file   or _DEFAULT_CUBE
+        _params = params_file or _DEFAULT_PARAMS
+        print(f"\n  Loading real QD potential (d={d_sparse} Bohr)...")
+        pot_grid, N_grid, d_actual = _load_qd_potential(
+            d_sparse, cube_file=_cube, params_file=_params)
+        V_flat  = pot_grid.potential.ravel().astype(np.float32)
+        n_grid  = N_grid ** 3
+        grid_L  = N_grid * d_actual
+        pot_label = f"QD (N={N_grid}, n={n_grid:,}, d={d_actual:.4f} Bohr)"
+    else:
+        N_grid    = N_sparse
+        d_actual  = d_sparse
+        V_flat    = V_sparse.flatten().astype(np.float32)
+        n_grid    = N_sparse ** 3
+        grid_L    = N_sparse * d_sparse
+        pot_label = f"V_sparse (N={N_sparse}, n={n_grid})"
 
-    rng     = np.random.default_rng(42)
-    psi_np  = rng.standard_normal(n_grid).astype(np.float64)
+    V_t   = torch.tensor(V_flat, dtype=torch.float32).unsqueeze(-1).to(dev)
+    rng   = np.random.default_rng(42)
+    psi_np = rng.standard_normal(n_grid).astype(np.float32)
     psi_np /= np.linalg.norm(psi_np)
-    psi_t   = torch.tensor(psi_np.astype(np.float32),
-                            dtype=torch.float32).unsqueeze(-1).to(dev)
+    psi_t  = torch.tensor(psi_np, dtype=torch.float32).unsqueeze(-1).to(dev)
 
     print(f"\n{'='*64}")
-    print(f"  Random-weight cross timing  (N={N_sparse}, n={n_grid})")
+    print(f"  Random-weight cross timing on {pot_label}")
     print(f"  fd_order={fd_order}  n_co_list={n_co_list}  model_types={model_types}")
     print(f"  n_reps={n_reps}  n_warmup={n_warmup}  device={dev_str}")
     print(f"{'='*64}")
@@ -443,14 +462,14 @@ def time_random_cross(
     for n_co in n_co_list:
         print(f"\n  Building graph  n_co={n_co}  (expected {n_co**3-1} co-neighbors/node)...")
         fd_ei, fd_ea, co_ei, co_ea = build_star_graph(
-            fd_order, n_co, N=N_sparse, d=d_sparse, grid_L=grid_L)
+            fd_order, n_co, N=N_grid, d=d_actual, grid_L=grid_L)
         fd_ei = fd_ei.to(dev); fd_ea = fd_ea.to(dev)
         co_ei = co_ei.to(dev); co_ea = co_ea.to(dev)
         n_co_edges = co_ei.shape[1]
         print(f"    co_edges total = {n_co_edges:,}  "
               f"({n_co_edges // n_grid} per node, expected {n_co**3-1})")
 
-        # FD 基准（只建一次 per n_co，不依赖模型类型）
+        # FD 基准
         _fd = FiniteDiffHamiltonian_Cross(fd_ei, fd_ea, V_t, dev)
 
         def _fd_fn(psi, _f=_fd): return _f(psi)
@@ -500,14 +519,14 @@ def time_random_cross(
             print(f"    {mt.upper():<4} (params={n_params}):  "
                   f"{t_mean:.3f}±{t_std:.3f} ms")
             results.append({
-                "model_type":   mt,
-                "n_co":         n_co,
-                "n_co_edges":   n_co_edges,
-                "hidden_dim":   hidden_dim if mt == 'gnn' else None,
+                "model_type":        mt,
+                "n_co":              n_co,
+                "n_co_edges":        n_co_edges,
+                "hidden_dim":        hidden_dim if mt == 'gnn' else None,
                 "radial_hidden_dim": radial_hidden_dim if mt == 'so3' else None,
-                "n_params":     n_params,
-                "t_mean_ms":    t_mean,
-                "t_std_ms":     t_std,
+                "n_params":          n_params,
+                "t_mean_ms":         t_mean,
+                "t_std_ms":          t_std,
             })
 
     # ── Summary table ─────────────────────────────────────────────────────────
@@ -535,9 +554,9 @@ def time_random_cross(
             "n_reps":            n_reps,
             "n_warmup":          n_warmup,
             "device":            dev_str,
-            "N_sparse":          N_sparse,
+            "potential":         "qd" if use_qd else "V_sparse",
+            "N_grid":            N_grid,
             "n_grid":            n_grid,
-            "potential":         "V_sparse",
         },
         "results": results,
     }
