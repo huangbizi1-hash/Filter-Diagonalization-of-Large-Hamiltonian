@@ -360,3 +360,181 @@ def arch_sweep_experiment(
         json.dump(output, f, indent=2, ensure_ascii=False, default=float)
     print(f"  Data → {json_path}")
     return output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# arch_loss_compare — 训练损失 vs 验证损失对比
+# ─────────────────────────────────────────────────────────────────────────────
+
+def arch_loss_compare(
+    n_co_list:     list  = None,
+    use_so3:       bool  = True,
+    fd_order:      int   = 6,
+    hidden_dim:    int   = 16,
+    epochs:        int   = 5000,
+    last_n_epochs: int   = 100,
+    val_dir:       str   = None,
+    k_max:         int   = 5,
+    test_n_k:      int   = 10,
+    device:        str   = 'cpu',
+    output_root:   str   = '.',
+    description:   str   = '',
+):
+    """
+    对 arch_sweep 训练的 6 个模型（GNN/SO3 × n_co=3,4,5）比较：
+      · 训练损失：loss_history.json 中最后 last_n_epochs 个 epoch 的均值
+      · 验证损失：在 val_dir 数据集上评估 MSE（与训练集不重叠的 k-grid 测试集）
+
+    val_dir 默认为 output_root/gnn_datasets/scaling_kmax{k_max}/test_nk{test_n_k}_halfshift
+    （即 data_scaling 实验生成的测试集）。
+
+    输出：1×2 子图（训练损失 / 验证损失 vs n_co）+ JSON。
+    """
+    if n_co_list is None:
+        n_co_list = [3, 4, 5]
+
+    from .gnn_operator import build_gnn_operator
+    from .dataset     import WavefunctionDataset
+
+    if device == 'auto':
+        import torch
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(output_root)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 验证集路径 ─────────────────────────────────────────────────────────────
+    if val_dir is None:
+        val_dir = str(out_dir / "gnn_datasets"
+                      / f"scaling_kmax{k_max}"
+                      / f"test_nk{test_n_k}_halfshift")
+
+    if not os.path.exists(os.path.join(val_dir, "metadata.json")):
+        raise FileNotFoundError(
+            f"验证集不存在: {val_dir}\n"
+            "请先运行 --mode data_scaling 生成验证集，或用 --arch_val_dir 指定路径。")
+
+    print(f"\n{'='*64}")
+    print(f"  Arch loss compare: n_co_list={n_co_list}  use_so3={use_so3}")
+    print(f"  fd_order={fd_order}  hidden_dim={hidden_dim}  epochs={epochs}")
+    print(f"  last_n_epochs={last_n_epochs}  device={device}")
+    print(f"  val_dir={val_dir}")
+    print(f"{'='*64}")
+
+    # ── 列出所有配置 ───────────────────────────────────────────────────────────
+    configs = []
+    for n_co in n_co_list:
+        configs.append({"n_co": n_co, "model_type": "gnn"})
+    if use_so3:
+        for n_co in n_co_list:
+            configs.append({"n_co": n_co, "model_type": "so3"})
+
+    # ── 加载验证集（一次性，共用）────────────────────────────────────────────────
+    print("\n  Loading validation dataset...")
+    val_ds = WavefunctionDataset(val_dir, in_memory=True)
+    print(f"  {len(val_ds)} validation samples")
+
+    # ── 逐模型读取损失 & 评估验证损失 ─────────────────────────────────────────
+    for cfg in configs:
+        n_co       = cfg["n_co"]
+        model_type = cfg["model_type"]
+        label      = f"{model_type.upper()} n_co={n_co}"
+        run_name   = (f"arch_fd{fd_order}_nco{n_co}_{model_type}"
+                      f"_hd{hidden_dim}_ep{epochs}")
+        run_path   = os.path.join(output_root, "gnn_models", run_name)
+        cfg["run_dir"] = run_path
+        cfg["label"]   = label
+        print(f"\n  ── {label} ──")
+
+        # ── 训练损失（最后 last_n_epochs 个 epoch 均值）─────────────────────────
+        lh_path = os.path.join(run_path, "loss_history.json")
+        if not os.path.exists(lh_path):
+            print(f"  SKIP — loss_history.json not found: {lh_path}")
+            cfg["train_loss"] = float("nan")
+            cfg["val_loss"]   = float("nan")
+            continue
+        with open(lh_path) as f:
+            lh = json.load(f)
+        loss_arr = lh.get("loss", [])
+        tail = loss_arr[-last_n_epochs:] if len(loss_arr) >= last_n_epochs else loss_arr
+        train_loss = float(np.mean(tail)) if tail else float("nan")
+        cfg["train_loss"] = train_loss
+        print(f"  train_loss (last {len(tail)} ep avg) = {train_loss:.4e}")
+
+        # ── 验证损失（MSE on val_ds）─────────────────────────────────────────────
+        try:
+            gnn_op = build_gnn_operator(run_path, use_fd=False, device=device)
+            total_mse = 0.0
+            for sample in val_ds:
+                psi_t, tgt_t = sample[0]          # chain_len=1
+                psi_np  = psi_t.numpy().flatten().astype(np.float64)
+                tgt_np  = tgt_t.numpy().flatten().astype(np.float64)
+                pred_np = gnn_op.matvec(psi_np)
+                total_mse += float(np.mean((pred_np - tgt_np) ** 2))
+            val_loss = total_mse / len(val_ds)
+            cfg["val_loss"] = val_loss
+            print(f"  val_loss (MSE, {len(val_ds)} samples) = {val_loss:.4e}")
+        except Exception as exc:
+            print(f"  val_loss FAILED: {exc}")
+            cfg["val_loss"] = float("nan")
+
+    # ── 绘图 ──────────────────────────────────────────────────────────────────
+    gnn_cfgs = [c for c in configs if c["model_type"] == "gnn"]
+    so3_cfgs = [c for c in configs if c["model_type"] == "so3"]
+
+    with plt.rc_context(_SCI_STYLE):
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+        for ax, metric, ylabel in [
+            (axes[0], "train_loss", f"Train loss (last {last_n_epochs} ep avg)"),
+            (axes[1], "val_loss",   "Val loss (MSE, out-of-distribution k-grid)"),
+        ]:
+            if gnn_cfgs:
+                ax.plot([c["n_co"] for c in gnn_cfgs],
+                        [c[metric] for c in gnn_cfgs],
+                        "o-", label="GNN-cross", linewidth=1.5)
+            if so3_cfgs:
+                ax.plot([c["n_co"] for c in so3_cfgs],
+                        [c[metric] for c in so3_cfgs],
+                        "s--", label="SO3-cross", linewidth=1.5)
+
+            ax.set_yscale("log")
+            ax.set_xlabel(r"$n_{co}$")
+            ax.set_ylabel(ylabel)
+            ax.set_xticks(n_co_list)
+            ax.legend()
+
+        fig.suptitle(
+            f"fd_order={fd_order}, hidden_dim={hidden_dim}, epochs={epochs}  "
+            f"| val: test_nk{test_n_k}_halfshift",
+            fontsize=14)
+        fig.tight_layout()
+        png_path = out_dir / f"arch_loss_{ts}.png"
+        fig.savefig(png_path, dpi=150)
+        plt.close(fig)
+    print(f"\n  Plot → {png_path}")
+
+    # ── 保存 JSON ─────────────────────────────────────────────────────────────
+    output = {
+        "description": description,
+        "script":      "gnn_code/arch_sweep.py::arch_loss_compare",
+        "datetime":    datetime.datetime.now().isoformat(),
+        "config": {
+            "n_co_list":     n_co_list,
+            "use_so3":       use_so3,
+            "fd_order":      fd_order,
+            "hidden_dim":    hidden_dim,
+            "epochs":        epochs,
+            "last_n_epochs": last_n_epochs,
+            "val_dir":       val_dir,
+            "n_val_samples": len(val_ds),
+            "device":        device,
+        },
+        "results": configs,
+    }
+    json_path = out_dir / f"arch_loss_{ts}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False, default=float)
+    print(f"  Data → {json_path}")
+    return output

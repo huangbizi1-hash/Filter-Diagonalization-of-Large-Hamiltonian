@@ -48,7 +48,7 @@ def main():
                                  "timing", "stability", "fd_compare", "compare",
                                  "iter_test", "loss_compare",
                                  "data_scaling", "arch_sweep",
-                                 "arch_timing", "all"],
+                                 "arch_timing", "arch_loss", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
                              "test_ho: HO ground state correctness test (no PyTorch); "
                              "test_gnn_ho: HO ground state test with GNN comparison; "
@@ -63,7 +63,8 @@ def main():
                              "loss_compare: compare avg chain loss curves for multiple run_dirs; "
                              "data_scaling: Exp-1 train data size vs test loss (n_k sweep, fixed arch); "
                              "arch_sweep: Exp-2 n_co / model_type sweep vs k=0 fidelity (fixed data); "
-                             "arch_timing: time trained GNN/SO3 models on V_sparse (use already-trained arch_sweep models)")
+                             "arch_timing: time trained GNN/SO3 models on V_sparse (use already-trained arch_sweep models); "
+                             "arch_loss: compare final train loss (last N ep avg) + val loss for arch_sweep models")
 
     # 波函数
     parser.add_argument("--wf_type", default="gaussian",
@@ -251,6 +252,13 @@ def main():
     parser.add_argument("--arch_timing_use_qd", action="store_true", default=False,
                         help="arch_timing: 在真实 QD 势（d_sparse 重采样）上计时，"
                              "而非 V_sparse 训练势")
+    parser.add_argument("--arch_val_dir", type=str, default=None,
+                        help="arch_loss: 验证集目录；默认自动使用 "
+                             "gnn_datasets/scaling_kmax{arch_k_max}/test_nk{arch_test_n_k}_halfshift")
+    parser.add_argument("--arch_test_n_k", type=int, default=10,
+                        help="arch_loss: 验证集 n_k（与 data_scaling 测试集一致，默认 10）")
+    parser.add_argument("--arch_last_n_epochs", type=int, default=100,
+                        help="arch_loss: 训练损失取最后多少个 epoch 的均值（默认 100）")
 
     args = parser.parse_args()
 
@@ -514,6 +522,25 @@ def main():
             output_root  = OUTPUT_ROOT,
             description  = args.timing_description,
             **kw,
+        )
+        return
+
+    # ── arch_loss 模式：训练损失 vs 验证损失对比 ──
+    if args.mode == "arch_loss":
+        from gnn_code.arch_sweep import arch_loss_compare
+        arch_loss_compare(
+            n_co_list      = args.arch_n_co_list,
+            use_so3        = args.arch_use_so3,
+            fd_order       = args.arch_fd_order,
+            hidden_dim     = args.arch_hidden_dim,
+            epochs         = args.arch_epochs,
+            last_n_epochs  = args.arch_last_n_epochs,
+            val_dir        = args.arch_val_dir,
+            k_max          = args.arch_k_max,
+            test_n_k       = args.arch_test_n_k,
+            device         = args.device,
+            output_root    = OUTPUT_ROOT,
+            description    = args.timing_description,
         )
         return
 
