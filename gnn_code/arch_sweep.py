@@ -1,9 +1,13 @@
 """
-gnn_code/arch_sweep.py — Experiment 2: n_co / model_type sweep, k=0 fidelity
+gnn_code/arch_sweep.py — Experiment 2: n_co / model_type sweep, k=0 and k=0.1 fidelity
 
 固定 N_k=10, k_max=5, fd_order=6, hidden_dim=16, epochs=5000, chain=1, teacher。
 分别用 n_co=3,4,5（cross+gnn）及 so3（n_co=3,4,5）进行训练，
-在训练势（V_sparse）上测试 k=0 态保真度，以 FFT（动能截断=30 Ha）为基准。
+测试：
+  · k=0 uniform 态   → H|ψ⟩ = V·ψ（动能为零，所有方法严格相同，仅作 sanity check）
+  · k=0.1 sine 态    → psi = sin(0.1*2π/L · x)，动能非零，模型之间有差异
+
+以 FFT（动能截断=30 Ha）为基准，并同时计算纯 FD 基准值作对比。
 
 用法（通过 run_gnn.py）：
     python run_gnn.py --mode arch_sweep \\
@@ -13,6 +17,10 @@ gnn_code/arch_sweep.py — Experiment 2: n_co / model_type sweep, k=0 fidelity
         --arch_n_k 10 \\
         --arch_epochs 5000 \\
         --arch_hidden_dim 16
+
+注意：k=0 uniform 态的 SO3/GNN/FD 保真度严格等于 1（H|uniform⟩ = V·uniform，
+动能项为零，三种算子完全相同），因此该测试只用于 sanity check，k=0.1 态才是真正
+区分各方法精度的测试。
 """
 
 import datetime
@@ -60,28 +68,43 @@ def _build_fft_train_op(kinetic_cutoff: float = 30.0) -> LinearOperator:
     return op
 
 
-# ── k=0 fidelity on training grid ────────────────────────────────────────────
+# ── test state builders ───────────────────────────────────────────────────────
 
-def _k0_fidelity(run_dir: str, fft_phi_n: np.ndarray,
-                 device_str: str = 'cpu') -> dict:
+def _make_k0_state(N: int) -> np.ndarray:
+    """Uniform k=0 state: psi = 1/sqrt(N³)."""
+    n_grid = N ** 3
+    return np.ones(n_grid, dtype=np.float64) / np.sqrt(n_grid)
+
+
+def _make_sine_state(k_frac: float, N: int, d: float, L: float) -> np.ndarray:
+    """Sine-wave state: psi = sin(k_frac * 2π/L · x), normalised.
+
+    k_frac is in units of the fundamental wave vector dk = 2π/L.
+    E.g. k_frac=0.1 gives kx = 0.1*(2π/L), T = ½*(0.1*2π/L)².
     """
-    Apply GNN once to k=0 state, compare to pre-computed fft_phi_n.
-    Returns dict with energy_k0, phi_norm, fidelity_vs_fft.
+    x = np.linspace(-L / 2, L / 2, N, endpoint=False)
+    X, Y, Z = np.meshgrid(x, x, x, indexing='ij')
+    kx = k_frac * 2 * np.pi / L
+    psi = np.sin(kx * X).ravel().astype(np.float64)
+    nrm = np.linalg.norm(psi)
+    return psi / nrm if nrm > 1e-15 else psi
+
+
+# ── single-operator fidelity evaluation ──────────────────────────────────────
+
+def _eval_fidelity(op: LinearOperator,
+                   psi_test: np.ndarray,
+                   phi_ref_n: np.ndarray) -> dict:
     """
-    from .gnn_operator import build_gnn_operator
-    from .physics import N_sparse
-
-    n_grid = N_sparse ** 3
-    psi_k0 = np.ones(n_grid, dtype=np.float64) / np.sqrt(n_grid)
-
-    gnn_op = build_gnn_operator(run_dir, use_fd=False, device=device_str)
-    phi    = gnn_op.matvec(psi_k0)
-    energy = float(np.dot(psi_k0, phi))
+    Apply op to psi_test, compare normalised result to pre-computed phi_ref_n.
+    Returns energy (Rayleigh quotient), phi_norm, fidelity_vs_ref.
+    """
+    phi    = op.matvec(psi_test)
+    energy = float(np.dot(psi_test, phi))
     nrm    = float(np.linalg.norm(phi))
     phi_n  = phi / nrm if nrm > 1e-15 else phi.copy()
-    fid    = float(abs(np.dot(phi_n, fft_phi_n))) if fft_phi_n is not None else float('nan')
-
-    return {"energy_k0": energy, "phi_norm": nrm, "fidelity_vs_fft": fid}
+    fid    = float(abs(np.dot(phi_n, phi_ref_n))) if phi_ref_n is not None else float('nan')
+    return {"energy": energy, "phi_norm": nrm, "fidelity_vs_fft": fid}
 
 
 # ── main pipeline ─────────────────────────────────────────────────────────────
@@ -105,13 +128,18 @@ def arch_sweep_experiment(
 ):
     """
     训练 cross-GNN（n_co=3,4,5）及可选 SO3（相同 n_co 列表），
-    在训练势上测试 k=0 保真度，绘图保存。
+    在训练势上测试 k=0/k=0.1 保真度，绘图保存。
+
+    k=0 (uniform) 测试：所有方法严格等于 FFT（动能为零），仅用作 sanity check。
+    k=0.1 (sine) 测试：kx = 0.1*2π/L，动能非零，区分各方法精度。
     """
     if n_co_list is None:
         n_co_list = [3, 4, 5]
 
     from .train   import train
     from .dataset import generate_k_grid_dataset
+    from .gnn_operator import build_gnn_operator
+    from .physics import N_sparse, d_sparse, L
 
     if device == 'auto':
         import torch
@@ -126,6 +154,8 @@ def arch_sweep_experiment(
     print(f"\n{'='*64}")
     print(f"  Arch sweep: n_co_list={n_co_list}  use_so3={use_so3}")
     print(f"  fd_order={fd_order}  n_k={n_k}  hidden_dim={hidden_dim}  epochs={epochs}")
+    print(f"  NOTE: k=0 (uniform) test is trivial — all methods agree by design.")
+    print(f"        k=0.1 (sine) test is the meaningful discriminator.")
     print(f"{'='*64}")
 
     # 共用训练集
@@ -183,67 +213,116 @@ def arch_sweep_experiment(
         run_dirs_map[label] = run_path
         cfg["run_dir"] = run_path
 
-    # ── FFT 参考（k=0 保真度）──────────────────────────────────────────────────
-    print("\n  Computing FFT k=0 reference...")
-    from .physics import N_sparse
-    n_grid    = N_sparse ** 3
-    psi_k0    = np.ones(n_grid, dtype=np.float64) / np.sqrt(n_grid)
-    fft_op    = _build_fft_train_op(kinetic_cutoff)
-    phi_fft   = fft_op.matvec(psi_k0)
-    nrm_fft   = float(np.linalg.norm(phi_fft))
-    phi_fft_n = phi_fft / nrm_fft if nrm_fft > 1e-15 else phi_fft.copy()
-    E_fft     = float(np.dot(psi_k0, phi_fft))
-    print(f"  FFT: E_k0={E_fft:.5f} Ha")
+    # ── 构建测试态 & FFT 参考 ──────────────────────────────────────────────────
+    print("\n  Building test states and FFT references...")
+    psi_k0 = _make_k0_state(N_sparse)
+    psi_k1 = _make_sine_state(0.1, N_sparse, d_sparse, L)
 
-    # ── k=0 保真度评估 ─────────────────────────────────────────────────────────
-    print("\n  Evaluating k=0 fidelity for each model...")
+    fft_op   = _build_fft_train_op(kinetic_cutoff)
+    phi_fft_k0   = fft_op.matvec(psi_k0)
+    nrm_fft_k0   = float(np.linalg.norm(phi_fft_k0))
+    phi_fft_k0_n = phi_fft_k0 / nrm_fft_k0 if nrm_fft_k0 > 1e-15 else phi_fft_k0.copy()
+    E_fft_k0     = float(np.dot(psi_k0, phi_fft_k0))
+
+    phi_fft_k1   = fft_op.matvec(psi_k1)
+    nrm_fft_k1   = float(np.linalg.norm(phi_fft_k1))
+    phi_fft_k1_n = phi_fft_k1 / nrm_fft_k1 if nrm_fft_k1 > 1e-15 else phi_fft_k1.copy()
+    E_fft_k1     = float(np.dot(psi_k1, phi_fft_k1))
+    print(f"  FFT: E_k0={E_fft_k0:.5f} Ha  E_k0.1={E_fft_k1:.5f} Ha")
+
+    # ── 纯 FD 基准（不依赖训练，直接用第一个模型的图，use_fd=True）─────────────
+    print("\n  Computing FD baseline (use_fd=True)...")
+    first_run = configs[0]["run_dir"]
+    fd_op = build_gnn_operator(first_run, use_fd=True, device=device)
+    fd_res_k0 = _eval_fidelity(fd_op, psi_k0, phi_fft_k0_n)
+    fd_res_k1 = _eval_fidelity(fd_op, psi_k1, phi_fft_k1_n)
+    print(f"  FD k=0: fid={fd_res_k0['fidelity_vs_fft']:.5f}  E={fd_res_k0['energy']:.5f}")
+    print(f"  FD k=0.1: fid={fd_res_k1['fidelity_vs_fft']:.5f}  E={fd_res_k1['energy']:.5f}"
+          f"  dE={fd_res_k1['energy'] - E_fft_k1:+.4e}")
+
+    # ── GNN / SO3 评估（k=0 & k=0.1）─────────────────────────────────────────
+    print("\n  Evaluating GNN/SO3 fidelity (k=0 and k=0.1)...")
     for cfg in configs:
-        label      = f"{cfg['model_type']}_nco{cfg['n_co']}"
-        run_path   = cfg["run_dir"]
+        label    = f"{cfg['model_type']}_nco{cfg['n_co']}"
+        run_path = cfg["run_dir"]
         try:
-            res = _k0_fidelity(run_path, phi_fft_n, device)
-            cfg["fidelity_vs_fft"]  = res["fidelity_vs_fft"]
-            cfg["energy_k0"]        = res["energy_k0"]
-            cfg["energy_err"]       = res["energy_k0"] - E_fft
-            print(f"  {label:<20}  fid={res['fidelity_vs_fft']:.5f}"
-                  f"  E_k0={res['energy_k0']:.5f}  dE={cfg['energy_err']:+.4e}")
+            gnn_op = build_gnn_operator(run_path, use_fd=False, device=device)
+
+            r0 = _eval_fidelity(gnn_op, psi_k0, phi_fft_k0_n)
+            cfg["k0_fidelity"]    = r0["fidelity_vs_fft"]
+            cfg["k0_energy"]      = r0["energy"]
+            cfg["k0_energy_err"]  = r0["energy"] - E_fft_k0
+
+            r1 = _eval_fidelity(gnn_op, psi_k1, phi_fft_k1_n)
+            cfg["k1_fidelity"]    = r1["fidelity_vs_fft"]
+            cfg["k1_energy"]      = r1["energy"]
+            cfg["k1_energy_err"]  = r1["energy"] - E_fft_k1
+
+            print(f"  {label:<20}"
+                  f"  k0: fid={r0['fidelity_vs_fft']:.5f}  E={r0['energy']:.5f}"
+                  f"  |  k0.1: fid={r1['fidelity_vs_fft']:.5f}  E={r1['energy']:.5f}"
+                  f"  dE={cfg['k1_energy_err']:+.4e}")
         except Exception as exc:
             print(f"  {label}: FAILED ({exc})")
-            cfg["fidelity_vs_fft"] = float('nan')
-            cfg["energy_k0"]       = float('nan')
-            cfg["energy_err"]      = float('nan')
+            for key in ("k0_fidelity","k0_energy","k0_energy_err",
+                        "k1_fidelity","k1_energy","k1_energy_err"):
+                cfg[key] = float('nan')
 
-    # ── 绘图：保真度 & 能量偏差 ────────────────────────────────────────────────
+    # ── 绘图：2 行（k=0, k=0.1）× 2 列（保真度, 能量偏差）───────────────────────
     gnn_cfgs = [c for c in configs if c["model_type"] == "gnn"]
     so3_cfgs = [c for c in configs if c["model_type"] == "so3"]
 
     with plt.rc_context(_SCI_STYLE):
-        fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+        fig, axes = plt.subplots(2, 2, figsize=(13, 9))
 
-        for ax_idx, (ax, metric, ylabel) in enumerate([
-            (axes[0], "fidelity_vs_fft",  r"Fidelity vs FFT (k=0)"),
-            (axes[1], "energy_err",        r"Energy error $\Delta E$ (Ha)"),
-        ]):
+        row_specs = [
+            # (row_idx, state_label, fid_key, energy_key, E_fft, fd_fid, fd_E)
+            (0, "k=0 (uniform, sanity check)",
+             "k0_fidelity", "k0_energy_err", E_fft_k0,
+             fd_res_k0["fidelity_vs_fft"], fd_res_k0["energy"] - E_fft_k0),
+            (1, r"$k_x=0.1\times 2\pi/L$ (sine, kinetic test)",
+             "k1_fidelity", "k1_energy_err", E_fft_k1,
+             fd_res_k1["fidelity_vs_fft"], fd_res_k1["energy"] - E_fft_k1),
+        ]
+
+        for row_idx, state_label, fid_key, err_key, E_fft_val, fd_fid, fd_err in row_specs:
+            ax_fid = axes[row_idx, 0]
+            ax_err = axes[row_idx, 1]
+
             if gnn_cfgs:
                 x_gnn = [c["n_co"] for c in gnn_cfgs]
-                y_gnn = [c[metric]  for c in gnn_cfgs]
-                ax.plot(x_gnn, y_gnn, "o-", label="GNN-cross", linewidth=1.5)
+                ax_fid.plot(x_gnn, [c[fid_key] for c in gnn_cfgs],
+                            "o-", label="GNN-cross", linewidth=1.5)
+                ax_err.plot(x_gnn, [c[err_key] for c in gnn_cfgs],
+                            "o-", label="GNN-cross", linewidth=1.5)
             if so3_cfgs:
                 x_so3 = [c["n_co"] for c in so3_cfgs]
-                y_so3 = [c[metric]  for c in so3_cfgs]
-                ax.plot(x_so3, y_so3, "s--", label="SO3-cross", linewidth=1.5)
+                ax_fid.plot(x_so3, [c[fid_key] for c in so3_cfgs],
+                            "s--", label="SO3-cross", linewidth=1.5)
+                ax_err.plot(x_so3, [c[err_key] for c in so3_cfgs],
+                            "s--", label="SO3-cross", linewidth=1.5)
 
-            if ax_idx == 0:
-                ax.axhline(1.0, color='gray', linewidth=0.8, linestyle=':',
+            # FD baseline
+            ax_fid.axhline(fd_fid, color='C2', linewidth=1.2,
+                           linestyle=':', label=f"FD (order={fd_order})")
+            ax_err.axhline(fd_err, color='C2', linewidth=1.2,
+                           linestyle=':', label=f"FD (order={fd_order})")
+
+            ax_fid.axhline(1.0, color='gray', linewidth=0.8, linestyle='--',
                            label='FFT=1')
-                ax.set_ylim(bottom=0)
-            else:
-                ax.axhline(0.0, color='gray', linewidth=0.8, linestyle=':')
+            ax_err.axhline(0.0, color='gray', linewidth=0.8, linestyle='--')
 
-            ax.set_xlabel(r"$n_{co}$ (correction cube size)")
-            ax.set_ylabel(ylabel)
-            ax.set_xticks(n_co_list)
-            ax.legend()
+            ax_fid.set_title(f"{state_label}  — Fidelity vs FFT")
+            ax_err.set_title(f"{state_label}  — Energy error (Ha)")
+            ax_fid.set_ylim(bottom=max(0, min(
+                [c[fid_key] for c in configs if not np.isnan(c[fid_key])] + [fd_fid, 1.0]
+            ) - 0.05))
+            ax_fid.set_ylabel(r"Fidelity $|\langle\phi|\phi_\mathrm{FFT}\rangle|$")
+            ax_err.set_ylabel(r"$\Delta E$ (Ha)")
+            for ax in (ax_fid, ax_err):
+                ax.set_xlabel(r"$n_{co}$ (correction cube size)")
+                ax.set_xticks(n_co_list)
+                ax.legend()
 
         fig.suptitle(f"Arch sweep: fd_order={fd_order}, N_k={n_k}, "
                      f"hidden_dim={hidden_dim}, epochs={epochs}", fontsize=14)
@@ -263,7 +342,16 @@ def arch_sweep_experiment(
             "fd_order":      fd_order,  "n_k": n_k, "k_max": k_max,
             "hidden_dim":    hidden_dim, "epochs": epochs,
             "kinetic_cutoff": kinetic_cutoff,
-            "fft_E_k0":      E_fft,
+            "fft_E_k0":      E_fft_k0,
+            "fft_E_k1":      E_fft_k1,
+        },
+        "fd_baseline": {
+            "k0_fidelity":   fd_res_k0["fidelity_vs_fft"],
+            "k0_energy":     fd_res_k0["energy"],
+            "k0_energy_err": fd_res_k0["energy"] - E_fft_k0,
+            "k1_fidelity":   fd_res_k1["fidelity_vs_fft"],
+            "k1_energy":     fd_res_k1["energy"],
+            "k1_energy_err": fd_res_k1["energy"] - E_fft_k1,
         },
         "results": configs,
     }
