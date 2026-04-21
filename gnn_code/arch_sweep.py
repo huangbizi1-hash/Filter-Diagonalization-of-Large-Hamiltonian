@@ -1,11 +1,11 @@
 """
-gnn_code/arch_sweep.py — Experiment 2: n_co / model_type sweep, k=0 and k=1 fidelity
+gnn_code/arch_sweep.py — Experiment 2: n_co / model_type sweep, k=0 and k=0.1 fidelity
 
 固定 N_k=10, k_max=5, fd_order=6, hidden_dim=16, epochs=5000, chain=1, teacher。
 分别用 n_co=3,4,5（cross+gnn）及 so3（n_co=3,4,5）进行训练，
 测试：
-  · k=0 uniform 态  → H|ψ⟩ = V·ψ（动能为零，所有方法严格相同，仅作 sanity check）
-  · k=1 sine 态     → psi = sin(2π/L · x)，动能非零，模型之间有差异
+  · k=0 uniform 态   → H|ψ⟩ = V·ψ（动能为零，所有方法严格相同，仅作 sanity check）
+  · k=0.1 sine 态    → psi = sin(0.1*2π/L · x)，动能非零，模型之间有差异
 
 以 FFT（动能截断=30 Ha）为基准，并同时计算纯 FD 基准值作对比。
 
@@ -19,7 +19,7 @@ gnn_code/arch_sweep.py — Experiment 2: n_co / model_type sweep, k=0 and k=1 fi
         --arch_hidden_dim 16
 
 注意：k=0 uniform 态的 SO3/GNN/FD 保真度严格等于 1（H|uniform⟩ = V·uniform，
-动能项为零，三种算子完全相同），因此该测试只用于 sanity check，k=1 态才是真正
+动能项为零，三种算子完全相同），因此该测试只用于 sanity check，k=0.1 态才是真正
 区分各方法精度的测试。
 """
 
@@ -76,17 +76,15 @@ def _make_k0_state(N: int) -> np.ndarray:
     return np.ones(n_grid, dtype=np.float64) / np.sqrt(n_grid)
 
 
-def _make_k1_state(N: int, d: float, L: float) -> np.ndarray:
-    """k=(1,0,0) sine wave: psi = sin(2π/L · x), normalised.
+def _make_sine_state(k_frac: float, N: int, d: float, L: float) -> np.ndarray:
+    """Sine-wave state: psi = sin(k_frac * 2π/L · x), normalised.
 
-    2π/L is the fundamental wave vector on the periodic box [−L/2, L/2).
-    This state has non-zero kinetic energy T=½(2π/L)² and a non-trivial
-    kinetic action, making it the minimal non-trivial test for the accuracy
-    of the kinetic operator approximation.
+    k_frac is in units of the fundamental wave vector dk = 2π/L.
+    E.g. k_frac=0.1 gives kx = 0.1*(2π/L), T = ½*(0.1*2π/L)².
     """
     x = np.linspace(-L / 2, L / 2, N, endpoint=False)
     X, Y, Z = np.meshgrid(x, x, x, indexing='ij')
-    kx = 2 * np.pi / L
+    kx = k_frac * 2 * np.pi / L
     psi = np.sin(kx * X).ravel().astype(np.float64)
     nrm = np.linalg.norm(psi)
     return psi / nrm if nrm > 1e-15 else psi
@@ -130,10 +128,10 @@ def arch_sweep_experiment(
 ):
     """
     训练 cross-GNN（n_co=3,4,5）及可选 SO3（相同 n_co 列表），
-    在训练势上测试 k=0/k=1 保真度，绘图保存。
+    在训练势上测试 k=0/k=0.1 保真度，绘图保存。
 
     k=0 (uniform) 测试：所有方法严格等于 FFT（动能为零），仅用作 sanity check。
-    k=1 (sine) 测试：kx = 2π/L，动能非零，区分各方法精度。
+    k=0.1 (sine) 测试：kx = 0.1*2π/L，动能非零，区分各方法精度。
     """
     if n_co_list is None:
         n_co_list = [3, 4, 5]
@@ -157,7 +155,7 @@ def arch_sweep_experiment(
     print(f"  Arch sweep: n_co_list={n_co_list}  use_so3={use_so3}")
     print(f"  fd_order={fd_order}  n_k={n_k}  hidden_dim={hidden_dim}  epochs={epochs}")
     print(f"  NOTE: k=0 (uniform) test is trivial — all methods agree by design.")
-    print(f"        k=1 (sine) test is the meaningful discriminator.")
+    print(f"        k=0.1 (sine) test is the meaningful discriminator.")
     print(f"{'='*64}")
 
     # 共用训练集
@@ -218,7 +216,7 @@ def arch_sweep_experiment(
     # ── 构建测试态 & FFT 参考 ──────────────────────────────────────────────────
     print("\n  Building test states and FFT references...")
     psi_k0 = _make_k0_state(N_sparse)
-    psi_k1 = _make_k1_state(N_sparse, d_sparse, L)
+    psi_k1 = _make_sine_state(0.1, N_sparse, d_sparse, L)
 
     fft_op   = _build_fft_train_op(kinetic_cutoff)
     phi_fft_k0   = fft_op.matvec(psi_k0)
@@ -230,7 +228,7 @@ def arch_sweep_experiment(
     nrm_fft_k1   = float(np.linalg.norm(phi_fft_k1))
     phi_fft_k1_n = phi_fft_k1 / nrm_fft_k1 if nrm_fft_k1 > 1e-15 else phi_fft_k1.copy()
     E_fft_k1     = float(np.dot(psi_k1, phi_fft_k1))
-    print(f"  FFT: E_k0={E_fft_k0:.5f} Ha  E_k1={E_fft_k1:.5f} Ha")
+    print(f"  FFT: E_k0={E_fft_k0:.5f} Ha  E_k0.1={E_fft_k1:.5f} Ha")
 
     # ── 纯 FD 基准（不依赖训练，直接用第一个模型的图，use_fd=True）─────────────
     print("\n  Computing FD baseline (use_fd=True)...")
@@ -239,11 +237,11 @@ def arch_sweep_experiment(
     fd_res_k0 = _eval_fidelity(fd_op, psi_k0, phi_fft_k0_n)
     fd_res_k1 = _eval_fidelity(fd_op, psi_k1, phi_fft_k1_n)
     print(f"  FD k=0: fid={fd_res_k0['fidelity_vs_fft']:.5f}  E={fd_res_k0['energy']:.5f}")
-    print(f"  FD k=1: fid={fd_res_k1['fidelity_vs_fft']:.5f}  E={fd_res_k1['energy']:.5f}"
+    print(f"  FD k=0.1: fid={fd_res_k1['fidelity_vs_fft']:.5f}  E={fd_res_k1['energy']:.5f}"
           f"  dE={fd_res_k1['energy'] - E_fft_k1:+.4e}")
 
-    # ── GNN / SO3 评估（k=0 & k=1）────────────────────────────────────────────
-    print("\n  Evaluating GNN/SO3 fidelity (k=0 and k=1)...")
+    # ── GNN / SO3 评估（k=0 & k=0.1）─────────────────────────────────────────
+    print("\n  Evaluating GNN/SO3 fidelity (k=0 and k=0.1)...")
     for cfg in configs:
         label    = f"{cfg['model_type']}_nco{cfg['n_co']}"
         run_path = cfg["run_dir"]
@@ -262,7 +260,7 @@ def arch_sweep_experiment(
 
             print(f"  {label:<20}"
                   f"  k0: fid={r0['fidelity_vs_fft']:.5f}  E={r0['energy']:.5f}"
-                  f"  |  k1: fid={r1['fidelity_vs_fft']:.5f}  E={r1['energy']:.5f}"
+                  f"  |  k0.1: fid={r1['fidelity_vs_fft']:.5f}  E={r1['energy']:.5f}"
                   f"  dE={cfg['k1_energy_err']:+.4e}")
         except Exception as exc:
             print(f"  {label}: FAILED ({exc})")
@@ -270,7 +268,7 @@ def arch_sweep_experiment(
                         "k1_fidelity","k1_energy","k1_energy_err"):
                 cfg[key] = float('nan')
 
-    # ── 绘图：2 行（k=0, k=1）× 2 列（保真度, 能量偏差）─────────────────────────
+    # ── 绘图：2 行（k=0, k=0.1）× 2 列（保真度, 能量偏差）───────────────────────
     gnn_cfgs = [c for c in configs if c["model_type"] == "gnn"]
     so3_cfgs = [c for c in configs if c["model_type"] == "so3"]
 
@@ -282,7 +280,7 @@ def arch_sweep_experiment(
             (0, "k=0 (uniform, sanity check)",
              "k0_fidelity", "k0_energy_err", E_fft_k0,
              fd_res_k0["fidelity_vs_fft"], fd_res_k0["energy"] - E_fft_k0),
-            (1, r"$k_x=2\pi/L$ (sine, kinetic test)",
+            (1, r"$k_x=0.1\times 2\pi/L$ (sine, kinetic test)",
              "k1_fidelity", "k1_energy_err", E_fft_k1,
              fd_res_k1["fidelity_vs_fft"], fd_res_k1["energy"] - E_fft_k1),
         ]
