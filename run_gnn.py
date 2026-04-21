@@ -248,6 +248,9 @@ def main():
                         help="arch_sweep: 训练 epochs（默认 5000）")
     parser.add_argument("--arch_kinetic_cutoff", type=float, default=30.0,
                         help="arch_sweep: FFT 动能截断（Ha，默认 30.0）")
+    parser.add_argument("--arch_timing_use_qd", action="store_true", default=False,
+                        help="arch_timing: 在真实 QD 势（d_sparse 重采样）上计时，"
+                             "而非 V_sparse 训练势")
 
     args = parser.parse_args()
 
@@ -495,6 +498,9 @@ def main():
         model_types = ['gnn']
         if args.arch_use_so3:
             model_types.append('so3')
+        kw = {}
+        if args.filter_cube   is not None: kw["cube_file"]   = args.filter_cube
+        if args.filter_params is not None: kw["params_file"] = args.filter_params
         time_trained_gnn(
             n_co_list    = args.arch_n_co_list,
             model_types  = model_types,
@@ -503,9 +509,11 @@ def main():
             epochs       = args.arch_epochs,
             n_reps       = args.timing_n_reps,
             n_warmup     = args.timing_n_warmup,
+            use_qd       = args.arch_timing_use_qd,
             device       = args.device,
             output_root  = OUTPUT_ROOT,
             description  = args.timing_description,
+            **kw,
         )
         return
 

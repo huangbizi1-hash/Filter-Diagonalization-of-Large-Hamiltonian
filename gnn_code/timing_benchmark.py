@@ -377,7 +377,7 @@ def time_h_apply(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# time_trained_gnn — 对已训练 arch_sweep 模型计时（在 V_sparse 训练势上）
+# time_trained_gnn — 对已训练 arch_sweep 模型计时
 # ─────────────────────────────────────────────────────────────────────────────
 
 def time_trained_gnn(
@@ -388,31 +388,27 @@ def time_trained_gnn(
     epochs:      int   = 5000,
     n_reps:      int   = 10,
     n_warmup:    int   = 3,
+    use_qd:      bool  = False,
+    cube_file:   str   = None,
+    params_file: str   = None,
     device:      str   = 'cpu',
     output_root: str   = '.',
     description: str   = '',
 ):
     """
-    对 arch_sweep 训练好的 GNN / SO3 模型在 V_sparse 训练势上计时。
+    对 arch_sweep 训练好的 GNN / SO3 模型计时。
 
     模型路径约定（与 arch_sweep_experiment 一致）：
         output_root/gnn_models/arch_fd{fd_order}_nco{n_co}_{model_type}_hd{hidden_dim}_ep{epochs}/
 
-    测试向量：V_sparse 网格（N_sparse³）上的随机单位向量（固定种子 42）。
-    计时方式：n_warmup 次热身 + n_reps 次计时，取均值与标准差。
-
     Parameters
     ----------
-    n_co_list    : n_co 值列表（默认 [3, 4, 5]）
-    model_types  : 模型类型列表，元素为 'gnn' 或 'so3'（默认 ['gnn', 'so3']）
-    fd_order     : 训练时使用的 FD 阶数
-    hidden_dim   : 训练时使用的 hidden_dim（GNN）或 radial_hidden_dim（SO3）
-    epochs       : 训练 epochs（用于构造 run 目录名）
-    n_reps       : 计时重复次数（取均值，默认 10）
-    n_warmup     : 热身次数（不计入统计，默认 3）
-    device       : 计算设备（默认 'cpu'）
-    output_root  : 仓库根目录
-    description  : 写入 JSON 的描述字符串
+    use_qd      : False → 在 V_sparse 训练势（N_sparse³）上计时；
+                  True  → 在真实 QD 势（d_sparse 重采样，N_qd³）上计时
+    cube_file   : QD cube 文件路径（use_qd=True 时有效，默认 localPot.cube）
+    params_file : Gaussian fit params JSON 路径（use_qd=True 时有效）
+    n_reps      : 计时重复次数（取均值，默认 10）
+    n_warmup    : 热身次数（不计入统计，默认 3）
     """
     import os
     import json as _json
@@ -432,19 +428,48 @@ def time_trained_gnn(
     dev_str = (device if device != 'auto' else
                ('cuda' if torch.cuda.is_available() else 'cpu'))
 
-    n_grid = N_sparse ** 3
+    # ── 确定势能和网格 ────────────────────────────────────────────────────────
+    if use_qd:
+        from .test_filter import _load_qd_potential, _DEFAULT_CUBE, _DEFAULT_PARAMS
+        _cube   = cube_file   or _DEFAULT_CUBE
+        _params = params_file or _DEFAULT_PARAMS
+        print(f"\n  Loading real QD potential (d={d_sparse} Bohr)...")
+        pot_grid, N_grid, d_actual = _load_qd_potential(
+            d_sparse, cube_file=_cube, params_file=_params)
+        V_ext  = pot_grid.potential.ravel().astype(np.float64)
+        n_grid = N_grid ** 3
+        pot_label = f"QD (N={N_grid}, n={n_grid:,}, d={d_actual:.4f} Bohr)"
+        gnn_op_kw = {"V_ext": V_ext, "N_grid": N_grid}
+    else:
+        N_grid    = N_sparse
+        V_ext     = None
+        n_grid    = N_sparse ** 3
+        pot_label = f"V_sparse (N={N_sparse}, n={n_grid})"
+        gnn_op_kw = {}
+
     rng    = np.random.default_rng(42)
     psi_np = rng.standard_normal(n_grid).astype(np.float64)
     psi_np /= np.linalg.norm(psi_np)
 
     print(f"\n{'='*64}")
-    print(f"  GNN trained-model timing on V_sparse (N={N_sparse}, n={n_grid})")
+    print(f"  GNN trained-model timing on {pot_label}")
     print(f"  fd_order={fd_order}  hidden_dim={hidden_dim}  epochs={epochs}")
     print(f"  n_co_list={n_co_list}  model_types={model_types}")
     print(f"  n_reps={n_reps}  n_warmup={n_warmup}  device={dev_str}")
     print(f"{'='*64}")
 
     results = []
+
+    # ── 内部计时工具 ──────────────────────────────────────────────────────────
+    def _run_timing(op):
+        for _ in range(n_warmup):
+            op.matvec(psi_np)
+        ts_list = []
+        for _ in range(n_reps):
+            t0 = time.perf_counter()
+            op.matvec(psi_np)
+            ts_list.append((time.perf_counter() - t0) * 1000.0)
+        return float(np.mean(ts_list)), float(np.std(ts_list))
 
     # ── FD 基准（use_fd=True，用第一个可用模型的图）─────────────────────────────
     fd_row = None
@@ -454,17 +479,9 @@ def time_trained_gnn(
             run_path = os.path.join(output_root, "gnn_models", run_name)
             if os.path.isdir(run_path):
                 try:
-                    fd_op = build_gnn_operator(run_path, use_fd=True, device=dev_str)
-                    # 热身
-                    for _ in range(n_warmup):
-                        fd_op.matvec(psi_np)
-                    times_fd = []
-                    for _ in range(n_reps):
-                        t0 = time.perf_counter()
-                        fd_op.matvec(psi_np)
-                        times_fd.append((time.perf_counter() - t0) * 1000.0)
-                    t_fd_mean = float(np.mean(times_fd))
-                    t_fd_std  = float(np.std(times_fd))
+                    fd_op = build_gnn_operator(
+                        run_path, use_fd=True, device=dev_str, **gnn_op_kw)
+                    t_fd_mean, t_fd_std = _run_timing(fd_op)
                     fd_row = {
                         "label":      f"FD (order={fd_order})",
                         "model_type": "fd",
@@ -481,7 +498,7 @@ def time_trained_gnn(
         if fd_row is not None:
             break
 
-    # ── GNN / SO3 逐 (n_co, model_type) 计时 ────────────────────────────────────
+    # ── GNN / SO3 逐 (n_co, model_type) 计时 ─────────────────────────────────
     for mt in model_types:
         for n_co in n_co_list:
             run_name = f"arch_fd{fd_order}_nco{n_co}_{mt}_hd{hidden_dim}_ep{epochs}"
@@ -489,7 +506,7 @@ def time_trained_gnn(
             label    = f"{mt.upper()} n_co={n_co}"
 
             if not os.path.isdir(run_path):
-                print(f"\n  [{label}]  SKIP — run dir not found: {run_path}")
+                print(f"\n  [{label}]  SKIP — not found: {run_path}")
                 results.append({
                     "label": label, "model_type": mt, "n_co": n_co,
                     "fd_order": fd_order, "error": "run_dir not found",
@@ -497,28 +514,17 @@ def time_trained_gnn(
                 continue
 
             try:
-                gnn_op = build_gnn_operator(run_path, use_fd=False, device=dev_str)
+                gnn_op = build_gnn_operator(
+                    run_path, use_fd=False, device=dev_str, **gnn_op_kw)
+                t_mean, t_std = _run_timing(gnn_op)
             except Exception as exc:
-                print(f"\n  [{label}]  FAILED to load: {exc}")
+                print(f"\n  [{label}]  FAILED: {exc}")
                 results.append({
                     "label": label, "model_type": mt, "n_co": n_co,
                     "fd_order": fd_order, "error": str(exc),
                 })
                 continue
 
-            # 热身
-            for _ in range(n_warmup):
-                gnn_op.matvec(psi_np)
-
-            # 计时
-            times = []
-            for _ in range(n_reps):
-                t0 = time.perf_counter()
-                gnn_op.matvec(psi_np)
-                times.append((time.perf_counter() - t0) * 1000.0)
-
-            t_mean = float(np.mean(times))
-            t_std  = float(np.std(times))
             print(f"  [{label}]  t={t_mean:.3f}±{t_std:.3f} ms")
             results.append({
                 "label":      label,
@@ -535,12 +541,14 @@ def time_trained_gnn(
     print(f"  {'Label':<22}  {'t_mean_ms':>10}  {'t_std_ms':>9}")
     print(f"  {'─'*22}  {'─'*10}  {'─'*9}")
     if fd_row:
-        print(f"  {fd_row['label']:<22}  {fd_row['t_mean_ms']:>10.3f}  {fd_row['t_std_ms']:>9.3f}")
+        print(f"  {fd_row['label']:<22}  {fd_row['t_mean_ms']:>10.3f}"
+              f"  {fd_row['t_std_ms']:>9.3f}")
     for r in results:
         if 'error' in r:
             print(f"  {r['label']:<22}  SKIP/ERROR")
         else:
-            print(f"  {r['label']:<22}  {r['t_mean_ms']:>10.3f}  {r['t_std_ms']:>9.3f}")
+            print(f"  {r['label']:<22}  {r['t_mean_ms']:>10.3f}"
+                  f"  {r['t_std_ms']:>9.3f}")
     print(f"{'─'*54}")
 
     # ── JSON ──────────────────────────────────────────────────────────────────
@@ -557,7 +565,8 @@ def time_trained_gnn(
             "n_reps":      n_reps,
             "n_warmup":    n_warmup,
             "device":      dev_str,
-            "N_sparse":    N_sparse,
+            "potential":   "qd" if use_qd else "V_sparse",
+            "N_grid":      N_grid,
             "n_grid":      n_grid,
         },
         "fd_baseline": fd_row,
