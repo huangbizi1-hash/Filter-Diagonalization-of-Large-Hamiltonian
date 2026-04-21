@@ -377,6 +377,178 @@ def time_h_apply(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# time_random_cross — 随机权重 GNN/SO3 cross 模型计时（无需训练）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def time_random_cross(
+    n_co_list:         list  = None,
+    model_types:       list  = None,
+    fd_order:          int   = 6,
+    hidden_dim:        int   = 16,
+    radial_hidden_dim: int   = 32,
+    n_reps:            int   = 10,
+    n_warmup:          int   = 3,
+    device:            str   = 'cpu',
+    output_root:       str   = '.',
+    description:       str   = '',
+):
+    """
+    对随机初始化（未训练）的 GNN-cross / SO3-cross 模型在 V_sparse 上计时。
+
+    用途：测试不同 n_co 带来的图规模（co 边数量）对 H-apply 耗时的影响，
+    与训练权重无关。
+
+    Parameters
+    ----------
+    n_co_list   : n_co 值列表（默认 [3, 4, 5]）
+    model_types : 'gnn' 和/或 'so3'（默认 ['gnn', 'so3']）
+    fd_order    : FD 精度阶数
+    """
+    import json as _json
+
+    if n_co_list   is None: n_co_list   = [3, 4, 5]
+    if model_types is None: model_types = ['gnn', 'so3']
+
+    from .physics import N_sparse, V_sparse, d_sparse
+    from .graph   import build_star_graph
+    from .model   import (HamiltonianGNN_Cross, FiniteDiffHamiltonian_Cross,
+                          SO3HamiltonianNet)
+
+    ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(output_root)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    dev_str = (device if device != 'auto' else
+               ('cuda' if torch.cuda.is_available() else 'cpu'))
+    dev     = torch.device(dev_str)
+
+    n_grid  = N_sparse ** 3
+    grid_L  = N_sparse * d_sparse
+    V_t     = torch.tensor(V_sparse.flatten(), dtype=torch.float32).unsqueeze(-1).to(dev)
+
+    rng     = np.random.default_rng(42)
+    psi_np  = rng.standard_normal(n_grid).astype(np.float64)
+    psi_np /= np.linalg.norm(psi_np)
+    psi_t   = torch.tensor(psi_np.astype(np.float32),
+                            dtype=torch.float32).unsqueeze(-1).to(dev)
+
+    print(f"\n{'='*64}")
+    print(f"  Random-weight cross timing  (N={N_sparse}, n={n_grid})")
+    print(f"  fd_order={fd_order}  n_co_list={n_co_list}  model_types={model_types}")
+    print(f"  n_reps={n_reps}  n_warmup={n_warmup}  device={dev_str}")
+    print(f"{'='*64}")
+
+    results = []
+
+    for n_co in n_co_list:
+        print(f"\n  Building graph  n_co={n_co}  (expected {n_co**3-1} co-neighbors/node)...")
+        fd_ei, fd_ea, co_ei, co_ea = build_star_graph(
+            fd_order, n_co, N=N_sparse, d=d_sparse, grid_L=grid_L)
+        fd_ei = fd_ei.to(dev); fd_ea = fd_ea.to(dev)
+        co_ei = co_ei.to(dev); co_ea = co_ea.to(dev)
+        n_co_edges = co_ei.shape[1]
+        print(f"    co_edges total = {n_co_edges:,}  "
+              f"({n_co_edges // n_grid} per node, expected {n_co**3-1})")
+
+        # FD 基准（只建一次 per n_co，不依赖模型类型）
+        _fd = FiniteDiffHamiltonian_Cross(fd_ei, fd_ea, V_t, dev)
+
+        def _fd_fn(psi, _f=_fd): return _f(psi)
+
+        for _ in range(n_warmup):
+            with torch.no_grad(): _fd_fn(psi_t)
+        fd_times = []
+        for _ in range(n_reps):
+            if dev.type == 'cuda': torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            with torch.no_grad(): _fd_fn(psi_t)
+            if dev.type == 'cuda': torch.cuda.synchronize()
+            fd_times.append((time.perf_counter() - t0) * 1000.0)
+        fd_mean, fd_std = float(np.mean(fd_times)), float(np.std(fd_times))
+        print(f"    FD:   {fd_mean:.3f}±{fd_std:.3f} ms")
+        results.append({
+            "model_type":   "fd",
+            "n_co":         n_co,
+            "n_co_edges":   n_co_edges,
+            "t_mean_ms":    fd_mean,
+            "t_std_ms":     fd_std,
+        })
+
+        # GNN / SO3
+        for mt in model_types:
+            if mt == 'gnn':
+                model = HamiltonianGNN_Cross(hidden_dim=hidden_dim).to(dev)
+            else:
+                model = SO3HamiltonianNet(radial_hidden_dim=radial_hidden_dim).to(dev)
+            model.eval()
+            n_params = sum(p.numel() for p in model.parameters())
+
+            def _fn(psi, _m=model):
+                nrm = torch.norm(psi) + 1e-30
+                return _m(psi / nrm, fd_ei, fd_ea, co_ei, co_ea, V_t) * nrm
+
+            for _ in range(n_warmup):
+                with torch.no_grad(): _fn(psi_t)
+            times = []
+            for _ in range(n_reps):
+                if dev.type == 'cuda': torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                with torch.no_grad(): _fn(psi_t)
+                if dev.type == 'cuda': torch.cuda.synchronize()
+                times.append((time.perf_counter() - t0) * 1000.0)
+            t_mean, t_std = float(np.mean(times)), float(np.std(times))
+            print(f"    {mt.upper():<4} (params={n_params}):  "
+                  f"{t_mean:.3f}±{t_std:.3f} ms")
+            results.append({
+                "model_type":   mt,
+                "n_co":         n_co,
+                "n_co_edges":   n_co_edges,
+                "hidden_dim":   hidden_dim if mt == 'gnn' else None,
+                "radial_hidden_dim": radial_hidden_dim if mt == 'so3' else None,
+                "n_params":     n_params,
+                "t_mean_ms":    t_mean,
+                "t_std_ms":     t_std,
+            })
+
+    # ── Summary table ─────────────────────────────────────────────────────────
+    print(f"\n{'─'*60}")
+    print(f"  {'model':<8}  {'n_co':>5}  {'co_edges':>10}  "
+          f"{'t_mean_ms':>10}  {'t_std_ms':>9}")
+    print(f"  {'─'*8}  {'─'*5}  {'─'*10}  {'─'*10}  {'─'*9}")
+    for r in results:
+        print(f"  {r['model_type']:<8}  {r['n_co']:>5}  "
+              f"{r['n_co_edges']:>10,}  "
+              f"{r['t_mean_ms']:>10.3f}  {r['t_std_ms']:>9.3f}")
+    print(f"{'─'*60}")
+
+    # ── JSON ──────────────────────────────────────────────────────────────────
+    output = {
+        "description": description,
+        "script":      "gnn_code/timing_benchmark.py::time_random_cross",
+        "datetime":    datetime.datetime.now().isoformat(),
+        "config": {
+            "n_co_list":         n_co_list,
+            "model_types":       model_types,
+            "fd_order":          fd_order,
+            "hidden_dim":        hidden_dim,
+            "radial_hidden_dim": radial_hidden_dim,
+            "n_reps":            n_reps,
+            "n_warmup":          n_warmup,
+            "device":            dev_str,
+            "N_sparse":          N_sparse,
+            "n_grid":            n_grid,
+            "potential":         "V_sparse",
+        },
+        "results": results,
+    }
+    json_path = out_dir / f"arch_timing_rand_{ts}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        _json.dump(output, f, indent=2, ensure_ascii=False, default=float)
+    print(f"\n  Results → {json_path}")
+    return output
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # time_trained_gnn — 对已训练 arch_sweep 模型计时
 # ─────────────────────────────────────────────────────────────────────────────
 

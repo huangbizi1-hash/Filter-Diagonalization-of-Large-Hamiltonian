@@ -48,7 +48,8 @@ def main():
                                  "timing", "stability", "fd_compare", "compare",
                                  "iter_test", "loss_compare",
                                  "data_scaling", "arch_sweep",
-                                 "arch_timing", "arch_loss", "all"],
+                                 "arch_timing", "arch_timing_rand",
+                                 "arch_loss", "all"],
                         help="test_fd: FD baseline on random wfs (no PyTorch); "
                              "test_ho: HO ground state correctness test (no PyTorch); "
                              "test_gnn_ho: HO ground state test with GNN comparison; "
@@ -64,6 +65,7 @@ def main():
                              "data_scaling: Exp-1 train data size vs test loss (n_k sweep, fixed arch); "
                              "arch_sweep: Exp-2 n_co / model_type sweep vs k=0 fidelity (fixed data); "
                              "arch_timing: time trained GNN/SO3 models on V_sparse (use already-trained arch_sweep models); "
+                             "arch_timing_rand: time random-weight GNN/SO3 cross models vs n_co (no training needed); "
                              "arch_loss: compare final train loss (last N ep avg) + val loss for arch_sweep models")
 
     # 波函数
@@ -522,6 +524,26 @@ def main():
             output_root  = OUTPUT_ROOT,
             description  = args.timing_description,
             **kw,
+        )
+        return
+
+    # ── arch_timing_rand 模式：随机权重 cross 模型计时（无训练）──
+    if args.mode == "arch_timing_rand":
+        from gnn_code.timing_benchmark import time_random_cross
+        model_types = ['gnn']
+        if args.arch_use_so3:
+            model_types.append('so3')
+        time_random_cross(
+            n_co_list         = args.arch_n_co_list,
+            model_types       = model_types,
+            fd_order          = args.arch_fd_order,
+            hidden_dim        = args.timing_hidden_dim,
+            radial_hidden_dim = args.timing_radial_hidden_dim,
+            n_reps            = args.timing_n_reps,
+            n_warmup          = args.timing_n_warmup,
+            device            = args.device,
+            output_root       = OUTPUT_ROOT,
+            description       = args.timing_description,
         )
         return
 

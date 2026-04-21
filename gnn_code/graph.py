@@ -129,7 +129,9 @@ def build_star_graph(fd_order: int = 4, n_co: int = 3,
     Parameters
     ----------
     fd_order : FD 精度阶数（偶数）
-    n_co     : correction 立方体边长（奇数）
+    n_co     : correction 立方体边长（正整数）。精确生成 n_co³-1 个邻居：
+               每轴取 n_co 个偏移量，范围 [-(n_co//2), (n_co-1)//2]，
+               跳过中心点。奇数 n_co 对称，偶数 n_co 负方向多一格。
     N        : 每轴网格点数（默认 N_sparse）
     d        : 网格步长（Bohr，默认 d_sparse）
     grid_L   : 周期性盒子边长（Bohr，默认 N * d）
@@ -145,7 +147,11 @@ def build_star_graph(fd_order: int = 4, n_co: int = 3,
     fd_w       = {int(k): float(-c[ki] / (2.0 * d**2))
                   for ki, k in enumerate(offsets_1d) if k != 0}
 
-    r_co  = n_co // 2
+    # n_co 直接决定每轴取 n_co 个偏移，确保 n_co³-1 个邻居：
+    #   偶数 n_co：[-n_co//2, (n_co-1)//2]（负方向多一格）
+    #   奇数 n_co：[-(n_co-1)//2, (n_co-1)//2]（对称）
+    co_neg = -(n_co // 2)
+    co_pos = (n_co - 1) // 2
     AXES  = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
 
     n_nodes = N ** 3
@@ -173,9 +179,9 @@ def build_star_graph(fd_order: int = 4, n_co: int = 3,
             fd_ea_list.append(attr)
 
     # ── 2. Co 边 ──
-    for di in range(-r_co, r_co + 1):
-        for dj in range(-r_co, r_co + 1):
-            for dk in range(-r_co, r_co + 1):
+    for di in range(co_neg, co_pos + 1):
+        for dj in range(co_neg, co_pos + 1):
+            for dk in range(co_neg, co_pos + 1):
                 if di == 0 and dj == 0 and dk == 0:
                     continue
 
