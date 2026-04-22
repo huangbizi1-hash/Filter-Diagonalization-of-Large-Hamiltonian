@@ -35,6 +35,8 @@ class RBFProblem:
     lap_interp_matrix: Optional[object]
     grid_points: Optional[Array]
     grid_shape: Optional[Tuple[int, int, int]]
+    # Custom potential on interior nodes (overrides harmonic V=0.5*r² when set)
+    V_nodes: Optional[Array] = None
 
     def ground_state(self, x: Optional[Array] = None) -> Array:
         pts = self.nodes if x is None else x
@@ -48,6 +50,8 @@ class RBFProblem:
         return (r2 - 3.0) * psi
 
     def potential(self, x: Optional[Array] = None) -> Array:
+        if self.V_nodes is not None and x is None:
+            return self.V_nodes
         pts = self.nodes[self.interior_idx] if x is None else x
         return 0.5 * np.sum(pts**2, axis=1)
 
@@ -218,6 +222,7 @@ def build_hamiltonian_matrix(problem: RBFProblem) -> sp.csr_matrix:
 def solve_lowest_eigenvalues(
     problem: RBFProblem,
     n_eigs: int = 6,
+    device: str = "cpu",
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Return (eigenvalues, eigenvectors) for the n_eigs lowest eigenvalues of H.
@@ -225,13 +230,215 @@ def solve_lowest_eigenvalues(
     eigenvalues : shape (n_eigs,), sorted ascending
     eigenvectors: shape (n_interior, n_eigs)
 
-    Exact 3-D HO levels: E = n_x+n_y+n_z + 3/2
-      -> 1.5 (1x), 2.5 (3x), 3.5 (6x), 4.5 (10x), ...
+    device='cpu'  → scipy.sparse.linalg.eigsh (ARPACK)
+    device='cuda' → cupy + cupyx.scipy.sparse.linalg.eigsh
     """
     H = build_hamiltonian_matrix(problem)
-    vals, vecs = spla.eigsh(H, k=n_eigs, which="SM")
+
+    if device == "cpu":
+        vals, vecs = spla.eigsh(H, k=n_eigs, which="SM")
+    elif device == "cuda":
+        try:
+            import cupy as cp
+            import cupyx.scipy.sparse as cpsp
+            import cupyx.scipy.sparse.linalg as cpspla
+        except ImportError:
+            raise RuntimeError(
+                "cupy is required for device='cuda'. "
+                "Install with: pip install cupy-cuda12x  (match your CUDA version)"
+            )
+        H_gpu = cpsp.csr_matrix(H)
+        vals_gpu, vecs_gpu = cpspla.eigsh(H_gpu, k=n_eigs, which="SM")
+        vals = cp.asnumpy(vals_gpu)
+        vecs = cp.asnumpy(vecs_gpu)
+    else:
+        raise ValueError(f"device must be 'cpu' or 'cuda', got {device!r}")
+
     order = np.argsort(vals)
     return vals[order], vecs[:, order]
+
+
+# ─── Cube file reader ────────────────────────────────────────────────────────
+
+def read_cube_file(path: str) -> Tuple[Array, Array, Array, Array]:
+    """
+    Read a Gaussian cube file (orthogonal grid assumed).
+
+    Returns
+    -------
+    x, y, z  : 1-D coordinate arrays (Bohr)
+    potential : shape (nx, ny, nz) in Hartree
+    """
+    with open(path, "r") as f:
+        lines = f.readlines()
+    n_atoms = abs(int(lines[2].split()[0]))
+    ox, oy, oz = (float(v) for v in lines[2].split()[1:4])
+    nx, dx = int(lines[3].split()[0]), float(lines[3].split()[1])
+    ny, dy = int(lines[4].split()[0]), float(lines[4].split()[2])
+    nz, dz = int(lines[5].split()[0]), float(lines[5].split()[3])
+    data_start = 6 + n_atoms
+    vals: list[float] = []
+    for line in lines[data_start:]:
+        vals.extend(map(float, line.split()))
+    potential = np.array(vals[: nx * ny * nz], dtype=np.float64).reshape(nx, ny, nz)
+    x = ox + np.arange(nx) * dx
+    y = oy + np.arange(ny) * dy
+    z = oz + np.arange(nz) * dz
+    return x, y, z, potential
+
+
+# ─── Sphere boundary (icosphere) ─────────────────────────────────────────────
+
+def _make_icosphere(R: float, n_subdivide: int = 3) -> Tuple[Array, Array]:
+    """Triangulated sphere surface of radius R for use with poisson_disc_nodes."""
+    phi = (1.0 + np.sqrt(5.0)) / 2.0
+    raw = np.array(
+        [[-1, phi, 0], [1, phi, 0], [-1, -phi, 0], [1, -phi, 0],
+         [0, -1, phi], [0, 1, phi], [0, -1, -phi], [0, 1, -phi],
+         [phi, 0, -1], [phi, 0, 1], [-phi, 0, -1], [-phi, 0, 1]],
+        dtype=float,
+    )
+    verts: list[Array] = list(raw / np.linalg.norm(raw[0]) * R)
+    faces: list[list[int]] = [
+        [0,11,5],[0,5,1],[0,1,7],[0,7,10],[0,10,11],
+        [1,5,9],[5,11,4],[11,10,2],[10,7,6],[7,1,8],
+        [3,9,4],[3,4,2],[3,2,6],[3,6,8],[3,8,9],
+        [4,9,5],[2,4,11],[6,2,10],[8,6,7],[9,8,1],
+    ]
+
+    for _ in range(n_subdivide):
+        midpoints: Dict[Tuple[int, int], int] = {}
+
+        def _mid(a: int, b: int) -> int:
+            key = (min(a, b), max(a, b))
+            if key not in midpoints:
+                m = (np.asarray(verts[a]) + np.asarray(verts[b])) / 2.0
+                m = m / np.linalg.norm(m) * R
+                midpoints[key] = len(verts)
+                verts.append(m)
+            return midpoints[key]
+
+        new_faces: list[list[int]] = []
+        for f in faces:
+            a, b, c = f
+            ab, bc, ca = _mid(a, b), _mid(b, c), _mid(c, a)
+            new_faces += [[a, ab, ca], [b, bc, ab], [c, ca, bc], [ab, bc, ca]]
+        faces = new_faces
+
+    return np.array(verts), np.array(faces, dtype=int)
+
+
+def generate_sphere_nodes(
+    spacing: float, R: float = 20.0, n_subdivide: int = 3
+):
+    """Poisson disc nodes inside a sphere of radius R."""
+    vert, smp = _make_icosphere(R, n_subdivide)
+    nodes, groups, _ = poisson_disc_nodes(spacing, (vert, smp))
+    return nodes, groups
+
+
+# ─── QD problem builder ──────────────────────────────────────────────────────
+
+def build_qd_problem(
+    cube_file: str,
+    domain: str = "cube",
+    spacing: float = 0.5,
+    R: float = 20.0,
+    stencil_size: int = 80,
+    phi: str = "phs3",
+    eps: float = 0.5,
+    order: int = 2,
+    sphere_subdivide: int = 3,
+) -> RBFProblem:
+    """
+    Build RBFProblem with QD potential from a Gaussian cube file.
+
+    domain='cube'
+        Use the exact regular grid from the cube file as nodes.
+        Interior = all non-face points; boundary (Dirichlet=0) = face points.
+        `spacing` and `R` are ignored.
+
+    domain='sphere'
+        Poisson disc nodes inside a sphere of radius R (default 20.0 Bohr).
+        QD potential is interpolated to node positions via linear RegularGridInterpolator.
+        Points outside the cube file extent get V=0.
+
+    Parameters
+    ----------
+    cube_file      : path to Gaussian .cube file
+    domain         : 'cube' or 'sphere'
+    spacing        : Poisson disc node spacing (sphere domain only)
+    R              : sphere radius in Bohr (sphere domain only, default 20.0)
+    stencil_size   : RBF-FD stencil size
+    phi            : RBF kernel name
+    eps            : RBF shape parameter
+    order          : polynomial augmentation order
+    sphere_subdivide: icosphere subdivision count (higher = smoother sphere)
+    """
+    from scipy.interpolate import RegularGridInterpolator
+
+    x_grid, y_grid, z_grid, pot_3d = read_cube_file(cube_file)
+    interp_fn = RegularGridInterpolator(
+        (x_grid, y_grid, z_grid), pot_3d,
+        method="linear", bounds_error=False, fill_value=0.0,
+    )
+
+    if domain == "cube":
+        nx, ny, nz = len(x_grid), len(y_grid), len(z_grid)
+        X, Y, Z = np.meshgrid(x_grid, y_grid, z_grid, indexing="ij")
+        nodes = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+        i_idx, j_idx, k_idx = np.unravel_index(np.arange(len(nodes)), (nx, ny, nz))
+        on_boundary = (
+            (i_idx == 0) | (i_idx == nx - 1) |
+            (j_idx == 0) | (j_idx == ny - 1) |
+            (k_idx == 0) | (k_idx == nz - 1)
+        )
+        interior_idx = np.where(~on_boundary)[0]
+        groups = {
+            "interior": interior_idx,
+            "boundary": np.where(on_boundary)[0],
+        }
+        cfg_L = float(np.max(np.abs(nodes)))
+
+    elif domain == "sphere":
+        nodes, groups = generate_sphere_nodes(spacing, R, sphere_subdivide)
+        interior_idx = groups["interior"]
+        cfg_L = R
+
+    else:
+        raise ValueError(f"domain must be 'cube' or 'sphere', got {domain!r}")
+
+    # QD potential on interior nodes (clamp tail artefacts near nuclei)
+    V_nodes = interp_fn(nodes[interior_idx]).astype(np.float64)
+    v_cap = float(np.percentile(V_nodes, 99.9))
+    V_nodes = np.clip(V_nodes, None, v_cap)
+
+    laplacian_matrix = weight_matrix(
+        x=nodes[interior_idx],
+        p=nodes,
+        n=stencil_size,
+        diffs=[[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+        phi=phi,
+        eps=eps,
+        order=order,
+    )
+
+    cfg = RBFConfig(
+        spacing=spacing, L=cfg_L,
+        stencil_size=stencil_size, phi=phi, eps=eps, order=order,
+    )
+    return RBFProblem(
+        config=cfg,
+        nodes=nodes,
+        groups=groups,
+        interior_idx=interior_idx,
+        laplacian_matrix=laplacian_matrix,
+        psi_interp_matrix=None,
+        lap_interp_matrix=None,
+        grid_points=None,
+        grid_shape=None,
+        V_nodes=V_nodes,
+    )
 
 
 def iterate_hamiltonian(problem: RBFProblem, n_max: int = 20, normalize_each_step: bool = True):
