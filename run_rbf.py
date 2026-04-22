@@ -7,6 +7,7 @@ from pathlib import Path
 from rbf_core import (RBFConfig, build_problem, build_qd_problem,
                        iterate_hamiltonian, relative_laplacian_error,
                        solve_lowest_eigenvalues, sweep_rbf_kernels,
+                       sweep_stencil_eps,
                        generate_nodes, KERNELS_ALL, KERNEL_GROUPS)
 
 
@@ -61,6 +62,37 @@ def parse_args() -> argparse.Namespace:
     sw.add_argument(
         "--sweep-output-dir", type=str, default=".",
         help="Directory for JSON and PNG output (default: current dir).",
+    )
+
+    # ── Stencil × eps 2D sweep ───────────────────────────────────────────────
+    s2 = parser.add_argument_group(
+        "Stencil×eps sweep (activated by --sweep-stencil-eps)")
+    s2.add_argument(
+        "--sweep-stencil-eps", action="store_true",
+        help="2D sweep over stencil_size and eps for a fixed phi.",
+    )
+    s2.add_argument(
+        "--sweep2-phi", type=str, default="ga",
+        help="RBF kernel for the 2D sweep (default: ga).",
+    )
+    s2.add_argument(
+        "--sweep2-stencil-sizes", type=int, nargs="+",
+        default=[8, 16, 32, 64, 128, 256],
+        help="Stencil sizes to sweep (default: 8 16 32 64 128 256).",
+    )
+    s2.add_argument(
+        "--sweep2-eps-list", type=float, nargs="+",
+        default=[round(0.1 * i, 10) for i in range(1, 11)],
+        help="eps values to sweep (default: 0.1 0.2 … 1.0).",
+    )
+    s2.add_argument(
+        "--sweep2-description", type=str,
+        default="2D sweep of stencil_size × eps on 3D HO (ga kernel, fixed nodes)",
+        help="Description stored in output JSON.",
+    )
+    s2.add_argument(
+        "--sweep2-output-dir", type=str, default=".",
+        help="Output directory for 2D sweep JSON and PNG.",
     )
 
     # ── QD mode ──────────────────────────────────────────────────────────────
@@ -215,6 +247,163 @@ def _run_sweep_kernels(args) -> None:
     print(f"  Plot → {plot_path}")
 
 
+def _run_sweep_stencil_eps(args) -> None:
+    import datetime
+    import json
+    import numpy as np
+    from pathlib import Path
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    stencil_sizes = args.sweep2_stencil_sizes
+    eps_values    = args.sweep2_eps_list
+    phi           = args.sweep2_phi
+
+    print("=" * 72)
+    print(f"2D sweep: stencil_size × eps   phi={phi}  order={args.order}")
+    print(f"  stencil_sizes = {stencil_sizes}")
+    print(f"  eps_values    = {[round(e, 2) for e in eps_values]}")
+    print(f"  spacing={args.spacing}  L={args.L}  n_eigs={args.n_eigs}"
+          f"  device={args.device}  symmetrize={args.symmetrize}")
+    print("  Generating nodes (fixed)...")
+    nodes, groups = generate_nodes(spacing=args.spacing, L=args.L)
+    interior_idx = groups["interior"]
+    print(f"  nodes total={nodes.shape[0]}  interior={interior_idx.shape[0]}")
+    print("-" * 72)
+
+    results = sweep_stencil_eps(
+        nodes=nodes, groups=groups,
+        phi=phi,
+        stencil_sizes=stencil_sizes,
+        eps_values=eps_values,
+        order=args.order,
+        n_eigs=args.n_eigs,
+        device=args.device,
+        symmetrize=args.symmetrize,
+    )
+
+    # best result
+    ok = [r for r in results if r["status"] == "ok"]
+    if ok:
+        best = ok[0]
+        print("-" * 72)
+        print(f"Best: stencil={best['stencil_size']}  eps={best['eps']:.2f}"
+              f"  mean_rel_err={best['mean_rel_err']:.4e}")
+
+    # ── JSON ─────────────────────────────────────────────────────────────────
+    ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(args.sweep2_output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # build 2D grid arrays for the JSON (rows=stencil_sizes, cols=eps_values)
+    err_grid = []
+    for n_st in stencil_sizes:
+        row = []
+        for eps in eps_values:
+            match = next(
+                (r for r in results
+                 if r["stencil_size"] == n_st and abs(r["eps"] - eps) < 1e-9),
+                None,
+            )
+            val = match["mean_rel_err"] if match and match["status"] == "ok" else None
+            row.append(val)
+        err_grid.append(row)
+
+    output = {
+        "description": args.sweep2_description,
+        "datetime":    datetime.datetime.now().isoformat(),
+        "config": {
+            "spacing":        args.spacing,
+            "L":              args.L,
+            "n_nodes_total":  int(nodes.shape[0]),
+            "n_interior":     int(interior_idx.shape[0]),
+            "phi":            phi,
+            "order":          args.order,
+            "n_eigs":         args.n_eigs,
+            "device":         args.device,
+            "symmetrize":     args.symmetrize,
+            "stencil_sizes":  stencil_sizes,
+            "eps_values":     [round(e, 10) for e in eps_values],
+        },
+        "err_grid": err_grid,       # [stencil_idx][eps_idx]
+        "results":  results,        # flat list sorted by mean_rel_err
+        "best": {
+            "stencil_size": best["stencil_size"],
+            "eps":          best["eps"],
+            "mean_rel_err": best["mean_rel_err"],
+        } if ok else None,
+    }
+    json_path = out_dir / f"sweep_stencil_eps_{ts}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False, default=float)
+    print(f"  JSON → {json_path}")
+
+    # ── Plot ─────────────────────────────────────────────────────────────────
+    if not ok:
+        return
+
+    # build numpy grid (NaN for failed)
+    Z = np.full((len(stencil_sizes), len(eps_values)), np.nan)
+    for r in ok:
+        ri = stencil_sizes.index(r["stencil_size"])
+        ci = min(range(len(eps_values)),
+                 key=lambda j: abs(eps_values[j] - r["eps"]))
+        Z[ri, ci] = r["mean_rel_err"]
+
+    eps_arr = np.array([round(e, 2) for e in eps_values])
+    n_st_arr = np.array(stencil_sizes)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+    # Left: 2D heat-map (log colour scale)
+    ax = axes[0]
+    vmin = np.nanmin(Z[Z > 0])
+    vmax = np.nanmax(Z[np.isfinite(Z)])
+    im = ax.pcolormesh(
+        eps_arr, n_st_arr, Z,
+        norm=LogNorm(vmin=vmin, vmax=vmax),
+        cmap="viridis_r", shading="nearest",
+    )
+    fig.colorbar(im, ax=ax, label="Mean relative spectral error")
+    ax.set_xlabel("eps (shape parameter)")
+    ax.set_ylabel("Stencil size")
+    ax.set_yscale("log")
+    ax.set_yticks(n_st_arr)
+    ax.set_yticklabels(n_st_arr)
+    ax.set_title(f"3D HO spectral error  phi={phi}  spacing={args.spacing}"
+                 f"  order={args.order}")
+    # mark best
+    if ok:
+        ax.scatter([best["eps"]], [best["stencil_size"]],
+                   marker="*", s=200, color="red", zorder=5, label="best")
+        ax.legend(fontsize=9)
+
+    # Right: line plot per stencil_size
+    ax2 = axes[1]
+    cmap_lines = plt.get_cmap("tab10")
+    for idx, n_st in enumerate(stencil_sizes):
+        row_errs = Z[idx]
+        mask = np.isfinite(row_errs)
+        if mask.any():
+            ax2.semilogy(eps_arr[mask], row_errs[mask],
+                         marker="o", markersize=4, linewidth=1.5,
+                         color=cmap_lines(idx % 10),
+                         label=f"n={n_st}")
+    ax2.set_xlabel("eps")
+    ax2.set_ylabel("Mean relative spectral error")
+    ax2.set_title("Error vs eps per stencil size")
+    ax2.legend(fontsize=8, ncol=2)
+    ax2.grid(True, which="both", alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = out_dir / f"sweep_stencil_eps_{ts}.png"
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"  Plot → {plot_path}")
+
+
 def _print_eigs(vals: "np.ndarray", n_eigs: int, is_ho: bool) -> None:
     """Print eigenvalue table; compares to 3-D HO exact levels when is_ho=True.
     Handles both real (float64) and complex (complex128) eigenvalue arrays."""
@@ -263,6 +452,11 @@ def main() -> None:
     # ── Kernel sweep mode ────────────────────────────────────────────────────
     if args.sweep_kernels:
         _run_sweep_kernels(args)
+        return
+
+    # ── Stencil × eps 2D sweep ───────────────────────────────────────────────
+    if args.sweep_stencil_eps:
+        _run_sweep_stencil_eps(args)
         return
 
     # ── QD mode ──────────────────────────────────────────────────────────────

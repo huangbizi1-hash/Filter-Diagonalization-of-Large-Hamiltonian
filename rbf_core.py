@@ -580,6 +580,95 @@ def sweep_rbf_kernels(
     return sorted(results, key=lambda r: r.get("mean_rel_err", float("inf")))
 
 
+def sweep_stencil_eps(
+    nodes: Array,
+    groups: Dict[str, Array],
+    phi: str = "ga",
+    stencil_sizes: Optional[list] = None,
+    eps_values: Optional[list] = None,
+    order: int = 0,
+    n_eigs: int = 10,
+    device: str = "cpu",
+    symmetrize: bool = False,
+) -> list:
+    """
+    2D sweep over (stencil_size, eps) for a fixed RBF kernel (phi).
+    Nodes are generated once and fixed; only the Laplacian is rebuilt per pair.
+
+    Returns a flat list of result dicts (all pairs including failed ones),
+    sorted ascending by mean_rel_err.  Each dict contains:
+        stencil_size, eps, status, mean_rel_err, max_imag,
+        eigenvalues_re, eigenvalues_im
+    """
+    if stencil_sizes is None:
+        stencil_sizes = [8, 16, 32, 64, 128, 256]
+    if eps_values is None:
+        eps_values = [round(0.1 * i, 10) for i in range(1, 11)]
+
+    interior_idx = groups["interior"]
+    exact = _ho_exact_levels(n_eigs)
+    results = []
+    n_total = len(stencil_sizes) * len(eps_values)
+    done = 0
+
+    for n_st in stencil_sizes:
+        for eps in eps_values:
+            done += 1
+            print(f"  [{done:3d}/{n_total}]  stencil={n_st:4d}  eps={eps:.2f}",
+                  end="  ", flush=True)
+            try:
+                lap = weight_matrix(
+                    x=nodes[interior_idx],
+                    p=nodes,
+                    n=n_st,
+                    diffs=[[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+                    phi=phi,
+                    eps=eps,
+                    order=order,
+                )
+                prob = RBFProblem(
+                    config=RBFConfig(stencil_size=n_st, phi=phi,
+                                     eps=eps, order=order),
+                    nodes=nodes,
+                    groups=groups,
+                    interior_idx=interior_idx,
+                    laplacian_matrix=lap,
+                    psi_interp_matrix=None,
+                    lap_interp_matrix=None,
+                    grid_points=None,
+                    grid_shape=None,
+                )
+                vals, _ = solve_lowest_eigenvalues(
+                    prob, n_eigs=n_eigs, device=device, symmetrize=symmetrize)
+                rel_errs = np.abs(np.abs(vals) - exact) / np.abs(exact)
+                mean_rel_err = float(np.mean(rel_errs))
+                max_imag = (float(np.max(np.abs(np.imag(vals))))
+                            if np.iscomplexobj(vals) else 0.0)
+                print(f"mean_rel_err={mean_rel_err:.4e}  max|Im|={max_imag:.2e}")
+                results.append({
+                    "stencil_size":   n_st,
+                    "eps":            float(eps),
+                    "status":         "ok",
+                    "mean_rel_err":   mean_rel_err,
+                    "max_imag":       max_imag,
+                    "eigenvalues_re": [float(v.real) for v in vals],
+                    "eigenvalues_im": ([float(v.imag) for v in vals]
+                                       if np.iscomplexobj(vals)
+                                       else [0.0] * len(vals)),
+                })
+            except Exception as exc:
+                print(f"FAILED: {exc}")
+                results.append({
+                    "stencil_size": n_st,
+                    "eps":          float(eps),
+                    "status":       "failed",
+                    "error":        str(exc),
+                    "mean_rel_err": float("inf"),
+                })
+
+    return sorted(results, key=lambda r: r.get("mean_rel_err", float("inf")))
+
+
 def iterate_hamiltonian(problem: RBFProblem, n_max: int = 20, normalize_each_step: bool = True):
     psi_nodes = problem.ground_state()
     records = []
