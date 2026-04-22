@@ -12,6 +12,26 @@ from rbf.pde.nodes import poisson_disc_nodes
 
 Array = np.ndarray
 
+# ─── All supported RBF kernels ───────────────────────────────────────────────
+
+KERNELS_ALL: list[str] = [
+    # A. Polyharmonic splines
+    "phs1", "phs2", "phs3", "phs4", "phs5", "phs6", "phs7", "phs8",
+    # B. Classic global kernels
+    "mq", "imq", "iq", "ga",
+    # C. Length-scale kernels
+    "exp", "se", "mat32", "mat52",
+    # D. Compactly supported Wendland kernels
+    "wen10", "wen11", "wen12", "wen30", "wen31", "wen32",
+]
+
+KERNEL_GROUPS: dict[str, list[str]] = {
+    "PHS":         ["phs1", "phs2", "phs3", "phs4", "phs5", "phs6", "phs7", "phs8"],
+    "Global":      ["mq", "imq", "iq", "ga"],
+    "LengthScale": ["exp", "se", "mat32", "mat52"],
+    "Wendland":    ["wen10", "wen11", "wen12", "wen30", "wen31", "wen32"],
+}
+
 
 @dataclass
 class RBFConfig:
@@ -439,6 +459,92 @@ def build_qd_problem(
         grid_shape=None,
         V_nodes=V_nodes,
     )
+
+
+# ─── Kernel sweep experiment ─────────────────────────────────────────────────
+
+def _ho_exact_levels(n: int) -> np.ndarray:
+    """First n exact 3D HO eigenvalues in ascending order (including degeneracy)."""
+    levels: list[float] = []
+    for s in range(100):
+        e = s + 1.5
+        deg = (s + 1) * (s + 2) // 2
+        levels.extend([e] * deg)
+        if len(levels) >= n:
+            break
+    return np.array(levels[:n], dtype=float)
+
+
+def sweep_rbf_kernels(
+    nodes: Array,
+    groups: Dict[str, Array],
+    stencil_size: int = 16,
+    eps: float = 0.7,
+    order: int = 0,
+    n_eigs: int = 10,
+    device: str = "cpu",
+    kernels: Optional[list] = None,
+) -> list:
+    """
+    For each RBF kernel in `kernels`, rebuild only the Laplacian (nodes fixed),
+    assemble H, solve n_eigs lowest eigenvalues, and compute mean relative
+    spectral error against exact 3D HO levels.
+
+    Returns a list of result dicts sorted ascending by mean_rel_err.
+    Failed kernels appear at the end with status='failed'.
+    """
+    if kernels is None:
+        kernels = KERNELS_ALL
+
+    interior_idx = groups["interior"]
+    exact = _ho_exact_levels(n_eigs)
+    results = []
+
+    for phi in kernels:
+        print(f"  {phi:<10}", end="  ", flush=True)
+        try:
+            lap = weight_matrix(
+                x=nodes[interior_idx],
+                p=nodes,
+                n=stencil_size,
+                diffs=[[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+                phi=phi,
+                eps=eps,
+                order=order,
+            )
+            prob = RBFProblem(
+                config=RBFConfig(stencil_size=stencil_size, phi=phi,
+                                 eps=eps, order=order),
+                nodes=nodes,
+                groups=groups,
+                interior_idx=interior_idx,
+                laplacian_matrix=lap,
+                psi_interp_matrix=None,
+                lap_interp_matrix=None,
+                grid_points=None,
+                grid_shape=None,
+            )
+            vals, _ = solve_lowest_eigenvalues(prob, n_eigs=n_eigs, device=device)
+            rel_errs = np.abs(vals - exact) / np.abs(exact)
+            mean_rel_err = float(np.mean(rel_errs))
+            print(f"mean_rel_err={mean_rel_err:.4e}")
+            results.append({
+                "phi":          phi,
+                "status":       "ok",
+                "eigenvalues":  [float(v) for v in vals],
+                "exact":        [float(v) for v in exact],
+                "rel_errs":     [float(v) for v in rel_errs],
+                "mean_rel_err": mean_rel_err,
+            })
+        except Exception as exc:
+            print(f"FAILED: {exc}")
+            results.append({
+                "phi":    phi,
+                "status": "failed",
+                "error":  str(exc),
+            })
+
+    return sorted(results, key=lambda r: r.get("mean_rel_err", float("inf")))
 
 
 def iterate_hamiltonian(problem: RBFProblem, n_max: int = 20, normalize_each_step: bool = True):

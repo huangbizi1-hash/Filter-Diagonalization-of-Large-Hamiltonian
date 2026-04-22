@@ -6,7 +6,8 @@ from pathlib import Path
 
 from rbf_core import (RBFConfig, build_problem, build_qd_problem,
                        iterate_hamiltonian, relative_laplacian_error,
-                       solve_lowest_eigenvalues)
+                       solve_lowest_eigenvalues, sweep_rbf_kernels,
+                       generate_nodes, KERNELS_ALL, KERNEL_GROUPS)
 
 
 
@@ -41,6 +42,22 @@ def parse_args() -> argparse.Namespace:
         help="Device for eigenvalue solve: 'cpu' (scipy/ARPACK) or 'cuda' (cupy).",
     )
 
+    # ── Kernel sweep mode ─────────────────────────────────────────────────────
+    sw = parser.add_argument_group("Kernel sweep (activated by --sweep-kernels)")
+    sw.add_argument(
+        "--sweep-kernels", action="store_true",
+        help="Sweep all RBF kernels on fixed nodes, rank by mean spectral error.",
+    )
+    sw.add_argument(
+        "--sweep-description", type=str,
+        default="RBF kernel sweep on 3D harmonic oscillator, fixed Poisson-disc nodes",
+        help="Description string stored in the output JSON.",
+    )
+    sw.add_argument(
+        "--sweep-output-dir", type=str, default=".",
+        help="Directory for JSON and PNG output (default: current dir).",
+    )
+
     # ── QD mode ──────────────────────────────────────────────────────────────
     qd = parser.add_argument_group("QD mode (activated when --qd-cube is given)")
     qd.add_argument(
@@ -69,6 +86,127 @@ def parse_args() -> argparse.Namespace:
 
 
 
+def _run_sweep_kernels(args) -> None:
+    import datetime
+    import json
+    from pathlib import Path
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+    import numpy as np
+
+    print("=" * 72)
+    print("Kernel sweep — 3D harmonic oscillator (nodes fixed)")
+    print(f"  spacing={args.spacing}  L={args.L}  stencil_size={args.stencil_size}")
+    print(f"  eps={args.eps}  order={args.order}  n_eigs={args.n_eigs}  device={args.device}")
+    print("  Generating nodes once (fixed for all kernels)...")
+    nodes, groups = generate_nodes(spacing=args.spacing, L=args.L)
+    interior_idx = groups["interior"]
+    print(f"  nodes total={nodes.shape[0]}  interior={interior_idx.shape[0]}")
+    print("-" * 72)
+
+    results = sweep_rbf_kernels(
+        nodes=nodes, groups=groups,
+        stencil_size=args.stencil_size,
+        eps=args.eps,
+        order=args.order,
+        n_eigs=args.n_eigs,
+        device=args.device,
+    )
+
+    ok     = [r for r in results if r["status"] == "ok"]
+    failed = [r for r in results if r["status"] != "ok"]
+
+    print("-" * 72)
+    print("Ranking (best → worst):")
+    for i, r in enumerate(ok):
+        print(f"  {i+1:2d}. {r['phi']:<10}  mean_rel_err={r['mean_rel_err']:.4e}")
+    for r in failed:
+        print(f"   FAILED: {r['phi']}  — {r.get('error','')}")
+
+    # ── JSON ─────────────────────────────────────────────────────────────────
+    ts      = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(args.sweep_output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    output = {
+        "description": args.sweep_description,
+        "datetime":    datetime.datetime.now().isoformat(),
+        "config": {
+            "spacing":       args.spacing,
+            "L":             args.L,
+            "n_nodes_total": int(nodes.shape[0]),
+            "n_interior":    int(interior_idx.shape[0]),
+            "stencil_size":  args.stencil_size,
+            "eps":           args.eps,
+            "order":         args.order,
+            "n_eigs":        args.n_eigs,
+            "device":        args.device,
+        },
+        "results": results,
+        "ranking": [
+            {"rank": i + 1, "phi": r["phi"], "mean_rel_err": r["mean_rel_err"]}
+            for i, r in enumerate(ok)
+        ],
+        "best":  ok[0]["phi"] if ok else None,
+        "worst": ok[-1]["phi"] if ok else None,
+    }
+    json_path = out_dir / f"sweep_kernels_{ts}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False, default=float)
+    print(f"  JSON → {json_path}")
+
+    # ── Plot ─────────────────────────────────────────────────────────────────
+    if not ok:
+        return
+
+    group_colors = {
+        "PHS":         "#4C72B0",
+        "Global":      "#DD8452",
+        "LengthScale": "#55A868",
+        "Wendland":    "#C44E52",
+    }
+    phi_to_group = {p: g for g, ps in KERNEL_GROUPS.items() for p in ps}
+
+    phis   = [r["phi"]          for r in ok]
+    errs   = [r["mean_rel_err"] for r in ok]
+    colors = [group_colors.get(phi_to_group.get(p, ""), "#888888") for p in phis]
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+    # Left: sorted bar chart, log-scale
+    ax = axes[0]
+    ax.bar(range(len(phis)), errs, color=colors)
+    ax.set_xticks(range(len(phis)))
+    ax.set_xticklabels(phis, rotation=45, ha="right", fontsize=8)
+    ax.set_yscale("log")
+    ax.set_ylabel("Mean relative spectral error")
+    ax.set_title(f"RBF kernel sweep — 3D HO "
+                 f"(spacing={args.spacing}, n={args.stencil_size}, eps={args.eps}, order={args.order})")
+    ax.grid(True, axis="y", alpha=0.3)
+    legend_elems = [Patch(facecolor=c, label=g) for g, c in group_colors.items()]
+    ax.legend(handles=legend_elems, fontsize=8, loc="upper left")
+
+    # Right: per-eigenvalue relative error for top 5 kernels
+    ax2 = axes[1]
+    for r in ok[:5]:
+        ax2.plot(range(args.n_eigs), r["rel_errs"],
+                 marker="o", linewidth=1.5, markersize=4, label=r["phi"])
+    ax2.set_xlabel("Eigenvalue index")
+    ax2.set_ylabel("Relative error |E_rbf − E_exact| / |E_exact|")
+    ax2.set_yscale("log")
+    ax2.set_title("Per-eigenvalue error (top 5 kernels)")
+    ax2.legend(fontsize=8)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plot_path = out_dir / f"sweep_kernels_{ts}.png"
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    print(f"  Plot → {plot_path}")
+
+
 def _print_eigs(vals: "np.ndarray", n_eigs: int, is_ho: bool) -> None:
     """Print eigenvalue table; compares to 3-D HO exact levels when is_ho=True."""
     if is_ho:
@@ -93,6 +231,11 @@ def _print_eigs(vals: "np.ndarray", n_eigs: int, is_ho: bool) -> None:
 
 def main() -> None:
     args = parse_args()
+
+    # ── Kernel sweep mode ────────────────────────────────────────────────────
+    if args.sweep_kernels:
+        _run_sweep_kernels(args)
+        return
 
     # ── QD mode ──────────────────────────────────────────────────────────────
     if args.qd_cube:
