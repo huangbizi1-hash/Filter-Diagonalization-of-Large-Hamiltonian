@@ -39,7 +39,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--device", type=str, default="cpu",
-        help="Device for eigenvalue solve: 'cpu' (scipy/ARPACK) or 'cuda' (cupy).",
+        help="Device for eigenvalue solve: 'cpu' (scipy ARPACK sparse) or 'cuda' (torch dense).",
+    )
+    parser.add_argument(
+        "--symmetrize", action="store_true",
+        help="Symmetrize H=(H+Hᵀ)/2 before solving (enables real eigsh). "
+             "Default: off — uses non-symmetric eigs, returns complex eigenvalues.",
     )
 
     # ── Kernel sweep mode ─────────────────────────────────────────────────────
@@ -99,7 +104,8 @@ def _run_sweep_kernels(args) -> None:
     print("=" * 72)
     print("Kernel sweep — 3D harmonic oscillator (nodes fixed)")
     print(f"  spacing={args.spacing}  L={args.L}  stencil_size={args.stencil_size}")
-    print(f"  eps={args.eps}  order={args.order}  n_eigs={args.n_eigs}  device={args.device}")
+    print(f"  eps={args.eps}  order={args.order}  n_eigs={args.n_eigs}"
+          f"  device={args.device}  symmetrize={args.symmetrize}")
     print("  Generating nodes once (fixed for all kernels)...")
     nodes, groups = generate_nodes(spacing=args.spacing, L=args.L)
     interior_idx = groups["interior"]
@@ -113,6 +119,7 @@ def _run_sweep_kernels(args) -> None:
         order=args.order,
         n_eigs=args.n_eigs,
         device=args.device,
+        symmetrize=args.symmetrize,
     )
 
     ok     = [r for r in results if r["status"] == "ok"]
@@ -143,6 +150,7 @@ def _run_sweep_kernels(args) -> None:
             "order":         args.order,
             "n_eigs":        args.n_eigs,
             "device":        args.device,
+            "symmetrize":    args.symmetrize,
         },
         "results": results,
         "ranking": [
@@ -208,7 +216,11 @@ def _run_sweep_kernels(args) -> None:
 
 
 def _print_eigs(vals: "np.ndarray", n_eigs: int, is_ho: bool) -> None:
-    """Print eigenvalue table; compares to 3-D HO exact levels when is_ho=True."""
+    """Print eigenvalue table; compares to 3-D HO exact levels when is_ho=True.
+    Handles both real (float64) and complex (complex128) eigenvalue arrays."""
+    import numpy as np
+    is_complex = np.iscomplexobj(vals)
+
     if is_ho:
         exact_levels: list[float] = []
         for s in range(30):
@@ -217,16 +229,32 @@ def _print_eigs(vals: "np.ndarray", n_eigs: int, is_ho: bool) -> None:
             exact_levels.extend([e] * deg)
             if len(exact_levels) >= n_eigs:
                 break
-        print(f"{'#':>4}  {'E_rbf':>12}  {'E_exact':>12}  {'abs_err':>12}  {'rel_err':>10}")
-        for i, ev in enumerate(vals):
-            ex = exact_levels[i] if i < len(exact_levels) else float("nan")
-            ae = abs(ev - ex)
-            re = ae / abs(ex) if ex != 0 else float("nan")
-            print(f"{i:4d}  {ev:12.6f}  {ex:12.6f}  {ae:12.2e}  {re:10.2e}")
+        if is_complex:
+            print(f"{'#':>4}  {'Re(E)':>14}  {'Im(E)':>12}  "
+                  f"{'E_exact':>10}  {'|Re-ex|/ex':>12}")
+            for i, ev in enumerate(vals):
+                ex = exact_levels[i] if i < len(exact_levels) else float("nan")
+                re_err = abs(ev.real - ex) / abs(ex) if ex != 0 else float("nan")
+                print(f"{i:4d}  {ev.real:14.6f}  {ev.imag:12.4e}  "
+                      f"{ex:10.4f}  {re_err:12.4e}")
+        else:
+            print(f"{'#':>4}  {'E_rbf':>12}  {'E_exact':>12}  "
+                  f"{'abs_err':>12}  {'rel_err':>10}")
+            for i, ev in enumerate(vals):
+                ex = exact_levels[i] if i < len(exact_levels) else float("nan")
+                ae = abs(float(ev) - ex)
+                re = ae / abs(ex) if ex != 0 else float("nan")
+                print(f"{i:4d}  {float(ev):12.6f}  {ex:12.6f}  "
+                      f"{ae:12.2e}  {re:10.2e}")
     else:
-        print(f"{'#':>4}  {'E_rbf':>14}")
-        for i, ev in enumerate(vals):
-            print(f"{i:4d}  {ev:14.6f}")
+        if is_complex:
+            print(f"{'#':>4}  {'Re(E)':>16}  {'Im(E)':>14}")
+            for i, ev in enumerate(vals):
+                print(f"{i:4d}  {ev.real:16.6f}  {ev.imag:14.4e}")
+        else:
+            print(f"{'#':>4}  {'E_rbf':>14}")
+            for i, ev in enumerate(vals):
+                print(f"{i:4d}  {float(ev):14.6f}")
 
 
 def main() -> None:
@@ -263,9 +291,11 @@ def main() -> None:
         print(f"V range        : [{problem.V_nodes.min():.4f}, {problem.V_nodes.max():.4f}] Ha")
         if not args.no_eigs:
             print("-" * 72)
-            print(f"Sparse eigenvalue solve  n_eigs={args.n_eigs}  device={args.device}")
+            print(f"Sparse eigenvalue solve  n_eigs={args.n_eigs}  device={args.device}"
+                  f"  symmetrize={args.symmetrize}")
             vals, _ = solve_lowest_eigenvalues(problem, n_eigs=args.n_eigs,
-                                               device=args.device)
+                                               device=args.device,
+                                               symmetrize=args.symmetrize)
             _print_eigs(vals, args.n_eigs, is_ho=False)
         return
 
@@ -312,9 +342,11 @@ def main() -> None:
     if not args.no_eigs:
         print("-" * 72)
         print(f"Sparse eigenvalue solve  n_eigs={args.n_eigs}"
-              f"  interior={problem.interior_idx.shape[0]}  device={args.device}")
+              f"  interior={problem.interior_idx.shape[0]}"
+              f"  device={args.device}  symmetrize={args.symmetrize}")
         vals, _ = solve_lowest_eigenvalues(problem, n_eigs=args.n_eigs,
-                                           device=args.device)
+                                           device=args.device,
+                                           symmetrize=args.symmetrize)
         _print_eigs(vals, args.n_eigs, is_ho=True)
 
     if args.csv:

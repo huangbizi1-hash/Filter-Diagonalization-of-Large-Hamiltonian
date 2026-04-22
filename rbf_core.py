@@ -226,19 +226,24 @@ def relative_laplacian_error(problem: RBFProblem, psi_nodes: Optional[Array] = N
 
 
 
-def build_hamiltonian_matrix(problem: RBFProblem) -> sp.csr_matrix:
+def build_hamiltonian_matrix(
+    problem: RBFProblem,
+    symmetrize: bool = False,
+) -> sp.csr_matrix:
     """
-    Assemble sparse H = -0.5 * L_int + diag(V) on interior nodes, then
-    symmetrize as (H + Hᵀ)/2.
+    Assemble sparse H = -0.5 * L_int + diag(V) on interior nodes.
 
-    RBF-FD Laplacian is generally non-symmetric (asymmetry is discretisation
-    error). The physical H is Hermitian, so (H + Hᵀ)/2 removes the spurious
-    antisymmetric part and makes eigsh valid.
+    symmetrize=False (default)
+        Return H as-is.  RBF-FD Laplacians are generally non-symmetric;
+        the result must be solved with a non-symmetric eigensolver.
+    symmetrize=True
+        Apply (H + Hᵀ)/2 before returning, enabling eigsh (real, symmetric).
     """
     L_int = sp.csr_matrix(problem.laplacian_matrix)[:, problem.interior_idx]
     V_diag = sp.diags(problem.potential(), format="csr")
     H = -0.5 * sp.csr_matrix(L_int) + V_diag
-    H = 0.5 * (H + H.T)   # symmetrize: eliminates RBF-FD asymmetry error
+    if symmetrize:
+        H = 0.5 * (H + H.T)
     return H.tocsr()
 
 
@@ -246,32 +251,53 @@ def solve_lowest_eigenvalues(
     problem: RBFProblem,
     n_eigs: int = 6,
     device: str = "cpu",
+    symmetrize: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Return (eigenvalues, eigenvectors) for the n_eigs lowest eigenvalues of H.
 
-    eigenvalues : shape (n_eigs,), sorted ascending
-    eigenvectors: shape (n_interior, n_eigs)
+    symmetrize=False (default) — non-symmetric solver, complex output
+    ─────────────────────────────────────────────────────────────────
+    CPU  : scipy.sparse.linalg.eigs  (ARPACK non-symmetric, sparse)
+           shift-invert at sigma=0 → finds smallest-magnitude eigenvalues.
+           Eigenvalues are complex; imaginary parts reflect discretisation
+           asymmetry and should be small for well-conditioned stencils.
+           Sort by real part ascending.
+    CUDA : torch.linalg.eig on dense CUDA tensor → complex eigenvalues.
 
-    device='cpu'  → scipy.sparse.linalg.eigsh  (ARPACK, sparse)
-    device='cuda' → torch.linalg.eigh on GPU   (dense; needs sufficient VRAM)
-                    Converts the sparse H to a dense CUDA tensor.
-                    Practical up to ~20k interior nodes on a 40 GB GPU.
+    symmetrize=True — symmetric solver, real output
+    ─────────────────────────────────────────────────────────────────
+    CPU  : scipy.sparse.linalg.eigsh (ARPACK symmetric, sparse) → real.
+    CUDA : torch.linalg.eigh on dense CUDA tensor → real.
+
+    eigenvalues : shape (n_eigs,)  — complex128 or float64 depending on symmetrize
+    eigenvectors: shape (n_interior, n_eigs) — complex128 or float64
     """
-    H = build_hamiltonian_matrix(problem)   # symmetric csr
+    H = build_hamiltonian_matrix(problem, symmetrize=symmetrize)
 
     if device == "cpu":
-        vals, vecs = spla.eigsh(H, k=n_eigs, which="SM")
-        order = np.argsort(vals)
-        return vals[order], vecs[:, order]
+        if symmetrize:
+            vals, vecs = spla.eigsh(H, k=n_eigs, which="SM")
+            order = np.argsort(vals)
+            return vals[order].astype(np.float64), vecs[:, order]
+        else:
+            # shift-invert at 0: for positive-spectrum H, finds smallest eigenvalues
+            vals, vecs = spla.eigs(H, k=n_eigs, sigma=0.0, which="LM")
+            order = np.argsort(vals.real)
+            return vals[order].astype(np.complex128), vecs[:, order].astype(np.complex128)
 
     elif device == "cuda":
         import torch
         H_dense = torch.tensor(H.toarray(), dtype=torch.float64, device="cuda")
-        # eigh returns ALL eigenvalues sorted ascending (symmetric matrix)
-        vals_t, vecs_t = torch.linalg.eigh(H_dense)
-        vals = vals_t[:n_eigs].cpu().numpy()
-        vecs = vecs_t[:, :n_eigs].cpu().numpy()
+        if symmetrize:
+            vals_t, vecs_t = torch.linalg.eigh(H_dense)
+            vals = vals_t[:n_eigs].cpu().numpy().astype(np.float64)
+            vecs = vecs_t[:, :n_eigs].cpu().numpy()
+        else:
+            vals_t, vecs_t = torch.linalg.eig(H_dense)
+            order = torch.argsort(vals_t.real)[:n_eigs]
+            vals = vals_t[order].cpu().numpy().astype(np.complex128)
+            vecs = vecs_t[:, order].cpu().numpy().astype(np.complex128)
         return vals, vecs
 
     else:
@@ -483,6 +509,7 @@ def sweep_rbf_kernels(
     order: int = 0,
     n_eigs: int = 10,
     device: str = "cpu",
+    symmetrize: bool = False,
     kernels: Optional[list] = None,
 ) -> list:
     """
@@ -490,6 +517,7 @@ def sweep_rbf_kernels(
     assemble H, solve n_eigs lowest eigenvalues, and compute mean relative
     spectral error against exact 3D HO levels.
 
+    When symmetrize=False eigenvalues are complex; rel_err uses np.abs(val).
     Returns a list of result dicts sorted ascending by mean_rel_err.
     Failed kernels appear at the end with status='failed'.
     """
@@ -524,17 +552,22 @@ def sweep_rbf_kernels(
                 grid_points=None,
                 grid_shape=None,
             )
-            vals, _ = solve_lowest_eigenvalues(prob, n_eigs=n_eigs, device=device)
-            rel_errs = np.abs(vals - exact) / np.abs(exact)
+            vals, _ = solve_lowest_eigenvalues(prob, n_eigs=n_eigs,
+                                               device=device, symmetrize=symmetrize)
+            # use |val| for complex case so rel_err is always real
+            rel_errs = np.abs(np.abs(vals) - exact) / np.abs(exact)
             mean_rel_err = float(np.mean(rel_errs))
-            print(f"mean_rel_err={mean_rel_err:.4e}")
+            max_imag = float(np.max(np.abs(np.imag(vals)))) if np.iscomplexobj(vals) else 0.0
+            print(f"mean_rel_err={mean_rel_err:.4e}  max|Im|={max_imag:.2e}")
             results.append({
                 "phi":          phi,
                 "status":       "ok",
-                "eigenvalues":  [float(v) for v in vals],
+                "eigenvalues_re": [float(v.real) for v in vals],
+                "eigenvalues_im": [float(v.imag) for v in vals] if np.iscomplexobj(vals) else [0.0]*len(vals),
                 "exact":        [float(v) for v in exact],
                 "rel_errs":     [float(v) for v in rel_errs],
                 "mean_rel_err": mean_rel_err,
+                "max_imag":     max_imag,
             })
         except Exception as exc:
             print(f"FAILED: {exc}")
