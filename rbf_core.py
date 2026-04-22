@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 from rbf.pde.fd import weight_matrix
 from rbf.pde.nodes import poisson_disc_nodes
 
@@ -198,6 +200,38 @@ def relative_laplacian_error(problem: RBFProblem, psi_nodes: Optional[Array] = N
         "max_rel_err": float(np.max(rel_err)),
     }
 
+
+
+def build_hamiltonian_matrix(problem: RBFProblem) -> sp.csr_matrix:
+    """
+    Assemble sparse H = -0.5 * L_int + diag(V) on interior nodes.
+
+    laplacian_matrix is (n_int, n_total); with Dirichlet BC (boundary=0)
+    only the interior columns contribute, giving an (n_int, n_int) square block.
+    """
+    L_int = problem.laplacian_matrix[:, problem.interior_idx]   # (n_int, n_int)
+    V_diag = sp.diags(problem.potential(), format="csr")         # (n_int, n_int)
+    H = -0.5 * sp.csr_matrix(L_int) + V_diag
+    return H
+
+
+def solve_lowest_eigenvalues(
+    problem: RBFProblem,
+    n_eigs: int = 6,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Return (eigenvalues, eigenvectors) for the n_eigs lowest eigenvalues of H.
+
+    eigenvalues : shape (n_eigs,), sorted ascending
+    eigenvectors: shape (n_interior, n_eigs)
+
+    Exact 3-D HO levels: E = n_x+n_y+n_z + 3/2
+      -> 1.5 (1x), 2.5 (3x), 3.5 (6x), 4.5 (10x), ...
+    """
+    H = build_hamiltonian_matrix(problem)
+    vals, vecs = spla.eigsh(H, k=n_eigs, which="SM")
+    order = np.argsort(vals)
+    return vals[order], vecs[:, order]
 
 
 def iterate_hamiltonian(problem: RBFProblem, n_max: int = 20, normalize_each_step: bool = True):

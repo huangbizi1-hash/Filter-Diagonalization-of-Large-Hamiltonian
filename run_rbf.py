@@ -4,7 +4,8 @@ import argparse
 import csv
 from pathlib import Path
 
-from rbf_core import RBFConfig, build_problem, iterate_hamiltonian, relative_laplacian_error
+from rbf_core import (RBFConfig, build_problem, iterate_hamiltonian,
+                       relative_laplacian_error, solve_lowest_eigenvalues)
 
 
 
@@ -22,6 +23,17 @@ def parse_args() -> argparse.Namespace:
         "--no-interp",
         action="store_true",
         help="Do not build interpolation matrices if you only need node-space quantities.",
+    )
+    parser.add_argument(
+        "--n-eigs",
+        type=int,
+        default=10,
+        help="Number of lowest eigenvalues to compute via sparse eigensolver.",
+    )
+    parser.add_argument(
+        "--no-eigs",
+        action="store_true",
+        help="Skip sparse eigenvalue solve (faster for large grids).",
     )
     parser.add_argument(
         "--csv",
@@ -74,6 +86,26 @@ def main() -> None:
             f"{r.n:3d} {r.E_H:14.6e} {r.E_T:14.6e} {r.E_V:14.6e} "
             f"{r.exact:14.6e} {r.rel_err:12.4e}"
         )
+
+    if not args.no_eigs:
+        print("-" * 72)
+        print(f"Sparse eigenvalue solve  (n_eigs={args.n_eigs}, interior nodes={problem.interior_idx.shape[0]})")
+        vals, _ = solve_lowest_eigenvalues(problem, n_eigs=args.n_eigs)
+        # 3-D HO exact levels: E = n_x+n_y+n_z + 1.5 (degeneracies 1,3,6,10,...)
+        exact_levels = []
+        for s in range(20):
+            e = s + 1.5
+            deg = (s + 1) * (s + 2) // 2
+            for _ in range(deg):
+                exact_levels.append(e)
+            if len(exact_levels) >= args.n_eigs:
+                break
+        print(f"{'#':>4}  {'E_rbf':>12}  {'E_exact':>12}  {'abs_err':>12}  {'rel_err':>10}")
+        for i, ev in enumerate(vals):
+            ex = exact_levels[i] if i < len(exact_levels) else float("nan")
+            ae = abs(ev - ex)
+            re = ae / abs(ex) if ex != 0 else float("nan")
+            print(f"{i:4d}  {ev:12.6f}  {ex:12.6f}  {ae:12.2e}  {re:10.2e}")
 
     if args.csv:
         out_path = Path(args.csv)
