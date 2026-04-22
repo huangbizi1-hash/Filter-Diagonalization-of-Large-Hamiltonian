@@ -15,7 +15,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spacing", type=float, default=0.5, help="Poisson-disc node spacing.")
     parser.add_argument("--L", type=float, default=5.0, help="Half box size, domain is [-L, L]^3.")
     parser.add_argument("--stencil-size", type=int, default=80, help="Stencil size n in weight_matrix.")
-    parser.add_argument("--phi", type=str, default="phs3", help="RBF basis name, e.g. phs3, phs5.")
+    parser.add_argument("--phi", type=str, default="ga", help="RBF basis name, e.g. ga (Gaussian), phs3, phs5.")
     parser.add_argument("--eps", type=float, default=0.5, help="RBF epsilon parameter.")
     parser.add_argument("--order", type=int, default=2, help="Polynomial augmentation order.")
     parser.add_argument("--grid-N", type=int, default=60, help="Regular grid size for interpolation matrices.")

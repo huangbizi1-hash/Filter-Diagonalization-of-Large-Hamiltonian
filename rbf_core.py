@@ -18,7 +18,7 @@ class RBFConfig:
     spacing: float = 0.5
     L: float = 5.0
     stencil_size: int = 80
-    phi: str = "phs3"
+    phi: str = "ga"
     eps: float = 0.5
     order: int = 2
     grid_N: int = 60
@@ -213,7 +213,7 @@ def build_hamiltonian_matrix(problem: RBFProblem) -> sp.csr_matrix:
     laplacian_matrix is (n_int, n_total); with Dirichlet BC (boundary=0)
     only the interior columns contribute, giving an (n_int, n_int) square block.
     """
-    L_int = problem.laplacian_matrix[:, problem.interior_idx]   # (n_int, n_int)
+    L_int = sp.csr_matrix(problem.laplacian_matrix)[:, problem.interior_idx]
     V_diag = sp.diags(problem.potential(), format="csr")         # (n_int, n_int)
     H = -0.5 * sp.csr_matrix(L_int) + V_diag
     return H
