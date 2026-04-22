@@ -208,15 +208,18 @@ def relative_laplacian_error(problem: RBFProblem, psi_nodes: Optional[Array] = N
 
 def build_hamiltonian_matrix(problem: RBFProblem) -> sp.csr_matrix:
     """
-    Assemble sparse H = -0.5 * L_int + diag(V) on interior nodes.
+    Assemble sparse H = -0.5 * L_int + diag(V) on interior nodes, then
+    symmetrize as (H + Hᵀ)/2.
 
-    laplacian_matrix is (n_int, n_total); with Dirichlet BC (boundary=0)
-    only the interior columns contribute, giving an (n_int, n_int) square block.
+    RBF-FD Laplacian is generally non-symmetric (asymmetry is discretisation
+    error). The physical H is Hermitian, so (H + Hᵀ)/2 removes the spurious
+    antisymmetric part and makes eigsh valid.
     """
     L_int = sp.csr_matrix(problem.laplacian_matrix)[:, problem.interior_idx]
-    V_diag = sp.diags(problem.potential(), format="csr")         # (n_int, n_int)
+    V_diag = sp.diags(problem.potential(), format="csr")
     H = -0.5 * sp.csr_matrix(L_int) + V_diag
-    return H
+    H = 0.5 * (H + H.T)   # symmetrize: eliminates RBF-FD asymmetry error
+    return H.tocsr()
 
 
 def solve_lowest_eigenvalues(
@@ -230,32 +233,29 @@ def solve_lowest_eigenvalues(
     eigenvalues : shape (n_eigs,), sorted ascending
     eigenvectors: shape (n_interior, n_eigs)
 
-    device='cpu'  → scipy.sparse.linalg.eigsh (ARPACK)
-    device='cuda' → cupy + cupyx.scipy.sparse.linalg.eigsh
+    device='cpu'  → scipy.sparse.linalg.eigsh  (ARPACK, sparse)
+    device='cuda' → torch.linalg.eigh on GPU   (dense; needs sufficient VRAM)
+                    Converts the sparse H to a dense CUDA tensor.
+                    Practical up to ~20k interior nodes on a 40 GB GPU.
     """
-    H = build_hamiltonian_matrix(problem)
+    H = build_hamiltonian_matrix(problem)   # symmetric csr
 
     if device == "cpu":
         vals, vecs = spla.eigsh(H, k=n_eigs, which="SM")
+        order = np.argsort(vals)
+        return vals[order], vecs[:, order]
+
     elif device == "cuda":
-        try:
-            import cupy as cp
-            import cupyx.scipy.sparse as cpsp
-            import cupyx.scipy.sparse.linalg as cpspla
-        except ImportError:
-            raise RuntimeError(
-                "cupy is required for device='cuda'. "
-                "Install with: pip install cupy-cuda12x  (match your CUDA version)"
-            )
-        H_gpu = cpsp.csr_matrix(H)
-        vals_gpu, vecs_gpu = cpspla.eigsh(H_gpu, k=n_eigs, which="SM")
-        vals = cp.asnumpy(vals_gpu)
-        vecs = cp.asnumpy(vecs_gpu)
+        import torch
+        H_dense = torch.tensor(H.toarray(), dtype=torch.float64, device="cuda")
+        # eigh returns ALL eigenvalues sorted ascending (symmetric matrix)
+        vals_t, vecs_t = torch.linalg.eigh(H_dense)
+        vals = vals_t[:n_eigs].cpu().numpy()
+        vecs = vecs_t[:, :n_eigs].cpu().numpy()
+        return vals, vecs
+
     else:
         raise ValueError(f"device must be 'cpu' or 'cuda', got {device!r}")
-
-    order = np.argsort(vals)
-    return vals[order], vecs[:, order]
 
 
 # ─── Cube file reader ────────────────────────────────────────────────────────
