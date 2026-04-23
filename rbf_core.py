@@ -57,6 +57,8 @@ class RBFProblem:
     grid_shape: Optional[Tuple[int, int, int]]
     # Custom potential on interior nodes (overrides harmonic V=0.5*r² when set)
     V_nodes: Optional[Array] = None
+    # Cached sparse H on interior nodes (built lazily by apply_H_flat)
+    _H_sparse: Optional[object] = None
 
     def ground_state(self, x: Optional[Array] = None) -> Array:
         pts = self.nodes if x is None else x
@@ -93,6 +95,18 @@ class RBFProblem:
         V_full[self.interior_idx] = self.potential() * psi_nodes[self.interior_idx]
         H_full = T_full + V_full
         return H_full, T_full, V_full
+
+    def apply_H_flat(self, psi_interior: Array) -> Array:
+        """
+        Flat-vector matvec H(ψ) on interior nodes only: (n_interior,) → (n_interior,).
+
+        Builds and caches a sparse H = -0.5·L_int[:, interior] + diag(V) on first call.
+        Suitable for the filter-diagonalisation loop (expects such a callable).
+        """
+        if self._H_sparse is None:
+            # lazy-build the sparse H restricted to interior → interior
+            self._H_sparse = build_hamiltonian_matrix(self, symmetrize=False)
+        return self._H_sparse.dot(np.asarray(psi_interior, dtype=np.float64))
 
     def interpolate_to_grid(self, values_on_interior: Array, kind: str = "psi") -> Array:
         values_on_interior = np.asarray(values_on_interior, dtype=float)
@@ -333,6 +347,27 @@ def read_cube_file(path: str) -> Tuple[Array, Array, Array, Array]:
     return x, y, z, potential
 
 
+def read_cube_atoms(path: str) -> Tuple[Array, Array]:
+    """
+    Read atom positions (and atomic numbers) from a Gaussian cube file.
+
+    Returns
+    -------
+    positions      : (n_atoms, 3) in Bohr (same units as the cube grid)
+    atomic_numbers : (n_atoms,) int
+    """
+    with open(path, "r") as f:
+        lines = f.readlines()
+    n_atoms = abs(int(lines[2].split()[0]))
+    positions = np.zeros((n_atoms, 3), dtype=np.float64)
+    numbers = np.zeros(n_atoms, dtype=np.int64)
+    for i in range(n_atoms):
+        parts = lines[6 + i].split()
+        numbers[i] = int(parts[0])
+        positions[i] = [float(parts[2]), float(parts[3]), float(parts[4])]
+    return positions, numbers
+
+
 # ─── Sphere boundary (icosphere) ─────────────────────────────────────────────
 
 def _make_icosphere(R: float, n_subdivide: int = 3) -> Tuple[Array, Array]:
@@ -383,6 +418,165 @@ def generate_sphere_nodes(
     return nodes, groups
 
 
+# ─── Atom-augmented node placement (for real QD) ─────────────────────────────
+
+def _filter_close_points(candidates: Array, pinned: Array, min_dist: float) -> Array:
+    """Drop rows of `candidates` that lie within `min_dist` of any row of `pinned`.
+
+    Uses KDTree for O(N log N) scaling.  Returns the kept subset.
+    """
+    if len(pinned) == 0 or min_dist <= 0.0:
+        return candidates
+    from scipy.spatial import cKDTree
+    tree = cKDTree(pinned)
+    d, _ = tree.query(candidates, k=1)
+    return candidates[d > min_dist]
+
+
+def generate_atom_augmented_nodes(
+    atom_positions: Array,
+    domain: str = "sphere",
+    R: float = 20.0,
+    spacing: float = 0.8,
+    augment: str = "poisson_disc",
+    exclude_radius: float = 0.0,
+    sphere_subdivide: int = 3,
+    cube_bounds: Optional[Tuple[float, float]] = None,
+) -> Tuple[Array, Dict[str, Array]]:
+    """
+    Build RBF-FD nodes that are pinned at atom positions, optionally augmented
+    with Poisson-disc fill of the surrounding domain.
+
+    Strategy
+    --------
+    1. Pin all atom positions as interior nodes (they are never discarded).
+    2. If augment == 'poisson_disc':
+         generate Poisson-disc nodes inside the `domain` (sphere or box),
+         drop any that lie within `exclude_radius` of an atom,
+         concatenate to the atom list.
+       If augment == 'none':
+         only atoms form the interior; the user must provide a separate
+         boundary (sphere surface nodes are added here too so groups are
+         well-defined).
+
+    Parameters
+    ----------
+    atom_positions   : (n_atoms, 3) array in Bohr
+    domain           : 'sphere' — augment inside a sphere of radius R,
+                       'box'    — augment inside the box cube_bounds × 3
+    R                : sphere radius (Bohr), used if domain=='sphere'
+    spacing          : Poisson-disc spacing for the augmentation fill
+    augment          : 'poisson_disc' | 'none'
+    exclude_radius   : drop augmentation candidates within this distance
+                       (Bohr) of any atom; 0.0 keeps everything
+    sphere_subdivide : icosphere subdivision for the sphere boundary
+    cube_bounds      : (lo, hi) — box domain [lo, hi]^3 when domain=='box'
+
+    Returns
+    -------
+    nodes  : (n_total, 3) concatenated array.  Atoms come first.
+    groups : dict with keys 'interior', 'boundary', 'atoms'.
+             'atoms'   : indices of the pinned atom nodes (subset of interior)
+             'interior': atom indices + augmentation interior indices
+             'boundary': boundary indices produced by the Poisson disc fill
+                         (Dirichlet nodes); empty when augment=='none'
+    """
+    atom_positions = np.asarray(atom_positions, dtype=np.float64).reshape(-1, 3)
+    n_atoms = len(atom_positions)
+
+    if augment not in ("poisson_disc", "none"):
+        raise ValueError(f"augment must be 'poisson_disc' or 'none', got {augment!r}")
+
+    if augment == "none":
+        # Atoms only — no boundary.  User must ensure the stencil has enough
+        # neighbours; this mode is typically too sparse for a usable Laplacian,
+        # but we expose it for experimentation.
+        nodes = atom_positions.copy()
+        groups = {
+            "interior": np.arange(n_atoms, dtype=np.int64),
+            "boundary": np.empty(0, dtype=np.int64),
+            "atoms":    np.arange(n_atoms, dtype=np.int64),
+        }
+        return nodes, groups
+
+    # ── augment == 'poisson_disc' ────────────────────────────────────────────
+    if domain == "sphere":
+        vert, smp = _make_icosphere(R, sphere_subdivide)
+    elif domain == "box":
+        if cube_bounds is None:
+            raise ValueError("domain='box' requires cube_bounds=(lo, hi)")
+        lo, hi = cube_bounds
+        vert = np.array([
+            [lo, lo, lo], [hi, lo, lo], [hi, hi, lo], [lo, hi, lo],
+            [lo, lo, hi], [hi, lo, hi], [hi, hi, hi], [lo, hi, hi],
+        ], dtype=np.float64)
+        smp = np.array([
+            [0, 1, 2], [0, 2, 3],
+            [4, 5, 6], [4, 6, 7],
+            [0, 1, 5], [0, 5, 4],
+            [3, 2, 6], [3, 6, 7],
+            [0, 3, 7], [0, 7, 4],
+            [1, 2, 6], [1, 6, 5],
+        ], dtype=int)
+    else:
+        raise ValueError(f"domain must be 'sphere' or 'box', got {domain!r}")
+
+    # Try pinning atoms directly via rbf's poisson_disc_nodes (recent API).
+    # Fall back to unpinned fill + KDTree de-dup if the version doesn't accept it.
+    try:
+        aug_nodes, aug_groups, _ = poisson_disc_nodes(
+            spacing, (vert, smp), pinned_nodes=atom_positions,
+        )
+    except TypeError:
+        aug_nodes, aug_groups, _ = poisson_disc_nodes(spacing, (vert, smp))
+        # Remove anything too close to an atom, then prepend atoms
+        keep_interior = _filter_close_points(
+            aug_nodes[aug_groups["interior"]], atom_positions,
+            min_dist=max(exclude_radius, 0.5 * spacing),
+        )
+        keep_boundary = aug_nodes[aug_groups["boundary"]]  # keep all boundary
+        nodes = np.vstack([atom_positions, keep_interior, keep_boundary])
+        n_int_aug = len(keep_interior)
+        n_bd = len(keep_boundary)
+        groups = {
+            "atoms":    np.arange(n_atoms, dtype=np.int64),
+            "interior": np.arange(n_atoms + n_int_aug, dtype=np.int64),
+            "boundary": np.arange(n_atoms + n_int_aug,
+                                   n_atoms + n_int_aug + n_bd, dtype=np.int64),
+        }
+        return nodes, groups
+
+    # With pinned_nodes, atoms are at aug_groups['interior'][:n_atoms]
+    # (rbf places pinned nodes first in the interior group).
+    interior = aug_groups["interior"]
+    boundary = aug_groups.get("boundary", np.empty(0, dtype=np.int64))
+    # Enforce exclusion zone manually on NON-atom interior nodes
+    if exclude_radius > 0.0 and n_atoms > 0:
+        non_atom_mask = np.ones(len(interior), dtype=bool)
+        non_atom_mask[:n_atoms] = False  # never drop atoms
+        non_atom_interior = aug_nodes[interior[non_atom_mask]]
+        kept = _filter_close_points(non_atom_interior, atom_positions, exclude_radius)
+        # Rebuild node set
+        atom_interior = aug_nodes[interior[:n_atoms]]
+        nodes = np.vstack([atom_interior, kept, aug_nodes[boundary]])
+        n_int_aug = len(kept)
+        groups = {
+            "atoms":    np.arange(n_atoms, dtype=np.int64),
+            "interior": np.arange(n_atoms + n_int_aug, dtype=np.int64),
+            "boundary": np.arange(n_atoms + n_int_aug,
+                                   n_atoms + n_int_aug + len(boundary),
+                                   dtype=np.int64),
+        }
+        return nodes, groups
+
+    groups_out = {
+        "atoms":    np.arange(n_atoms, dtype=np.int64),
+        "interior": np.asarray(interior, dtype=np.int64),
+        "boundary": np.asarray(boundary, dtype=np.int64),
+    }
+    return aug_nodes, groups_out
+
+
 # ─── QD problem builder ──────────────────────────────────────────────────────
 
 def build_qd_problem(
@@ -395,6 +589,9 @@ def build_qd_problem(
     eps: float = 0.5,
     order: int = 2,
     sphere_subdivide: int = 3,
+    augment: str = "poisson_disc",
+    exclude_radius: float = 0.0,
+    v_clip_percentile: float = 99.9,
 ) -> RBFProblem:
     """
     Build RBFProblem with QD potential from a Gaussian cube file.
@@ -406,20 +603,31 @@ def build_qd_problem(
 
     domain='sphere'
         Poisson disc nodes inside a sphere of radius R (default 20.0 Bohr).
-        QD potential is interpolated to node positions via linear RegularGridInterpolator.
-        Points outside the cube file extent get V=0.
+        QD potential is interpolated to node positions via linear
+        RegularGridInterpolator.  Points outside the cube extent get V=0.
+
+    domain='atoms'
+        Place nodes at every atom position read from the cube file, then
+        (optionally) augment with Poisson-disc fill inside a sphere of radius R.
+            augment='poisson_disc' : add Poisson-disc nodes (default)
+            augment='none'         : use atom positions only (experimental)
+        `exclude_radius` drops augmentation candidates within that distance
+        of any atom (Bohr).
 
     Parameters
     ----------
-    cube_file      : path to Gaussian .cube file
-    domain         : 'cube' or 'sphere'
-    spacing        : Poisson disc node spacing (sphere domain only)
-    R              : sphere radius in Bohr (sphere domain only, default 20.0)
-    stencil_size   : RBF-FD stencil size
-    phi            : RBF kernel name
-    eps            : RBF shape parameter
-    order          : polynomial augmentation order
-    sphere_subdivide: icosphere subdivision count (higher = smoother sphere)
+    cube_file        : path to Gaussian .cube file
+    domain           : 'cube' | 'sphere' | 'atoms'
+    spacing          : Poisson-disc spacing (sphere / atoms domains)
+    R                : sphere radius (Bohr) for sphere / atoms domains
+    stencil_size     : RBF-FD stencil size
+    phi              : RBF kernel name
+    eps              : RBF shape parameter
+    order            : polynomial augmentation order
+    sphere_subdivide : icosphere subdivision count
+    augment          : 'poisson_disc' | 'none' (atoms domain only)
+    exclude_radius   : Bohr; Poisson candidates closer to any atom are dropped
+    v_clip_percentile: clip V at this percentile to tame cube tail artefacts
     """
     from scipy.interpolate import RegularGridInterpolator
 
@@ -451,12 +659,27 @@ def build_qd_problem(
         interior_idx = groups["interior"]
         cfg_L = R
 
+    elif domain == "atoms":
+        atom_pos, _ = read_cube_atoms(cube_file)
+        nodes, groups = generate_atom_augmented_nodes(
+            atom_positions=atom_pos,
+            domain="sphere",
+            R=R,
+            spacing=spacing,
+            augment=augment,
+            exclude_radius=exclude_radius,
+            sphere_subdivide=sphere_subdivide,
+        )
+        interior_idx = groups["interior"]
+        cfg_L = R
+
     else:
-        raise ValueError(f"domain must be 'cube' or 'sphere', got {domain!r}")
+        raise ValueError(
+            f"domain must be 'cube', 'sphere', or 'atoms', got {domain!r}")
 
     # QD potential on interior nodes (clamp tail artefacts near nuclei)
     V_nodes = interp_fn(nodes[interior_idx]).astype(np.float64)
-    v_cap = float(np.percentile(V_nodes, 99.9))
+    v_cap = float(np.percentile(V_nodes, v_clip_percentile))
     V_nodes = np.clip(V_nodes, None, v_cap)
 
     laplacian_matrix = weight_matrix(
