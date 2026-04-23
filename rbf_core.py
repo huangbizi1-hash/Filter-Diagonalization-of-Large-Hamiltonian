@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import scipy.sparse as sp
@@ -577,6 +577,457 @@ def generate_atom_augmented_nodes(
     return aug_nodes, groups_out
 
 
+# ─── Conventional-cell hybrid node generator (zincblende, e.g. InAs) ──────────
+
+# Default zincblende atomic basis (fractional, wrt conventional cubic cell)
+_CONV_CELL_IN_FRAC_DEFAULT: Array = np.array(
+    [[0.0, 0.0, 0.0],
+     [0.5, 0.5, 0.0],
+     [0.5, 0.0, 0.5],
+     [0.0, 0.5, 0.5]],
+    dtype=np.float64,
+)
+_CONV_CELL_AS_FRAC_DEFAULT: Array = np.array(
+    [[0.25, 0.25, 0.25],
+     [0.75, 0.75, 0.25],
+     [0.75, 0.25, 0.75],
+     [0.25, 0.75, 0.75]],
+    dtype=np.float64,
+)
+
+# The 4 FCC lattice points inside a conventional cubic cell (used to expand any
+# high-symmetry base point into an FCC-symmetric set of cosets).
+_FCC_OFFSETS_FRAC: Array = np.array(
+    [[0.0, 0.0, 0.0],
+     [0.5, 0.5, 0.0],
+     [0.5, 0.0, 0.5],
+     [0.0, 0.5, 0.5]],
+    dtype=np.float64,
+)
+
+# level-3 "FCC high-symmetry" base points: the 8 corners of the sub-cube
+# spanned by fractional coordinates in {1/3, 2/3}.  Each base point is expanded
+# by the 4 FCC cosets → ≤32 cosets per cell (duplicates removed mod 1).
+_LEVEL3_BASE_FRAC_DEFAULT: Array = np.array(
+    [[1/3, 1/3, 1/3],
+     [2/3, 2/3, 2/3],
+     [1/3, 1/3, 2/3],
+     [1/3, 2/3, 1/3],
+     [2/3, 1/3, 1/3],
+     [2/3, 2/3, 1/3],
+     [2/3, 1/3, 2/3],
+     [1/3, 2/3, 2/3]],
+    dtype=np.float64,
+)
+
+
+def _wrap_frac(x: Array) -> Array:
+    return np.asarray(x, dtype=np.float64) % 1.0
+
+
+def _unique_rows_mod1(arr: Array, tol: float = 1e-10) -> Array:
+    arr = _wrap_frac(arr)
+    arr_q = np.round(arr / tol).astype(np.int64)
+    _, idx = np.unique(arr_q, axis=0, return_index=True)
+    return arr[np.sort(idx)]
+
+
+def _unique_cart_rows(arr: Array, tol: float = 1e-8) -> Array:
+    arr_q = np.round(arr / tol).astype(np.int64)
+    _, idx = np.unique(arr_q, axis=0, return_index=True)
+    return arr[np.sort(idx)]
+
+
+def _periodic_diff(x: Array, y: Array) -> Array:
+    d = np.abs(x - y)
+    return np.minimum(d, 1.0 - d)
+
+
+def _periodic_dist(x: Array, y: Array) -> float:
+    return float(np.linalg.norm(_periodic_diff(x, y)))
+
+
+def _greedy_filter_by_dmin_periodic(points_frac: Array, d_min: float) -> Array:
+    """Greedy d_min filter using periodic (minimum-image) distance in fractional
+    coordinates.  Preserves the input order of `points_frac`."""
+    kept: list[Array] = []
+    for x in points_frac:
+        if kept:
+            dmin = min(_periodic_dist(x, y) for y in kept)
+            if dmin < d_min:
+                continue
+        kept.append(x)
+    if not kept:
+        return np.empty((0, 3), dtype=np.float64)
+    return np.stack(kept, axis=0)
+
+
+def _make_unit_cube_surface(a: float) -> Tuple[Array, Array]:
+    """8-vertex / 12-triangle surface of the cube [0,a]^3 for rbf's poisson_disc_nodes."""
+    vert = np.array([
+        [0, 0, 0], [a, 0, 0], [a, a, 0], [0, a, 0],
+        [0, 0, a], [a, 0, a], [a, a, a], [0, a, a],
+    ], dtype=np.float64)
+    smp = np.array([
+        [0, 1, 2], [0, 2, 3],
+        [4, 5, 6], [4, 6, 7],
+        [0, 1, 5], [0, 5, 4],
+        [3, 2, 6], [3, 6, 7],
+        [0, 3, 7], [0, 7, 4],
+        [1, 2, 6], [1, 6, 5],
+    ], dtype=int)
+    return vert, smp
+
+
+def generate_conv_cell_nodes(
+    bbox_min: Array,
+    bbox_max: Array,
+    a: float,
+    d_min_frac: float = 0.06,
+    n_random_target: int = 120,
+    seed: int = 42,
+    include_parity: bool = True,
+    atom_frac: Optional[Array] = None,
+    level3_base_frac: Optional[Array] = None,
+    use_rbf_poisson: bool = True,
+    boundary_margin_frac: float = 0.5,
+) -> Tuple[Array, Dict[str, Array], Dict[str, int]]:
+    """
+    Hybrid node generator on a conventional cubic cell (zincblende by default),
+    tiled to fill an axis-aligned box.
+
+    The per-cell node template is the union of:
+
+        (1) atomic sites — 4 In + 4 As at the zincblende positions
+            (override via `atom_frac`, shape (k, 3) in fractional coords)
+
+        (2) level-3 FCC high-symmetry points — 8 base points at
+            (i/3, j/3, k/3), i,j,k∈{1,2}, each expanded by the 4 FCC cosets
+            (override bases via `level3_base_frac`, shape (m, 3))
+
+        (3) Poisson-like random points — generated inside the unit cell with
+            `rbf.pde.nodes.poisson_disc_nodes` (`use_rbf_poisson=True`, default)
+            using the skeleton (1)+(2) as `pinned_nodes` and radius = d_min_frac*a.
+            Falls back to the user's original periodic rejection sampler if
+            `use_rbf_poisson=False`.
+
+        (4) parity counterparts — for each random point r, add `1 − r` (inversion
+            about the cell centre).  Disable via `include_parity=False`.
+
+    After the union, a greedy d_min filter is applied in fractional coordinates
+    with periodic (minimum-image) distance, preserving the order atoms → level3
+    → random → parity.  The surviving fractional template is scaled by `a` and
+    tiled by integer shifts `(nx, ny, nz) · a` to cover [bbox_min, bbox_max).
+
+    Interior / boundary assignment on the tiled set:
+        - a node within `boundary_margin_frac * a` of any face of the bbox is
+          flagged as boundary (Dirichlet)
+        - everything else is interior
+
+    Returns
+    -------
+    nodes   : (N, 3) Cartesian, Bohr
+    groups  : dict with int64 arrays under keys
+              'interior', 'boundary', 'atoms', 'level3', 'random', 'parity'
+              ('atoms' etc. are *template-role* groups relative to the one-cell
+              template; after tiling they index every tiled copy)
+    stats   : counts {cell_skeleton, cell_random, cell_accepted_parity,
+                      cell_after_filter, tiled_total}
+    """
+    bbox_min = np.asarray(bbox_min, dtype=np.float64).reshape(3)
+    bbox_max = np.asarray(bbox_max, dtype=np.float64).reshape(3)
+
+    if atom_frac is None:
+        atom_frac = np.vstack([_CONV_CELL_IN_FRAC_DEFAULT,
+                                _CONV_CELL_AS_FRAC_DEFAULT])
+    else:
+        atom_frac = np.asarray(atom_frac, dtype=np.float64).reshape(-1, 3)
+
+    if level3_base_frac is None:
+        level3_base_frac = _LEVEL3_BASE_FRAC_DEFAULT
+    else:
+        level3_base_frac = np.asarray(level3_base_frac, dtype=np.float64).reshape(-1, 3)
+
+    # level-3: expand each base by the 4 FCC cosets and reduce mod 1
+    level3_frac = np.vstack([
+        _wrap_frac(r0 + _FCC_OFFSETS_FRAC) for r0 in level3_base_frac
+    ])
+    level3_frac = _unique_rows_mod1(level3_frac)
+
+    # skeleton = atoms + level-3 (these are all pinned)
+    skeleton_frac = _unique_rows_mod1(np.vstack([atom_frac, level3_frac]))
+
+    # ── Poisson-like random points in [0,1)^3 ────────────────────────────────
+    rng = np.random.default_rng(seed)
+    if use_rbf_poisson:
+        # Use the repo's Poisson-disc sampler on the unit cube [0,a]^3 with
+        # the skeleton pinned.  radius = d_min_frac*a (Cartesian).
+        vert, smp = _make_unit_cube_surface(a)
+        pinned_cart = skeleton_frac * a
+        try:
+            rbf_nodes_cart, _rbf_groups, _ = poisson_disc_nodes(
+                d_min_frac * a, (vert, smp), pinned_nodes=pinned_cart,
+            )
+            # Drop the pinned copies — we already have them in skeleton_frac
+            # (rbf places pinned first in the interior group)
+            n_pin = len(pinned_cart)
+            extra_cart = rbf_nodes_cart[n_pin:]
+            # Drop boundary nodes from the Poisson output — the cube faces'
+            # boundary nodes aren't the user's "random" points
+            # (filter anything within 1e-6*a of a face)
+            face_tol = 1e-6 * a
+            in_interior = np.all(
+                (extra_cart > face_tol) & (extra_cart < a - face_tol), axis=1)
+            extra_cart = extra_cart[in_interior]
+            random_frac = extra_cart / a
+
+            # Optionally truncate / seed-permute to match n_random_target
+            if len(random_frac) > n_random_target:
+                perm = rng.permutation(len(random_frac))[:n_random_target]
+                random_frac = random_frac[perm]
+        except TypeError:
+            # Old rbf without pinned_nodes support — fall back to rejection
+            use_rbf_poisson = False
+
+    if not use_rbf_poisson:
+        # Periodic rejection sampler (user's original algorithm)
+        random_frac, _trials = _poisson_like_periodic(
+            skeleton_frac, n_random_target, d_min_frac,
+            max_trials=max(200_000, 2000 * n_random_target), rng=rng,
+        )
+
+    # ── parity counterparts ──────────────────────────────────────────────────
+    if include_parity and len(random_frac) > 0:
+        parity_frac = _wrap_frac(1.0 - random_frac)
+    else:
+        parity_frac = np.empty((0, 3), dtype=np.float64)
+
+    # ── assemble template with role labels, then greedy d_min filter ─────────
+    parts = [
+        ("atoms",  atom_frac),
+        ("level3", level3_frac),
+        ("random", random_frac),
+        ("parity", parity_frac),
+    ]
+    ordered_frac = np.vstack([p[1] for p in parts if len(p[1])])
+    ordered_frac = _unique_rows_mod1(ordered_frac)
+    # Track roles (by fractional coordinate lookup, using rounding)
+    role_map: Dict[str, Array] = {}
+    for name, arr in parts:
+        role_map[name] = _wrap_frac(arr) if len(arr) else np.empty((0, 3), dtype=np.float64)
+
+    cell_nodes_frac = _greedy_filter_by_dmin_periodic(ordered_frac, d_min_frac)
+    cell_nodes_frac = _unique_rows_mod1(cell_nodes_frac)
+
+    # For each surviving cell node, record which role set it came from
+    # (first match in priority order atoms > level3 > random > parity)
+    cell_role_idx: list[int] = []
+    role_priority = ["atoms", "level3", "random", "parity"]
+    for node in cell_nodes_frac:
+        assigned = 3  # fallback = parity
+        for ri, rname in enumerate(role_priority):
+            src = role_map[rname]
+            if len(src) == 0:
+                continue
+            if np.any(np.all(np.abs(_periodic_diff(src, node)) < 1e-9, axis=1)):
+                assigned = ri
+                break
+        cell_role_idx.append(assigned)
+    cell_role_idx = np.asarray(cell_role_idx, dtype=np.int64)
+
+    cell_stats = {
+        "cell_skeleton":         int(len(skeleton_frac)),
+        "cell_random":           int(len(random_frac)),
+        "cell_accepted_parity":  int(len(parity_frac)),
+        "cell_after_filter":     int(len(cell_nodes_frac)),
+    }
+
+    # ── tile the one-cell template to cover [bbox_min, bbox_max) ─────────────
+    cell_nodes_cart = cell_nodes_frac * a
+    if len(cell_nodes_cart) == 0:
+        return (np.empty((0, 3), dtype=np.float64),
+                {k: np.empty(0, dtype=np.int64)
+                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity")},
+                {**cell_stats, "tiled_total": 0})
+
+    nmin = np.floor((bbox_min - cell_nodes_cart.max(axis=0)) / a).astype(int) - 1
+    nmax = np.ceil((bbox_max - cell_nodes_cart.min(axis=0)) / a).astype(int) + 1
+
+    tiled_nodes: list[Array] = []
+    tiled_roles: list[Array] = []
+    for nx in range(nmin[0], nmax[0] + 1):
+        for ny in range(nmin[1], nmax[1] + 1):
+            for nz in range(nmin[2], nmax[2] + 1):
+                shift = np.array([nx, ny, nz], dtype=np.float64) * a
+                pts = cell_nodes_cart + shift
+                m = np.all(pts >= bbox_min, axis=1) & np.all(pts < bbox_max, axis=1)
+                if np.any(m):
+                    tiled_nodes.append(pts[m])
+                    tiled_roles.append(cell_role_idx[m])
+
+    if not tiled_nodes:
+        return (np.empty((0, 3), dtype=np.float64),
+                {k: np.empty(0, dtype=np.int64)
+                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity")},
+                {**cell_stats, "tiled_total": 0})
+
+    nodes = np.vstack(tiled_nodes)
+    roles = np.concatenate(tiled_roles)
+    # final Cartesian dedup
+    nodes_u, idx_u = np.unique(
+        np.round(nodes / 1e-8).astype(np.int64), axis=0, return_index=True)
+    idx_u = np.sort(idx_u)
+    nodes = nodes[idx_u]
+    roles = roles[idx_u]
+
+    # Interior / boundary: mark nodes within `boundary_margin_frac * a` of any
+    # bbox face as boundary.
+    margin = boundary_margin_frac * a
+    near_face = (
+        (nodes[:, 0] < bbox_min[0] + margin) | (nodes[:, 0] > bbox_max[0] - margin) |
+        (nodes[:, 1] < bbox_min[1] + margin) | (nodes[:, 1] > bbox_max[1] - margin) |
+        (nodes[:, 2] < bbox_min[2] + margin) | (nodes[:, 2] > bbox_max[2] - margin)
+    )
+    interior_idx = np.where(~near_face)[0].astype(np.int64)
+    boundary_idx = np.where(near_face)[0].astype(np.int64)
+
+    groups: Dict[str, Array] = {
+        "interior": interior_idx,
+        "boundary": boundary_idx,
+        "atoms":    np.where(roles == 0)[0].astype(np.int64),
+        "level3":   np.where(roles == 1)[0].astype(np.int64),
+        "random":   np.where(roles == 2)[0].astype(np.int64),
+        "parity":   np.where(roles == 3)[0].astype(np.int64),
+    }
+    stats = {**cell_stats, "tiled_total": int(len(nodes))}
+    return nodes, groups, stats
+
+
+def _poisson_like_periodic(
+    skeleton_frac: Array,
+    n_target: int,
+    d_min: float,
+    max_trials: int,
+    rng: np.random.Generator,
+) -> Tuple[Array, int]:
+    """Fallback sampler (user's original algorithm): periodic rejection.
+
+    Kept for environments where `rbf.pde.nodes.poisson_disc_nodes` doesn't
+    accept `pinned_nodes`.  Uses periodic minimum-image distance in [0,1)^3.
+    """
+    accepted: list[Array] = []
+    trials = 0
+    while len(accepted) < n_target and trials < max_trials:
+        trials += 1
+        x = rng.random(3)
+        ok = True
+        for y in skeleton_frac:
+            if _periodic_dist(x, y) < d_min:
+                ok = False
+                break
+        if ok:
+            for y in accepted:
+                if _periodic_dist(x, y) < d_min:
+                    ok = False
+                    break
+        if ok:
+            accepted.append(x)
+    if not accepted:
+        return np.empty((0, 3), dtype=np.float64), trials
+    return np.stack(accepted, axis=0), trials
+
+
+# ─── Node quality metrics ────────────────────────────────────────────────────
+
+def compute_node_quality(
+    nodes: Array,
+    bbox_min: Optional[Array] = None,
+    bbox_max: Optional[Array] = None,
+    probe_method: str = "uniform",
+    n_probe: Optional[int] = None,
+    random_seed: int = 0,
+) -> Dict[str, Any]:
+    """
+    Compute geometric quality metrics for a scattered node set X ⊂ Ω.
+
+        q = ½ · min_{i≠j} ‖xᵢ − xⱼ‖        (node separation)
+        h = sup_{x∈Ω} min_i ‖x − xᵢ‖       (fill radius / mesh norm)
+        ρ = h / q                         (mesh ratio; → 1 is uniform)
+
+    Parameters
+    ----------
+    nodes        : (N, 3) Cartesian
+    bbox_min/max : axis-aligned probe domain Ω.  If None, taken as the nodes'
+                   own bbox (+ no margin).
+    probe_method : 'uniform' — dense uniform grid in Ω
+                   'random'  — uniform random points in Ω
+    n_probe      : number of probe points (only used for 'random';
+                   the 'uniform' mode derives a cubic grid count from n_probe^(1/3)).
+                   If None, auto-chosen ~ 32× interior nodes (cheap upper bound).
+
+    Returns
+    -------
+    dict with q, h, rho, n_nodes, n_probe, probe_method,
+    min_pair_dist (= 2q), domain_bbox_min/max
+    """
+    from scipy.spatial import cKDTree
+
+    nodes = np.asarray(nodes, dtype=np.float64)
+    if nodes.ndim != 2 or nodes.shape[0] < 2:
+        return {
+            "q": float("nan"), "h": float("nan"), "rho": float("nan"),
+            "n_nodes": int(nodes.shape[0] if nodes.size else 0),
+            "n_probe": 0, "probe_method": probe_method,
+            "min_pair_dist": float("nan"),
+        }
+
+    if bbox_min is None:
+        bbox_min = nodes.min(axis=0)
+    if bbox_max is None:
+        bbox_max = nodes.max(axis=0)
+    bbox_min = np.asarray(bbox_min, dtype=np.float64).reshape(3)
+    bbox_max = np.asarray(bbox_max, dtype=np.float64).reshape(3)
+
+    # q: half the minimum pairwise distance (2nd-nearest neighbour via KDTree)
+    tree = cKDTree(nodes)
+    dists2, _ = tree.query(nodes, k=2)   # (N, 2): self + nearest neighbour
+    min_pair = float(np.min(dists2[:, 1]))
+    q = 0.5 * min_pair
+
+    # h: approximate fill radius via probe points
+    if n_probe is None:
+        n_probe_target = max(4096, 32 * nodes.shape[0])
+    else:
+        n_probe_target = int(n_probe)
+
+    if probe_method == "uniform":
+        m = max(4, int(round(n_probe_target ** (1.0 / 3.0))))
+        xs = np.linspace(bbox_min[0], bbox_max[0], m)
+        ys = np.linspace(bbox_min[1], bbox_max[1], m)
+        zs = np.linspace(bbox_min[2], bbox_max[2], m)
+        X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+        probes = np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
+    elif probe_method == "random":
+        rng = np.random.default_rng(random_seed)
+        probes = rng.uniform(
+            low=bbox_min, high=bbox_max, size=(n_probe_target, 3))
+    else:
+        raise ValueError(f"probe_method must be 'uniform' or 'random', got {probe_method!r}")
+
+    probe_d, _ = tree.query(probes, k=1)
+    h = float(np.max(probe_d))
+
+    return {
+        "q": q, "h": h, "rho": (h / q if q > 0 else float("inf")),
+        "n_nodes": int(nodes.shape[0]),
+        "n_probe": int(probes.shape[0]),
+        "probe_method": probe_method,
+        "min_pair_dist": min_pair,
+        "domain_bbox_min": bbox_min.tolist(),
+        "domain_bbox_max": bbox_max.tolist(),
+    }
+
+
 # ─── QD problem builder ──────────────────────────────────────────────────────
 
 def build_qd_problem(
@@ -592,6 +1043,14 @@ def build_qd_problem(
     augment: str = "poisson_disc",
     exclude_radius: float = 0.0,
     v_clip_percentile: float = 99.9,
+    # conv_cell-only knobs
+    conv_cell_a: float = 11.4523,
+    conv_cell_d_min_frac: float = 0.06,
+    conv_cell_n_random: int = 120,
+    conv_cell_seed: int = 42,
+    conv_cell_parity: bool = True,
+    conv_cell_boundary_margin_frac: float = 0.5,
+    conv_cell_use_rbf_poisson: bool = True,
 ) -> RBFProblem:
     """
     Build RBFProblem with QD potential from a Gaussian cube file.
@@ -614,10 +1073,15 @@ def build_qd_problem(
         `exclude_radius` drops augmentation candidates within that distance
         of any atom (Bohr).
 
+    domain='conv_cell'
+        Conventional-cubic-cell hybrid template (zincblende atoms + level-3 FCC
+        high-symmetry points + Poisson-disc random + parity counterparts),
+        tiled to cover the cube-file box.  See `generate_conv_cell_nodes`.
+
     Parameters
     ----------
     cube_file        : path to Gaussian .cube file
-    domain           : 'cube' | 'sphere' | 'atoms'
+    domain           : 'cube' | 'sphere' | 'atoms' | 'conv_cell'
     spacing          : Poisson-disc spacing (sphere / atoms domains)
     R                : sphere radius (Bohr) for sphere / atoms domains
     stencil_size     : RBF-FD stencil size
@@ -628,6 +1092,15 @@ def build_qd_problem(
     augment          : 'poisson_disc' | 'none' (atoms domain only)
     exclude_radius   : Bohr; Poisson candidates closer to any atom are dropped
     v_clip_percentile: clip V at this percentile to tame cube tail artefacts
+    conv_cell_a              : lattice constant (Bohr, conv_cell only, default InAs 11.4523)
+    conv_cell_d_min_frac     : d_min in fractional coords for the greedy filter (conv_cell)
+    conv_cell_n_random       : target # of Poisson-like random points per cell
+    conv_cell_seed           : RNG seed (conv_cell)
+    conv_cell_parity         : include 1-r inversion counterparts (conv_cell)
+    conv_cell_boundary_margin_frac : nodes within this fraction of `a` of a
+                                     bbox face are flagged boundary (conv_cell)
+    conv_cell_use_rbf_poisson: use rbf's poisson_disc_nodes (default) vs.
+                               periodic rejection sampler
     """
     from scipy.interpolate import RegularGridInterpolator
 
@@ -673,9 +1146,31 @@ def build_qd_problem(
         interior_idx = groups["interior"]
         cfg_L = R
 
+    elif domain == "conv_cell":
+        # bbox from cube-file grid extents (orthorhombic assumed)
+        bbox_min = np.array([x_grid[0], y_grid[0], z_grid[0]], dtype=np.float64)
+        bbox_max = np.array([x_grid[-1] + (x_grid[1] - x_grid[0]),
+                              y_grid[-1] + (y_grid[1] - y_grid[0]),
+                              z_grid[-1] + (z_grid[1] - z_grid[0])],
+                             dtype=np.float64)
+        nodes, groups, _cell_stats = generate_conv_cell_nodes(
+            bbox_min=bbox_min,
+            bbox_max=bbox_max,
+            a=conv_cell_a,
+            d_min_frac=conv_cell_d_min_frac,
+            n_random_target=conv_cell_n_random,
+            seed=conv_cell_seed,
+            include_parity=conv_cell_parity,
+            boundary_margin_frac=conv_cell_boundary_margin_frac,
+            use_rbf_poisson=conv_cell_use_rbf_poisson,
+        )
+        interior_idx = groups["interior"]
+        cfg_L = float(np.max(np.abs(nodes))) if len(nodes) else 0.0
+
     else:
         raise ValueError(
-            f"domain must be 'cube', 'sphere', or 'atoms', got {domain!r}")
+            "domain must be 'cube', 'sphere', 'atoms', or 'conv_cell', "
+            f"got {domain!r}")
 
     # QD potential on interior nodes (clamp tail artefacts near nuclei)
     V_nodes = interp_fn(nodes[interior_idx]).astype(np.float64)

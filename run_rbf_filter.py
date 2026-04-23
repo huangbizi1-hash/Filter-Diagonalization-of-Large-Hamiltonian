@@ -102,9 +102,10 @@ CONFIG: Dict[str, Any] = {
 
     # ---------- 节点放置 ----------
     # domain:
-    #   "cube"    : 使用 cube 文件原有的规则网格（interior = 非面边界）
-    #   "sphere"  : 球内 Poisson disc
-    #   "atoms"   : 从 cube 文件读原子坐标作为节点，再按 augment 加密
+    #   "cube"      : 使用 cube 文件原有的规则网格（interior = 非面边界）
+    #   "sphere"    : 球内 Poisson disc
+    #   "atoms"     : 从 cube 文件读原子坐标作为节点，再按 augment 加密
+    #   "conv_cell" : 惯用晶胞模板 (atoms+level-3 FCC+Poisson+parity) × 平铺
     "domain":           "atoms",
     "spacing":          0.8,         # Poisson-disc 间距（sphere/atoms）
     "R":                20.0,        # 球半径（Bohr，sphere/atoms）
@@ -112,6 +113,17 @@ CONFIG: Dict[str, Any] = {
     # atoms 专用：
     "augment":          "poisson_disc",   # "poisson_disc" | "none"
     "exclude_radius":   0.4,              # Bohr，Poisson 候选点离原子更近则丢弃
+    # conv_cell 专用：
+    "conv_cell_a":                    11.4523,
+    "conv_cell_d_min_frac":           0.06,
+    "conv_cell_n_random":             120,
+    "conv_cell_seed":                 42,
+    "conv_cell_parity":               True,
+    "conv_cell_boundary_margin_frac": 0.5,
+    "conv_cell_use_rbf_poisson":      True,
+    # 节点质量检测（运行时计算 q, h, ρ 并打印 / 写 JSON）：
+    "quality_probe_method":           "uniform",
+    "quality_probe_n":                0,
 
     # ---------- RBF 设置 ----------
     "stencil_size": 80,
@@ -267,7 +279,7 @@ def run(cfg: Dict[str, Any]) -> None:
     t0 = time.perf_counter()
 
     # rbf_core 依赖 rbf-python；延迟导入，方便 --help 等只查看帮助
-    from rbf_core import build_qd_problem
+    from rbf_core import build_qd_problem, compute_node_quality
 
     pot = cfg["potential"]
     problem = build_qd_problem(
@@ -283,6 +295,13 @@ def run(cfg: Dict[str, Any]) -> None:
         augment          = cfg.get("augment", "poisson_disc"),
         exclude_radius   = cfg.get("exclude_radius", 0.0),
         v_clip_percentile= pot.get("v_clip_percentile", 99.9),
+        conv_cell_a                    = cfg.get("conv_cell_a", 11.4523),
+        conv_cell_d_min_frac           = cfg.get("conv_cell_d_min_frac", 0.06),
+        conv_cell_n_random             = cfg.get("conv_cell_n_random", 120),
+        conv_cell_seed                 = cfg.get("conv_cell_seed", 42),
+        conv_cell_parity               = cfg.get("conv_cell_parity", True),
+        conv_cell_boundary_margin_frac = cfg.get("conv_cell_boundary_margin_frac", 0.5),
+        conv_cell_use_rbf_poisson      = cfg.get("conv_cell_use_rbf_poisson", True),
     )
     n_interior = len(problem.interior_idx)
     n_total    = len(problem.nodes)
@@ -293,8 +312,26 @@ def run(cfg: Dict[str, Any]) -> None:
     if cfg["domain"] == "atoms":
         print(f"   augment          : {cfg.get('augment')}")
         print(f"   exclude_radius   : {cfg.get('exclude_radius')} Bohr")
+    elif cfg["domain"] == "conv_cell":
+        print(f"   a (lattice)      : {cfg.get('conv_cell_a')} Bohr")
+        print(f"   d_min_frac       : {cfg.get('conv_cell_d_min_frac')}")
+        print(f"   n_random/cell    : {cfg.get('conv_cell_n_random')}")
+        print(f"   parity           : {cfg.get('conv_cell_parity')}")
     print(f"   n_nodes total    : {n_total}")
     print(f"   n_interior       : {n_interior}")
+
+    # 节点质量度量
+    nodes_np = np.asarray(problem.nodes, dtype=float)
+    quality = compute_node_quality(
+        nodes_np[problem.interior_idx],
+        bbox_min=nodes_np.min(axis=0) if nodes_np.size else None,
+        bbox_max=nodes_np.max(axis=0) if nodes_np.size else None,
+        probe_method=cfg.get("quality_probe_method", "uniform"),
+        n_probe=(cfg.get("quality_probe_n", 0) or None),
+    )
+    print(f"   quality q        : {quality.get('q', float('nan')):.4e}")
+    print(f"   quality h        : {quality.get('h', float('nan')):.4e}")
+    print(f"   quality ρ = h/q  : {quality.get('rho', float('nan')):.3f}")
     if len(atom_idx):
         print(f"   n_atoms (pinned) : {len(atom_idx)}")
     print(f"   V range          : [{problem.V_nodes.min():.4f}, "
@@ -499,6 +536,7 @@ def run(cfg: Dict[str, Any]) -> None:
             "V_min":        float(problem.V_nodes.min()),
             "V_max":        float(problem.V_nodes.max()),
             "V_mean":       float(problem.V_nodes.mean()),
+            "quality":      quality,     # q, h, rho on interior nodes
         },
         "filter": {
             "filter_type":      filter_type,

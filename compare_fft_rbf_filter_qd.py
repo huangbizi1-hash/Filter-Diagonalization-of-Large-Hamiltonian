@@ -37,6 +37,7 @@ from rbf_core import (
     build_hamiltonian_matrix,
     build_problem,
     build_qd_problem,
+    compute_node_quality,
     read_cube_file,
 )
 
@@ -64,14 +65,28 @@ class CompareConfig:
     rbf_v_clip_percentile: float = 99.9
 
     # ── QD 节点放置方式（QD 模式下生效） ───────────────────────────────────
-    # cube   : cube 文件自带的规则网格（默认，节点均匀分布）
-    # sphere : 球内 Poisson-disc 节点（非均匀，推荐与 RBF-FD 搭配）
-    # atoms  : 原子位置做节点 + 可选 Poisson-disc 加密
+    # cube       : cube 文件自带的规则网格（默认，节点均匀分布）
+    # sphere     : 球内 Poisson-disc 节点（非均匀，推荐与 RBF-FD 搭配）
+    # atoms      : 原子位置做节点 + 可选 Poisson-disc 加密
+    # conv_cell  : 惯用晶胞混合模板 (atoms+level-3 FCC+Poisson+parity) × 平铺
     rbf_node_method: str = "cube"
     rbf_R: float = 20.0                    # sphere / atoms 的球半径（Bohr）
     rbf_sphere_subdivide: int = 3           # 球面 icosphere 细分级数
     rbf_augment: str = "poisson_disc"       # atoms 模式：poisson_disc | none
     rbf_exclude_radius: float = 0.0         # atoms 模式：原子排斥半径（Bohr）
+
+    # conv_cell 专用参数（仅 --rbf-node-method conv_cell 生效）
+    conv_cell_a: float = 11.4523            # 晶格常数（Bohr），InAs zincblende 默认
+    conv_cell_d_min_frac: float = 0.06      # fractional 坐标下的 greedy d_min
+    conv_cell_n_random: int = 120           # 每个晶胞 Poisson-like 目标点数
+    conv_cell_seed: int = 42
+    conv_cell_parity: bool = True           # 是否加 1-r 反演对偶点
+    conv_cell_boundary_margin_frac: float = 0.5  # bbox 面附近多近算 boundary
+    conv_cell_use_rbf_poisson: bool = True  # True=rbf.poisson_disc_nodes, False=周期拒绝采样
+
+    # ── 节点质量度量 ───────────────────────────────────────────────────────
+    quality_probe_method: str = "uniform"   # 'uniform' 或 'random'
+    quality_probe_n: int = 0                # 0 = 自动（~32× n_nodes）
 
     # ── 节点持久化 ─────────────────────────────────────────────────────────
     save_nodes: str = ""   # 非空则把节点单独写入此 JSON（无需后缀，未填则自动命名）
@@ -144,13 +159,21 @@ def _power_method_energy(H_apply, psi0: np.ndarray, n_steps: int = 30) -> float:
     return _rayleigh(H_apply, psi)
 
 
-def _build_node_storage(problem, provenance: dict | None = None) -> dict[str, Any]:
+def _build_node_storage(
+    problem,
+    provenance: dict | None = None,
+    quality_probe_method: str = "uniform",
+    quality_probe_n: int = 0,
+) -> dict[str, Any]:
     """Serialise a RBFProblem's node layout to a JSON-compatible dict.
 
     provenance: optional dict recording how the nodes were generated
                 (domain / spacing / R / augment / exclude_radius / cube_file …).
                 Included as 'source' so the JSON can later be reloaded without
                 re-running the generator.
+
+    Node quality metrics (q, h, rho) are computed on the interior node set
+    over the bbox of the whole node set; see rbf_core.compute_node_quality.
     """
     nodes = np.asarray(problem.nodes, dtype=float)
     interior_idx = np.asarray(problem.interior_idx, dtype=int)
@@ -162,6 +185,17 @@ def _build_node_storage(problem, provenance: dict | None = None) -> dict[str, An
         arr = np.asarray(idx, dtype=int)
         groups_full[str(name)] = arr.tolist()
         group_counts[str(name)] = int(len(arr))
+
+    # q, h, ρ on interior nodes (what the Hamiltonian actually sees)
+    quality: dict[str, Any] = {}
+    if interior_nodes.shape[0] >= 2:
+        quality = compute_node_quality(
+            interior_nodes,
+            bbox_min=nodes.min(axis=0) if nodes.size else None,
+            bbox_max=nodes.max(axis=0) if nodes.size else None,
+            probe_method=quality_probe_method,
+            n_probe=(None if quality_probe_n <= 0 else quality_probe_n),
+        )
 
     return {
         "total_nodes": int(nodes.shape[0]),
@@ -176,6 +210,7 @@ def _build_node_storage(problem, provenance: dict | None = None) -> dict[str, An
             "eps": float(problem.config.eps),
             "order": int(problem.config.order),
         },
+        "quality": quality,     # {q, h, rho, ...}
         "source": provenance or {},
         # 完整坐标 + 分组索引 → 足以重建 RBFProblem 节点布局
         "coordinates_all": nodes.tolist(),
@@ -355,6 +390,13 @@ def run(cfg: CompareConfig) -> Path:
         "rbf_sphere_subdivide": cfg.rbf_sphere_subdivide,
         "rbf_augment":     cfg.rbf_augment,
         "rbf_exclude_radius": cfg.rbf_exclude_radius,
+        "conv_cell_a":     cfg.conv_cell_a,
+        "conv_cell_d_min_frac": cfg.conv_cell_d_min_frac,
+        "conv_cell_n_random":   cfg.conv_cell_n_random,
+        "conv_cell_seed":       cfg.conv_cell_seed,
+        "conv_cell_parity":     cfg.conv_cell_parity,
+        "conv_cell_boundary_margin_frac": cfg.conv_cell_boundary_margin_frac,
+        "conv_cell_use_rbf_poisson":      cfg.conv_cell_use_rbf_poisson,
         "ho_L":            cfg.ho_L,
         "loaded_from":     cfg.load_nodes or None,
     }
@@ -370,9 +412,10 @@ def run(cfg: CompareConfig) -> Path:
         provenance["loaded_from"] = str(load_path)
     elif cfg.system == "qd":
         assert qd_cube is not None
-        if cfg.rbf_node_method not in ("cube", "sphere", "atoms"):
+        if cfg.rbf_node_method not in ("cube", "sphere", "atoms", "conv_cell"):
             raise ValueError(
-                f"--rbf-node-method 仅支持 cube | sphere | atoms，收到 {cfg.rbf_node_method!r}"
+                "--rbf-node-method 仅支持 cube | sphere | atoms | conv_cell，"
+                f"收到 {cfg.rbf_node_method!r}"
             )
         problem = build_qd_problem(
             cube_file=str(qd_cube),
@@ -387,6 +430,13 @@ def run(cfg: CompareConfig) -> Path:
             augment=cfg.rbf_augment,
             exclude_radius=cfg.rbf_exclude_radius,
             v_clip_percentile=cfg.rbf_v_clip_percentile,
+            conv_cell_a=cfg.conv_cell_a,
+            conv_cell_d_min_frac=cfg.conv_cell_d_min_frac,
+            conv_cell_n_random=cfg.conv_cell_n_random,
+            conv_cell_seed=cfg.conv_cell_seed,
+            conv_cell_parity=cfg.conv_cell_parity,
+            conv_cell_boundary_margin_frac=cfg.conv_cell_boundary_margin_frac,
+            conv_cell_use_rbf_poisson=cfg.conv_cell_use_rbf_poisson,
         )
     else:
         rbf_cfg = RBFConfig(
@@ -401,7 +451,19 @@ def run(cfg: CompareConfig) -> Path:
     H_rbf = build_hamiltonian_matrix(problem, symmetrize=True)
     H_rbf_op = spla.aslinearoperator(H_rbf)
     interior_idx = problem.interior_idx
-    node_storage = _build_node_storage(problem, provenance=provenance)
+    node_storage = _build_node_storage(
+        problem,
+        provenance=provenance,
+        quality_probe_method=cfg.quality_probe_method,
+        quality_probe_n=cfg.quality_probe_n,
+    )
+    q_info = node_storage.get("quality", {})
+    if q_info:
+        print(f"[node quality] q={q_info.get('q', float('nan')):.4e}  "
+              f"h={q_info.get('h', float('nan')):.4e}  "
+              f"ρ={q_info.get('rho', float('nan')):.3f}  "
+              f"(n_probe={q_info.get('n_probe', 0)}, "
+              f"method={q_info.get('probe_method', '')})")
     timings["build_rbf_operator"] = time.perf_counter() - t3
 
     # 按需单独落盘节点 JSON（便于后续 --load-nodes 复用，不依赖结果 JSON）
@@ -697,9 +759,10 @@ def parse_args() -> CompareConfig:
     # QD 节点放置方式
     p.add_argument(
         "--rbf-node-method", type=str,
-        choices=["cube", "sphere", "atoms"], default="cube",
+        choices=["cube", "sphere", "atoms", "conv_cell"], default="cube",
         help="QD 节点来源：cube=规则网格(默认)，sphere=球内 Poisson-disc，"
-             "atoms=原子位置 + 可选 Poisson-disc 加密")
+             "atoms=原子位置 + 可选 Poisson-disc 加密，"
+             "conv_cell=惯用晶胞混合模板（atoms+level-3 FCC+Poisson+parity）× 平铺")
     p.add_argument("--rbf-R", type=float, default=20.0,
                    help="sphere / atoms 球半径（Bohr）")
     p.add_argument("--rbf-sphere-subdivide", type=int, default=3,
@@ -709,6 +772,29 @@ def parse_args() -> CompareConfig:
                    help="atoms 模式加密方式")
     p.add_argument("--rbf-exclude-radius", type=float, default=0.0,
                    help="atoms 模式下 Poisson 候选点离原子更近则丢弃（Bohr）")
+
+    # conv_cell 专用
+    p.add_argument("--conv-cell-a", type=float, default=11.4523,
+                   help="惯用晶胞晶格常数 a（Bohr），默认 InAs 11.4523")
+    p.add_argument("--conv-cell-d-min-frac", type=float, default=0.06,
+                   help="conv_cell fractional d_min（greedy 过滤阈值）")
+    p.add_argument("--conv-cell-n-random", type=int, default=120,
+                   help="conv_cell 每个晶胞 Poisson-like 目标点数")
+    p.add_argument("--conv-cell-seed", type=int, default=42,
+                   help="conv_cell 随机种子")
+    p.add_argument("--conv-cell-no-parity", action="store_true",
+                   help="不加 1-r 反演对偶点")
+    p.add_argument("--conv-cell-boundary-margin-frac", type=float, default=0.5,
+                   help="距 bbox 面小于 margin*a 的节点判为 boundary")
+    p.add_argument("--conv-cell-use-legacy-poisson", action="store_true",
+                   help="用用户原版周期拒绝采样而不是 rbf.poisson_disc_nodes")
+
+    # 节点质量度量
+    p.add_argument("--quality-probe-method", type=str,
+                   choices=["uniform", "random"], default="uniform",
+                   help="计算 fill radius h 时的探测点分布方式")
+    p.add_argument("--quality-probe-n", type=int, default=0,
+                   help="探测点总数（0=自动，约 32× n_nodes）")
 
     # 可选对照 Ritz：量化"插值到均匀格点"的影响
     p.add_argument(
@@ -758,6 +844,15 @@ def parse_args() -> CompareConfig:
         save_nodes=a.save_nodes,
         load_nodes=a.load_nodes,
         rbf_interp_ritz=a.rbf_interp_ritz,
+        conv_cell_a=a.conv_cell_a,
+        conv_cell_d_min_frac=a.conv_cell_d_min_frac,
+        conv_cell_n_random=a.conv_cell_n_random,
+        conv_cell_seed=a.conv_cell_seed,
+        conv_cell_parity=(not a.conv_cell_no_parity),
+        conv_cell_boundary_margin_frac=a.conv_cell_boundary_margin_frac,
+        conv_cell_use_rbf_poisson=(not a.conv_cell_use_legacy_poisson),
+        quality_probe_method=a.quality_probe_method,
+        quality_probe_n=a.quality_probe_n,
         power_steps=a.power_steps,
         fft_kinetic_cut=a.fft_kinetic_cut,
         out_dir=a.out_dir,
