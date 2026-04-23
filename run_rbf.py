@@ -161,73 +161,6 @@ def _single_order(args) -> int:
     return int(args.order[0])
 
 
-def _save_problem_artifacts(problem, *, mode: str, order: int, args) -> None:
-    """Save nodes + sparse Hamiltonian + metadata to disk."""
-    import numpy as np
-    import scipy.sparse as sp
-
-    out_dir = Path(args.artifacts_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    extra = f"_{args.artifact_tag}" if args.artifact_tag else ""
-    stem = f"{mode}_order{order}{extra}_{ts}"
-
-    nodes_path = out_dir / f"{stem}_nodes.npy"
-    interior_path = out_dir / f"{stem}_interior_idx.npy"
-    matrix_path = out_dir / f"{stem}_H_sparse.npz"
-    meta_path = out_dir / f"{stem}_meta.json"
-
-    np.save(nodes_path, problem.nodes)
-    np.save(interior_path, problem.interior_idx)
-
-    H = build_hamiltonian_matrix(problem, symmetrize=args.symmetrize).tocsr()
-    sp.save_npz(matrix_path, H)
-
-    n_rows, n_cols = H.shape
-    n_boundary = int(len(problem.nodes) - len(problem.interior_idx))
-    density = float(H.nnz / (n_rows * n_cols)) if n_rows and n_cols else 0.0
-
-    meta = {
-        "description": "RBF-FD generated nodes and sparse Hamiltonian artifacts",
-        "saved_at": datetime.now().isoformat(),
-        "mode": mode,
-        "order": int(order),
-        "symmetrize": bool(args.symmetrize),
-        "phi": args.phi,
-        "eps": float(args.eps),
-        "stencil_size": int(args.stencil_size),
-        "spacing": float(args.spacing),
-        "L": float(args.L),
-        "n_nodes_total": int(problem.nodes.shape[0]),
-        "n_interior_nodes": int(problem.interior_idx.shape[0]),
-        "n_boundary_nodes": n_boundary,
-        "matrix_shape": [int(n_rows), int(n_cols)],
-        "matrix_nnz": int(H.nnz),
-        "matrix_density": density,
-        "files": {
-            "nodes_npy": str(nodes_path),
-            "interior_idx_npy": str(interior_path),
-            "hamiltonian_npz": str(matrix_path),
-        },
-    }
-    if getattr(args, "qd_cube", ""):
-        meta["qd"] = {
-            "cube_file": args.qd_cube,
-            "domain": args.qd_domain,
-            "R": float(args.qd_R),
-            "sphere_subdivide": int(args.qd_sphere_subdivide),
-        }
-    with meta_path.open("w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-
-    print("-" * 72)
-    print(f"Saved artifacts:")
-    print(f"  nodes      → {nodes_path}")
-    print(f"  interior   → {interior_path}")
-    print(f"  H sparse   → {matrix_path}")
-    print(f"  metadata   → {meta_path}")
-
-
 def _ho_exact_levels(n: int) -> list[float]:
     levels: list[float] = []
     for s in range(100):
@@ -268,8 +201,6 @@ def _run_sweep_order(args) -> None:
             grid_N=args.grid_N,
         )
         problem = build_problem(config=config, build_interpolation=not args.no_interp)
-        if args.save_artifacts:
-            _save_problem_artifacts(problem, mode="ho_sweep_order", order=order, args=args)
         err = relative_laplacian_error(problem)
 
         row = {

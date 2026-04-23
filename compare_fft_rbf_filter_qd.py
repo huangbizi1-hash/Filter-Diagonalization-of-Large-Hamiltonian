@@ -31,12 +31,11 @@ from filter_core import (
 )
 from gaussian_potential_builder import GaussianPotentialBuilder, PotentialGrid
 from ho3d_solvers_v2 import build_3d_fft_operator
-from rbf_core import RBFConfig, build_hamiltonian_matrix, build_problem, build_qd_problem
+from rbf_core import build_hamiltonian_matrix, build_qd_problem
 
 
 @dataclass
 class CompareConfig:
-    system: str = "qd"  # qd | ho
     qd_radius: int = 11
     el: float = -0.18
     nc: int = 500
@@ -52,20 +51,12 @@ class CompareConfig:
     rbf_eps: float = 0.5
     rbf_order: int = 2
     rbf_v_clip_percentile: float = 99.9
-    rbf_domain: str = "cube"  # cube | sphere | atoms
-    rbf_spacing: float = 0.8
-    rbf_R: float = 20.0
-    rbf_sphere_subdivide: int = 3
-    rbf_augment: str = "poisson_disc"  # atoms domain only: poisson_disc | none
-    rbf_exclude_radius: float = 0.0
 
     potential_cube_file: str = "localPot.cube"
     potential_params_file: str = "gaussian_fit_params.json"
     potential_r_cut: float = 7.0
 
     out_dir: str = "filter_compare_results"
-    ho_N: int = 24
-    ho_L: float = 8.0
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -95,20 +86,7 @@ def _read_cube_header(cube_path: Path):
 
 def _rayleigh(H_apply, psi: np.ndarray) -> float:
     hpsi = H_apply(psi)
-    den = float(np.vdot(psi, psi).real)
-    if not np.isfinite(den) or den <= 1e-30:
-        return float("nan")
-    val = float(np.vdot(psi, hpsi).real / den)
-    return val if np.isfinite(val) else float("nan")
-
-
-def _normalize_if_valid(v: np.ndarray, eps: float = 1e-30) -> tuple[np.ndarray, float, bool]:
-    nrm = float(np.linalg.norm(v))
-    if np.isfinite(nrm) and nrm > eps:
-        vv = v / nrm
-        if np.all(np.isfinite(vv)):
-            return vv, nrm, True
-    return v, nrm, False
+    return float(np.vdot(psi, hpsi).real / np.vdot(psi, psi).real)
 
 
 def _make_qd_potential(cube_path: Path, cfg: CompareConfig) -> PotentialGrid:
@@ -138,24 +116,19 @@ def _make_qd_potential(cube_path: Path, cfg: CompareConfig) -> PotentialGrid:
 
 
 def run(cfg: CompareConfig) -> Path:
-    timings: dict[str, float] = {}
-    qd_cube = None
+    qd_cube = Path(f"QD_Outputs/QD_R{cfg.qd_radius}.cube")
+    if not qd_cube.exists():
+        raise FileNotFoundError(
+            f"未找到 {qd_cube}。请先运行 generate_QD_cubes.py 或指定已存在的 QD 半径。"
+        )
 
-    if cfg.system == "qd":
-        qd_cube = Path(f"QD_Outputs/QD_R{cfg.qd_radius}.cube")
-        if not qd_cube.exists():
-            raise FileNotFoundError(
-                f"未找到 {qd_cube}。请先运行 generate_QD_cubes.py 或指定已存在的 QD 半径。"
-            )
-        t0 = time.perf_counter()
-        pot = _make_qd_potential(qd_cube, cfg)
-        timings["build_qd_potential"] = time.perf_counter() - t0
-        N = pot.Nx
-        n_grid = N ** 3
-    else:
-        pot = None
-        N = int(cfg.ho_N)
-        n_grid = N ** 3
+    timings: dict[str, float] = {}
+    t0 = time.perf_counter()
+    pot = _make_qd_potential(qd_cube, cfg)
+    timings["build_qd_potential"] = time.perf_counter() - t0
+
+    N = pot.Nx
+    n_grid = N ** 3
 
     dt = (cfg.nc / (cfg.dE * 2.5)) ** 2
     phys = PhysParams(dE=cfg.dE, Vmin=cfg.Vmin, dt=dt)
@@ -175,38 +148,19 @@ def run(cfg: CompareConfig) -> Path:
     timings["build_filter_coeff"] = time.perf_counter() - t1
 
     t2 = time.perf_counter()
-    H_fft, _, _ = build_3d_fft_operator(N=N, potential_grid=pot, L=cfg.ho_L)
+    H_fft, _, _ = build_3d_fft_operator(N=N, potential_grid=pot)
     timings["build_fft_operator"] = time.perf_counter() - t2
 
     t3 = time.perf_counter()
-    if cfg.system == "qd":
-        problem = build_qd_problem(
-            cube_file=str(qd_cube),
-            domain=cfg.rbf_domain,
-            spacing=cfg.rbf_spacing,
-            R=cfg.rbf_R,
-            stencil_size=cfg.rbf_stencil_size,
-            phi=cfg.rbf_phi,
-            eps=cfg.rbf_eps,
-            order=cfg.rbf_order,
-            sphere_subdivide=cfg.rbf_sphere_subdivide,
-            augment=cfg.rbf_augment,
-            exclude_radius=cfg.rbf_exclude_radius,
-            v_clip_percentile=cfg.rbf_v_clip_percentile,
-        )
-    else:
-        problem = build_problem(
-            RBFConfig(
-                spacing=cfg.rbf_spacing,
-                L=cfg.ho_L,
-                stencil_size=cfg.rbf_stencil_size,
-                phi=cfg.rbf_phi,
-                eps=cfg.rbf_eps,
-                order=cfg.rbf_order,
-                grid_N=cfg.ho_N,
-            ),
-            build_interpolation=False,
-        )
+    problem = build_qd_problem(
+        cube_file=str(qd_cube),
+        domain="cube",
+        stencil_size=cfg.rbf_stencil_size,
+        phi=cfg.rbf_phi,
+        eps=cfg.rbf_eps,
+        order=cfg.rbf_order,
+        v_clip_percentile=cfg.rbf_v_clip_percentile,
+    )
     H_rbf = build_hamiltonian_matrix(problem, symmetrize=True)
     H_rbf_op = spla.aslinearoperator(H_rbf)
     interior_idx = problem.interior_idx
@@ -219,29 +173,25 @@ def run(cfg: CompareConfig) -> Path:
     rbf_basis = []
 
     t4 = time.perf_counter()
-    same_state_mode = (cfg.system == "qd" and cfg.rbf_domain == "cube")
     for i in range(cfg.n_random):
         psi_full = rng.standard_normal(n_grid)
         psi_full /= np.linalg.norm(psi_full)
-        if same_state_mode:
-            psi_int = psi_full[interior_idx]
-            psi_int /= np.linalg.norm(psi_int)
-        else:
-            # 非 cube 节点域（sphere/atoms）与 FFT 网格自由度不同，
-            # 无法做一一映射，因此用同一 RNG 下独立抽样保证可复现。
-            psi_int = rng.standard_normal(len(interior_idx))
-            psi_int /= np.linalg.norm(psi_int)
+        psi_int = psi_full[interior_idx]
+        psi_int /= np.linalg.norm(psi_int)
 
         fft_filt = apply_filter_H_all_op(H_fft.matvec, psi_full, samp, an, phys)[0]
         rbf_filt = apply_filter_H_all_op(H_rbf_op.matvec, psi_int, samp, an, phys)[0]
 
-        fft_filt, norm_fft, valid_fft = _normalize_if_valid(fft_filt)
-        rbf_filt, norm_rbf, valid_rbf = _normalize_if_valid(rbf_filt)
+        norm_fft = float(np.linalg.norm(fft_filt))
+        norm_rbf = float(np.linalg.norm(rbf_filt))
+        if norm_fft > 0:
+            fft_filt = fft_filt / norm_fft
+        if norm_rbf > 0:
+            rbf_filt = rbf_filt / norm_rbf
 
         E_fft = _rayleigh(H_fft.matvec, fft_filt)
         E_rbf = _rayleigh(H_rbf_op.matvec, rbf_filt)
 
-        diff = (E_rbf - E_fft) if (np.isfinite(E_fft) and np.isfinite(E_rbf)) else float("nan")
         per_state.append(
             {
                 "state_index": i,
@@ -249,51 +199,38 @@ def run(cfg: CompareConfig) -> Path:
                 "filter_norm_rbf": norm_rbf,
                 "energy_fft": E_fft,
                 "energy_rbf": E_rbf,
-                "abs_diff": abs(diff) if np.isfinite(diff) else float("nan"),
-                "signed_diff": diff,
-                "same_state_mode": same_state_mode,
-                "valid_fft": bool(valid_fft and np.isfinite(E_fft)),
-                "valid_rbf": bool(valid_rbf and np.isfinite(E_rbf)),
+                "abs_diff": abs(E_fft - E_rbf),
+                "signed_diff": E_rbf - E_fft,
             }
         )
-        if valid_fft and np.isfinite(E_fft):
-            fft_basis.append(fft_filt)
-        if valid_rbf and np.isfinite(E_rbf):
-            rbf_basis.append(rbf_filt)
+
+        fft_basis.append(fft_filt)
+        rbf_basis.append(rbf_filt)
 
     timings["filter_states"] = time.perf_counter() - t4
 
-    if fft_basis:
-        fft_basis_mat = np.column_stack(fft_basis)
-        t5 = time.perf_counter()
-        evals_fft, _, rank_fft = svd_rayleigh_ritz_op(
-            fft_basis_mat,
-            H_fft.matvec,
-            svd_tol=cfg.svd_tol,
-            max_energies=cfg.max_energies,
-            hermitian=True,
-        )
-        timings["rr_fft"] = time.perf_counter() - t5
-    else:
-        evals_fft = np.array([], dtype=float)
-        rank_fft = 0
-        timings["rr_fft"] = 0.0
+    fft_basis_mat = np.column_stack(fft_basis)
+    rbf_basis_mat = np.column_stack(rbf_basis)
 
-    if rbf_basis:
-        rbf_basis_mat = np.column_stack(rbf_basis)
-        t6 = time.perf_counter()
-        evals_rbf, _, rank_rbf = svd_rayleigh_ritz_op(
-            rbf_basis_mat,
-            H_rbf_op.matvec,
-            svd_tol=cfg.svd_tol,
-            max_energies=cfg.max_energies,
-            hermitian=True,
-        )
-        timings["rr_rbf"] = time.perf_counter() - t6
-    else:
-        evals_rbf = np.array([], dtype=float)
-        rank_rbf = 0
-        timings["rr_rbf"] = 0.0
+    t5 = time.perf_counter()
+    evals_fft, _, rank_fft = svd_rayleigh_ritz_op(
+        fft_basis_mat,
+        H_fft.matvec,
+        svd_tol=cfg.svd_tol,
+        max_energies=cfg.max_energies,
+        hermitian=True,
+    )
+    timings["rr_fft"] = time.perf_counter() - t5
+
+    t6 = time.perf_counter()
+    evals_rbf, _, rank_rbf = svd_rayleigh_ritz_op(
+        rbf_basis_mat,
+        H_rbf_op.matvec,
+        svd_tol=cfg.svd_tol,
+        max_energies=cfg.max_energies,
+        hermitian=True,
+    )
+    timings["rr_rbf"] = time.perf_counter() - t6
 
     k = min(len(evals_fft), len(evals_rbf))
     paired = []
@@ -309,8 +246,7 @@ def run(cfg: CompareConfig) -> Path:
                 }
             )
 
-    valid_state_diffs = [x["abs_diff"] for x in per_state if np.isfinite(x["abs_diff"])]
-    avg_state_err = float(np.mean(valid_state_diffs)) if valid_state_diffs else None
+    avg_state_err = float(np.mean([x["abs_diff"] for x in per_state])) if per_state else None
     avg_eval_err = float(np.mean([x["abs_diff"] for x in paired])) if paired else None
 
     out = {
@@ -321,11 +257,7 @@ def run(cfg: CompareConfig) -> Path:
             "N": N,
             "N_grid": n_grid,
             "n_interior_rbf": int(len(interior_idx)),
-            "qd_cube": str(qd_cube) if qd_cube is not None else None,
-            "same_state_mode": same_state_mode,
-            "system": cfg.system,
-            "n_valid_fft_basis": len(fft_basis),
-            "n_valid_rbf_basis": len(rbf_basis),
+            "qd_cube": str(qd_cube),
         },
         "filter": {
             "EL": cfg.el,
@@ -357,11 +289,7 @@ def run(cfg: CompareConfig) -> Path:
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if cfg.system == "qd":
-        out_name = f"fft_rbf_qd_R{cfg.qd_radius}_{ts}.json"
-    else:
-        out_name = f"fft_rbf_ho_N{cfg.ho_N}_{ts}.json"
-    out_path = out_dir / out_name
+    out_path = out_dir / f"fft_rbf_qd_R{cfg.qd_radius}_{ts}.json"
     with out_path.open("w", encoding="utf-8") as f:
         json.dump(_to_jsonable(out), f, ensure_ascii=False, indent=2)
 
@@ -369,8 +297,7 @@ def run(cfg: CompareConfig) -> Path:
 
 
 def parse_args() -> CompareConfig:
-    p = argparse.ArgumentParser(description="Compare FFT and RBF filter on QD/HO")
-    p.add_argument("--system", type=str, default="qd", choices=["qd", "ho"])
+    p = argparse.ArgumentParser(description="Compare FFT and RBF filter on QD")
     p.add_argument("--qd-radius", type=int, default=11)
     p.add_argument("--el", type=float, default=-0.18)
     p.add_argument("--nc", type=int, default=500)
@@ -385,23 +312,10 @@ def parse_args() -> CompareConfig:
     p.add_argument("--rbf-eps", type=float, default=0.5)
     p.add_argument("--rbf-order", type=int, default=2)
     p.add_argument("--rbf-v-clip-percentile", type=float, default=99.9)
-    p.add_argument("--rbf-domain", type=str, default="cube",
-                   choices=["cube", "sphere", "atoms"])
-    p.add_argument("--rbf-spacing", type=float, default=0.8)
-    p.add_argument("--rbf-R", type=float, default=20.0)
-    p.add_argument("--rbf-sphere-subdivide", type=int, default=3)
-    p.add_argument("--rbf-augment", type=str, default="poisson_disc",
-                   choices=["poisson_disc", "none"])
-    p.add_argument("--rbf-exclude-radius", type=float, default=0.0)
     p.add_argument("--out-dir", type=str, default="filter_compare_results")
-    p.add_argument("--ho-N", type=int, default=24,
-                   help="HO mode only: FFT grid size per axis")
-    p.add_argument("--ho-L", type=float, default=8.0,
-                   help="HO mode only: box half-length")
 
     a = p.parse_args()
     return CompareConfig(
-        system=a.system,
         qd_radius=a.qd_radius,
         el=a.el,
         nc=a.nc,
@@ -416,15 +330,7 @@ def parse_args() -> CompareConfig:
         rbf_eps=a.rbf_eps,
         rbf_order=a.rbf_order,
         rbf_v_clip_percentile=a.rbf_v_clip_percentile,
-        rbf_domain=a.rbf_domain,
-        rbf_spacing=a.rbf_spacing,
-        rbf_R=a.rbf_R,
-        rbf_sphere_subdivide=a.rbf_sphere_subdivide,
-        rbf_augment=a.rbf_augment,
-        rbf_exclude_radius=a.rbf_exclude_radius,
         out_dir=a.out_dir,
-        ho_N=a.ho_N,
-        ho_L=a.ho_L,
     )
 
 
