@@ -79,6 +79,16 @@ class CompareConfig:
                            #   laplacian / V_nodes 仍然会按 CLI 的 --rbf-phi / eps /
                            #   order / stencil-size / v-clip 等参数重新计算
 
+    # ── 可选：带插值的对照 Ritz（用于量化"插值到均匀格点"带来的误差） ──────
+    # 当前默认的 RBF Ritz 是直接在非均匀 interior 节点空间里做的，不含任何
+    # 波函数插值。启用此开关时，会额外：
+    #   (a) 用 RBF 权重矩阵构造 n_grid × n_interior 的插值算子 P，
+    #   (b) 把 RBF 滤波基 Φ_rbf 插到 FFT 均匀格点：Φ_interp = P @ Φ_rbf，
+    #   (c) 用 FFT 的 H 在插值后基上做 Ritz，得到 evals_rbf_interp。
+    # evals_rbf（原有，无插值）与 evals_rbf_interp（新增，含插值）之差即可
+    # 用来定量评估插值的影响。启用会增加一次 weight_matrix 构造 + 一次 Ritz。
+    rbf_interp_ritz: bool = False
+
     potential_cube_file: str = "localPot.cube"
     potential_params_file: str = "gaussian_fit_params.json"
     potential_r_cut: float = 7.0
@@ -179,6 +189,24 @@ def _save_nodes_json(node_storage: dict[str, Any], path: Path) -> Path:
     with path.open("w", encoding="utf-8") as f:
         json.dump(_to_jsonable(node_storage), f, ensure_ascii=False, indent=2)
     return path
+
+
+def _fft_grid_points(pot: PotentialGrid | None, N: int, ho_L: float) -> np.ndarray:
+    """返回 FFT 所用均匀格点的 3D 坐标，shape (N³, 3)。
+
+    QD 模式 (pot 非 None)：直接用 pot.x / pot.y / pot.z
+    HO 模式 (pot is None)：按 build_3d_fft_operator 的约定
+                           d = 2L/N，x1d = (arange(N) - N/2) * d
+    """
+    if pot is not None:
+        x1d, y1d, z1d = pot.x, pot.y, pot.z
+    else:
+        d = 2.0 * ho_L / N
+        x1d = (np.arange(N) - N / 2) * d
+        y1d = x1d.copy()
+        z1d = x1d.copy()
+    X, Y, Z = np.meshgrid(x1d, y1d, z1d, indexing="ij")
+    return np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
 
 
 def _build_problem_from_nodes_json(path: Path, cfg: "CompareConfig",
@@ -471,6 +499,65 @@ def run(cfg: CompareConfig) -> Path:
     )
     timings["rr_rbf"] = time.perf_counter() - t6
 
+    # ── 可选：带插值的对照 Ritz ─────────────────────────────────────────────
+    # 把 RBF 滤波基从 n_interior 非均匀节点插到 FFT 均匀格点 (n_grid)，
+    # 再用 FFT 的 H 在插值后基上做 Ritz。供对比"插值 vs 不插值"。
+    evals_rbf_interp: np.ndarray = np.array([], dtype=np.float64)
+    rank_rbf_interp = 0
+    t_interp_build = 0.0
+    t_rr_rbf_interp = 0.0
+    per_state_interp: list[dict[str, Any]] = []
+
+    if cfg.rbf_interp_ritz:
+        t_ib0 = time.perf_counter()
+        from rbf.pde.fd import weight_matrix as _weight_matrix_for_interp
+
+        fft_pts = _fft_grid_points(pot, N, cfg.ho_L)          # (N³, 3)
+        interior_pts = problem.nodes[problem.interior_idx]    # (n_interior, 3)
+        # RBF 插值算子：diffs=[0,0,0] 即在点上直接求值
+        P_interp = _weight_matrix_for_interp(
+            x=fft_pts,
+            p=interior_pts,
+            n=cfg.rbf_stencil_size,
+            diffs=[0, 0, 0],
+            phi=cfg.rbf_phi,
+            eps=cfg.rbf_eps,
+            order=cfg.rbf_order,
+        )
+        t_interp_build = time.perf_counter() - t_ib0
+        timings["build_interp_matrix"] = t_interp_build
+
+        # 插值整个基：(n_grid, n_interior) @ (n_interior, n_random) → (n_grid, n_random)
+        rbf_basis_interp = np.asarray(P_interp @ rbf_basis_mat)
+
+        # 每个插值后态在 H_fft 下的 Rayleigh 能量（便于定量对比）
+        for i in range(rbf_basis_interp.shape[1]):
+            psi_i = rbf_basis_interp[:, i]
+            nrm_i = float(np.linalg.norm(psi_i))
+            E_interp = (_rayleigh(H_fft.matvec, psi_i / nrm_i)
+                        if nrm_i > 0 else float("nan"))
+            per_state_interp.append({
+                "state_index": i,
+                "norm_after_interp": nrm_i,
+                "energy_rbf_interp": E_interp,
+                "energy_fft":        per_state[i]["energy_fft"],
+                "energy_rbf_nodes":  per_state[i]["energy_rbf"],
+                "abs_diff_vs_fft":   abs(E_interp - per_state[i]["energy_fft"]),
+                "abs_diff_vs_rbf_nodes": abs(E_interp - per_state[i]["energy_rbf"]),
+            })
+
+        t_rr0 = time.perf_counter()
+        evals_rbf_interp, _, rank_rbf_interp = svd_rayleigh_ritz_op(
+            rbf_basis_interp,
+            H_fft.matvec,
+            svd_tol=cfg.svd_tol,
+            max_energies=cfg.max_energies,
+            hermitian=True,
+        )
+        t_rr_rbf_interp = time.perf_counter() - t_rr0
+        timings["rr_rbf_interp"] = t_rr_rbf_interp
+
+    # ── 配对差 ──────────────────────────────────────────────────────────────
     k = min(len(evals_fft), len(evals_rbf))
     paired = []
     if k > 0:
@@ -485,8 +572,35 @@ def run(cfg: CompareConfig) -> Path:
                 }
             )
 
+    # rbf_nodes (无插值) vs rbf_interp (插到均匀格点后 Ritz)：
+    # 两者都是"同一份滤波态"的 Ritz 结果，差异 = 插值的净影响
+    paired_rbf_interp_vs_nodes: list[dict[str, Any]] = []
+    paired_interp_vs_fft:       list[dict[str, Any]] = []
+    if len(evals_rbf_interp) > 0:
+        k2 = min(len(evals_rbf_interp), len(evals_rbf))
+        for i in range(k2):
+            paired_rbf_interp_vs_nodes.append({
+                "level_index": i,
+                "rbf_nodes":  float(evals_rbf[i]),
+                "rbf_interp": float(evals_rbf_interp[i]),
+                "abs_diff":   float(abs(evals_rbf_interp[i] - evals_rbf[i])),
+                "signed_diff": float(evals_rbf_interp[i] - evals_rbf[i]),
+            })
+        k3 = min(len(evals_rbf_interp), len(evals_fft))
+        for i in range(k3):
+            paired_interp_vs_fft.append({
+                "level_index": i,
+                "fft":        float(evals_fft[i]),
+                "rbf_interp": float(evals_rbf_interp[i]),
+                "abs_diff":   float(abs(evals_rbf_interp[i] - evals_fft[i])),
+                "signed_diff": float(evals_rbf_interp[i] - evals_fft[i]),
+            })
+
     avg_state_err = float(np.mean([x["abs_diff"] for x in per_state])) if per_state else None
     avg_eval_err = float(np.mean([x["abs_diff"] for x in paired])) if paired else None
+    avg_interp_eff = (
+        float(np.mean([x["abs_diff"] for x in paired_rbf_interp_vs_nodes]))
+        if paired_rbf_interp_vs_nodes else None)
 
     out = {
         "script": "compare_fft_rbf_filter_qd.py",
@@ -518,19 +632,33 @@ def run(cfg: CompareConfig) -> Path:
             "signed_diff": float(Emax_rbf - Emax_fft),
         },
         "rr": {
+            # evals_rbf 始终是"直接在非均匀节点上 Ritz"的结果（无波函数插值）
+            # evals_rbf_interp 仅在 --rbf-interp-ritz 时存在：把 RBF 基插到 FFT
+            # 均匀格点后用 FFT 的 H 做 Ritz，用来量化插值本身的影响
             "rank_fft": int(rank_fft),
-            "rank_rbf": int(rank_rbf),
+            "rank_rbf_nodes": int(rank_rbf),
+            "rank_rbf_interp": int(rank_rbf_interp),
             "evals_fft": [float(x) for x in evals_fft],
-            "evals_rbf": [float(x) for x in evals_rbf],
-            "paired_level_diffs": paired,
+            "evals_rbf": [float(x) for x in evals_rbf],                     # no interp
+            "evals_rbf_nodes": [float(x) for x in evals_rbf],               # alias
+            "evals_rbf_interp": [float(x) for x in evals_rbf_interp],       # with interp
+            "paired_level_diffs": paired,                                   # fft vs rbf_nodes
+            "paired_level_diffs_rbf_interp_vs_nodes": paired_rbf_interp_vs_nodes,
+            "paired_level_diffs_rbf_interp_vs_fft":   paired_interp_vs_fft,
             "avg_abs_error_eigenvalues": avg_eval_err,
+            "avg_abs_error_interp_effect": avg_interp_eff,   # ← 插值的净影响
         },
         "per_state_filtered_energy": per_state,
+        "per_state_filtered_energy_interp": per_state_interp,
         "summary": {
             "avg_abs_error_per_state_filtered_energy": avg_state_err,
             "avg_abs_error_eigenvalues": avg_eval_err,
             "max_abs_error_per_state_filtered_energy": float(np.max([x["abs_diff"] for x in per_state])) if per_state else None,
             "max_abs_error_eigenvalues": float(np.max([x["abs_diff"] for x in paired])) if paired else None,
+            "avg_abs_error_interp_effect_eigenvalues": avg_interp_eff,
+            "max_abs_error_interp_effect_eigenvalues": (
+                float(np.max([x["abs_diff"] for x in paired_rbf_interp_vs_nodes]))
+                if paired_rbf_interp_vs_nodes else None),
         },
         "timings_sec": timings,
     }
@@ -582,6 +710,13 @@ def parse_args() -> CompareConfig:
     p.add_argument("--rbf-exclude-radius", type=float, default=0.0,
                    help="atoms 模式下 Poisson 候选点离原子更近则丢弃（Bohr）")
 
+    # 可选对照 Ritz：量化"插值到均匀格点"的影响
+    p.add_argument(
+        "--rbf-interp-ritz", action="store_true",
+        help="额外跑一次'把 RBF 滤波基插到 FFT 均匀格点后再用 FFT 的 H 做 Ritz'；"
+             "结果写入 evals_rbf_interp，与 evals_rbf（直接在节点上 Ritz）对比即为"
+             "插值本身带来的误差")
+
     # 节点持久化
     p.add_argument(
         "--save-nodes", type=str, default="",
@@ -622,6 +757,7 @@ def parse_args() -> CompareConfig:
         rbf_exclude_radius=a.rbf_exclude_radius,
         save_nodes=a.save_nodes,
         load_nodes=a.load_nodes,
+        rbf_interp_ritz=a.rbf_interp_ritz,
         power_steps=a.power_steps,
         fft_kinetic_cut=a.fft_kinetic_cut,
         out_dir=a.out_dir,
