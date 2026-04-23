@@ -31,8 +31,14 @@ from filter_core import (
 )
 from gaussian_potential_builder import GaussianPotentialBuilder, PotentialGrid
 from ho3d_solvers_v2 import build_3d_fft_operator
-from rbf_core import build_hamiltonian_matrix, build_qd_problem
-from rbf_core import RBFConfig, build_problem
+from rbf_core import (
+    RBFConfig,
+    RBFProblem,
+    build_hamiltonian_matrix,
+    build_problem,
+    build_qd_problem,
+    read_cube_file,
+)
 
 
 @dataclass
@@ -56,6 +62,22 @@ class CompareConfig:
     rbf_eps: float = 0.5
     rbf_order: int = 2
     rbf_v_clip_percentile: float = 99.9
+
+    # ── QD 节点放置方式（QD 模式下生效） ───────────────────────────────────
+    # cube   : cube 文件自带的规则网格（默认，节点均匀分布）
+    # sphere : 球内 Poisson-disc 节点（非均匀，推荐与 RBF-FD 搭配）
+    # atoms  : 原子位置做节点 + 可选 Poisson-disc 加密
+    rbf_node_method: str = "cube"
+    rbf_R: float = 20.0                    # sphere / atoms 的球半径（Bohr）
+    rbf_sphere_subdivide: int = 3           # 球面 icosphere 细分级数
+    rbf_augment: str = "poisson_disc"       # atoms 模式：poisson_disc | none
+    rbf_exclude_radius: float = 0.0         # atoms 模式：原子排斥半径（Bohr）
+
+    # ── 节点持久化 ─────────────────────────────────────────────────────────
+    save_nodes: str = ""   # 非空则把节点单独写入此 JSON（无需后缀，未填则自动命名）
+    load_nodes: str = ""   # 非空则从此 JSON 加载节点，跳过节点生成；节点上的
+                           #   laplacian / V_nodes 仍然会按 CLI 的 --rbf-phi / eps /
+                           #   order / stencil-size / v-clip 等参数重新计算
 
     potential_cube_file: str = "localPot.cube"
     potential_params_file: str = "gaussian_fit_params.json"
@@ -112,14 +134,24 @@ def _power_method_energy(H_apply, psi0: np.ndarray, n_steps: int = 30) -> float:
     return _rayleigh(H_apply, psi)
 
 
-def _build_node_storage(problem) -> dict[str, Any]:
+def _build_node_storage(problem, provenance: dict | None = None) -> dict[str, Any]:
+    """Serialise a RBFProblem's node layout to a JSON-compatible dict.
+
+    provenance: optional dict recording how the nodes were generated
+                (domain / spacing / R / augment / exclude_radius / cube_file …).
+                Included as 'source' so the JSON can later be reloaded without
+                re-running the generator.
+    """
     nodes = np.asarray(problem.nodes, dtype=float)
     interior_idx = np.asarray(problem.interior_idx, dtype=int)
     interior_nodes = nodes[interior_idx]
 
+    groups_full: dict[str, list[int]] = {}
     group_counts: dict[str, int] = {}
     for name, idx in problem.groups.items():
-        group_counts[str(name)] = int(len(idx))
+        arr = np.asarray(idx, dtype=int)
+        groups_full[str(name)] = arr.tolist()
+        group_counts[str(name)] = int(len(arr))
 
     return {
         "total_nodes": int(nodes.shape[0]),
@@ -127,16 +159,91 @@ def _build_node_storage(problem) -> dict[str, Any]:
         "dimension": int(nodes.shape[1]) if nodes.ndim == 2 else None,
         "bbox_min": nodes.min(axis=0).tolist() if nodes.size else [],
         "bbox_max": nodes.max(axis=0).tolist() if nodes.size else [],
-        "groups": group_counts,
+        "group_counts": group_counts,
         "metadata": {
             "stencil_size": int(problem.config.stencil_size),
             "phi": str(problem.config.phi),
             "eps": float(problem.config.eps),
             "order": int(problem.config.order),
         },
+        "source": provenance or {},
+        # 完整坐标 + 分组索引 → 足以重建 RBFProblem 节点布局
         "coordinates_all": nodes.tolist(),
         "coordinates_interior": interior_nodes.tolist(),
+        "groups": groups_full,
     }
+
+
+def _save_nodes_json(node_storage: dict[str, Any], path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(_to_jsonable(node_storage), f, ensure_ascii=False, indent=2)
+    return path
+
+
+def _build_problem_from_nodes_json(path: Path, cfg: "CompareConfig",
+                                    cube_path: Path) -> tuple[RBFProblem, dict[str, Any]]:
+    """Reconstruct a RBFProblem from a saved nodes JSON.
+
+    Node positions and group assignments are loaded from the file as-is.
+    The RBF-FD Laplacian and V_nodes are recomputed using the **current** CLI
+    parameters (stencil_size / phi / eps / order / v_clip_percentile), so you
+    can reuse the same node layout while sweeping RBF kernels.
+    """
+    from rbf.pde.fd import weight_matrix
+    from scipy.interpolate import RegularGridInterpolator
+
+    with path.open("r", encoding="utf-8") as f:
+        saved = json.load(f)
+
+    nodes = np.asarray(saved["coordinates_all"], dtype=float)
+    groups = {str(k): np.asarray(v, dtype=int) for k, v in saved["groups"].items()}
+    if "interior" not in groups:
+        raise ValueError(
+            f"saved nodes JSON {path} missing 'interior' group")
+    interior_idx = groups["interior"]
+
+    # V_nodes: interpolate the QD potential at the saved interior positions
+    x_cube, y_cube, z_cube, pot_3d = read_cube_file(str(cube_path))
+    interp = RegularGridInterpolator(
+        (x_cube, y_cube, z_cube), pot_3d,
+        method="linear", bounds_error=False, fill_value=0.0,
+    )
+    V_nodes = interp(nodes[interior_idx]).astype(np.float64)
+    v_cap = float(np.percentile(V_nodes, cfg.rbf_v_clip_percentile))
+    V_nodes = np.clip(V_nodes, None, v_cap)
+
+    # Recompute the RBF-FD Laplacian from the saved geometry
+    laplacian_matrix = weight_matrix(
+        x=nodes[interior_idx],
+        p=nodes,
+        n=cfg.rbf_stencil_size,
+        diffs=[[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+        phi=cfg.rbf_phi,
+        eps=cfg.rbf_eps,
+        order=cfg.rbf_order,
+    )
+    rbf_cfg = RBFConfig(
+        spacing=cfg.rbf_spacing,
+        L=float(np.max(np.abs(nodes))) if nodes.size else 0.0,
+        stencil_size=cfg.rbf_stencil_size,
+        phi=cfg.rbf_phi,
+        eps=cfg.rbf_eps,
+        order=cfg.rbf_order,
+    )
+    problem = RBFProblem(
+        config=rbf_cfg,
+        nodes=nodes,
+        groups=groups,
+        interior_idx=interior_idx,
+        laplacian_matrix=laplacian_matrix,
+        psi_interp_matrix=None,
+        lap_interp_matrix=None,
+        grid_points=None,
+        grid_shape=None,
+        V_nodes=V_nodes,
+    )
+    return problem, saved
 
 
 def _make_qd_potential(cube_path: Path, cfg: CompareConfig) -> PotentialGrid:
@@ -210,15 +317,47 @@ def run(cfg: CompareConfig) -> Path:
     timings["build_fft_operator"] = time.perf_counter() - t2
 
     t3 = time.perf_counter()
-    if cfg.system == "qd":
+    provenance: dict[str, Any] = {
+        "system":          cfg.system,
+        "qd_radius":       cfg.qd_radius if cfg.system == "qd" else None,
+        "qd_cube":         str(qd_cube) if qd_cube is not None else None,
+        "node_method":     cfg.rbf_node_method,
+        "rbf_spacing":     cfg.rbf_spacing,
+        "rbf_R":           cfg.rbf_R,
+        "rbf_sphere_subdivide": cfg.rbf_sphere_subdivide,
+        "rbf_augment":     cfg.rbf_augment,
+        "rbf_exclude_radius": cfg.rbf_exclude_radius,
+        "ho_L":            cfg.ho_L,
+        "loaded_from":     cfg.load_nodes or None,
+    }
+
+    if cfg.load_nodes:
+        # 从已存节点 JSON 重建 RBFProblem（Laplacian + V 按当前 CLI 重新算）
+        if cfg.system != "qd" or qd_cube is None:
+            raise ValueError("--load-nodes 目前只支持 --system qd（需要 cube 文件做 V 插值）")
+        load_path = Path(cfg.load_nodes)
+        if not load_path.exists():
+            raise FileNotFoundError(f"--load-nodes 指定的文件不存在: {load_path}")
+        problem, _saved_meta = _build_problem_from_nodes_json(load_path, cfg, qd_cube)
+        provenance["loaded_from"] = str(load_path)
+    elif cfg.system == "qd":
         assert qd_cube is not None
+        if cfg.rbf_node_method not in ("cube", "sphere", "atoms"):
+            raise ValueError(
+                f"--rbf-node-method 仅支持 cube | sphere | atoms，收到 {cfg.rbf_node_method!r}"
+            )
         problem = build_qd_problem(
             cube_file=str(qd_cube),
-            domain="cube",
+            domain=cfg.rbf_node_method,
+            spacing=cfg.rbf_spacing,
+            R=cfg.rbf_R,
             stencil_size=cfg.rbf_stencil_size,
             phi=cfg.rbf_phi,
             eps=cfg.rbf_eps,
             order=cfg.rbf_order,
+            sphere_subdivide=cfg.rbf_sphere_subdivide,
+            augment=cfg.rbf_augment,
+            exclude_radius=cfg.rbf_exclude_radius,
             v_clip_percentile=cfg.rbf_v_clip_percentile,
         )
     else:
@@ -234,8 +373,24 @@ def run(cfg: CompareConfig) -> Path:
     H_rbf = build_hamiltonian_matrix(problem, symmetrize=True)
     H_rbf_op = spla.aslinearoperator(H_rbf)
     interior_idx = problem.interior_idx
-    node_storage = _build_node_storage(problem)
+    node_storage = _build_node_storage(problem, provenance=provenance)
     timings["build_rbf_operator"] = time.perf_counter() - t3
+
+    # 按需单独落盘节点 JSON（便于后续 --load-nodes 复用，不依赖结果 JSON）
+    nodes_json_path: Path | None = None
+    ts_nodes = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if cfg.save_nodes:
+        # 用户给了路径——如果是目录则自动命名，否则当作完整文件路径
+        p_user = Path(cfg.save_nodes)
+        if p_user.suffix == "" or p_user.is_dir():
+            p_user.mkdir(parents=True, exist_ok=True)
+            tag = (f"qd_R{cfg.qd_radius}" if cfg.system == "qd"
+                   else f"ho_N{cfg.ho_N}")
+            nodes_json_path = p_user / f"nodes_{tag}_{cfg.rbf_node_method}_{ts_nodes}.json"
+        else:
+            nodes_json_path = p_user
+        _save_nodes_json(node_storage, nodes_json_path)
+        print(f"节点 JSON 已保存: {nodes_json_path}")
 
     # FFT 和 RBF 生活在完全不同的向量空间：
     #   FFT: 均匀网格，维度 n_grid = N³
@@ -343,7 +498,9 @@ def run(cfg: CompareConfig) -> Path:
             "n_interior_rbf": n_interior,
             "qd_cube": str(qd_cube) if qd_cube is not None else None,
         },
+        # 结果 JSON 中保留完整 node_storage；nodes_file 指向独立落盘的副本（如有）
         "rbf_nodes": node_storage,
+        "rbf_nodes_file": str(nodes_json_path) if nodes_json_path else None,
         "filter": {
             "EL": cfg.el,
             "NC_input": cfg.nc,
@@ -408,6 +565,32 @@ def parse_args() -> CompareConfig:
     p.add_argument("--rbf-eps", type=float, default=0.5)
     p.add_argument("--rbf-order", type=int, default=2)
     p.add_argument("--rbf-v-clip-percentile", type=float, default=99.9)
+
+    # QD 节点放置方式
+    p.add_argument(
+        "--rbf-node-method", type=str,
+        choices=["cube", "sphere", "atoms"], default="cube",
+        help="QD 节点来源：cube=规则网格(默认)，sphere=球内 Poisson-disc，"
+             "atoms=原子位置 + 可选 Poisson-disc 加密")
+    p.add_argument("--rbf-R", type=float, default=20.0,
+                   help="sphere / atoms 球半径（Bohr）")
+    p.add_argument("--rbf-sphere-subdivide", type=int, default=3,
+                   help="球面 icosphere 细分级数（越大边界越圆滑）")
+    p.add_argument("--rbf-augment", type=str,
+                   choices=["poisson_disc", "none"], default="poisson_disc",
+                   help="atoms 模式加密方式")
+    p.add_argument("--rbf-exclude-radius", type=float, default=0.0,
+                   help="atoms 模式下 Poisson 候选点离原子更近则丢弃（Bohr）")
+
+    # 节点持久化
+    p.add_argument(
+        "--save-nodes", type=str, default="",
+        help="把节点单独存成 JSON（可以是目录或完整文件路径）；"
+             "目录时会自动命名为 nodes_<tag>_<method>_<ts>.json")
+    p.add_argument(
+        "--load-nodes", type=str, default="",
+        help="从已存的节点 JSON 加载（跳过节点生成，Laplacian/V 仍按当前 CLI 重新算）")
+
     p.add_argument("--power-steps", type=int, default=30)
     p.add_argument("--fft-kinetic-cut", type=float, default=30.0)
     p.add_argument("--out-dir", type=str, default="filter_compare_results")
@@ -432,6 +615,13 @@ def parse_args() -> CompareConfig:
         rbf_eps=a.rbf_eps,
         rbf_order=a.rbf_order,
         rbf_v_clip_percentile=a.rbf_v_clip_percentile,
+        rbf_node_method=a.rbf_node_method,
+        rbf_R=a.rbf_R,
+        rbf_sphere_subdivide=a.rbf_sphere_subdivide,
+        rbf_augment=a.rbf_augment,
+        rbf_exclude_radius=a.rbf_exclude_radius,
+        save_nodes=a.save_nodes,
+        load_nodes=a.load_nodes,
         power_steps=a.power_steps,
         fft_kinetic_cut=a.fft_kinetic_cut,
         out_dir=a.out_dir,
