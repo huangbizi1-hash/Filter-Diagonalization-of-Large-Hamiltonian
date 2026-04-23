@@ -112,6 +112,33 @@ def _power_method_energy(H_apply, psi0: np.ndarray, n_steps: int = 30) -> float:
     return _rayleigh(H_apply, psi)
 
 
+def _build_node_storage(problem) -> dict[str, Any]:
+    nodes = np.asarray(problem.nodes, dtype=float)
+    interior_idx = np.asarray(problem.interior_idx, dtype=int)
+    interior_nodes = nodes[interior_idx]
+
+    group_counts: dict[str, int] = {}
+    for name, idx in problem.groups.items():
+        group_counts[str(name)] = int(len(idx))
+
+    return {
+        "total_nodes": int(nodes.shape[0]),
+        "interior_nodes": int(interior_nodes.shape[0]),
+        "dimension": int(nodes.shape[1]) if nodes.ndim == 2 else None,
+        "bbox_min": nodes.min(axis=0).tolist() if nodes.size else [],
+        "bbox_max": nodes.max(axis=0).tolist() if nodes.size else [],
+        "groups": group_counts,
+        "metadata": {
+            "stencil_size": int(problem.config.stencil_size),
+            "phi": str(problem.config.phi),
+            "eps": float(problem.config.eps),
+            "order": int(problem.config.order),
+        },
+        "coordinates_all": nodes.tolist(),
+        "coordinates_interior": interior_nodes.tolist(),
+    }
+
+
 def _make_qd_potential(cube_path: Path, cfg: CompareConfig) -> PotentialGrid:
     N, d_qd, origin_qd = _read_cube_header(cube_path)
 
@@ -207,6 +234,7 @@ def run(cfg: CompareConfig) -> Path:
     H_rbf = build_hamiltonian_matrix(problem, symmetrize=True)
     H_rbf_op = spla.aslinearoperator(H_rbf)
     interior_idx = problem.interior_idx
+    node_storage = _build_node_storage(problem)
     timings["build_rbf_operator"] = time.perf_counter() - t3
 
     # FFT 和 RBF 生活在完全不同的向量空间：
@@ -315,6 +343,7 @@ def run(cfg: CompareConfig) -> Path:
             "n_interior_rbf": n_interior,
             "qd_cube": str(qd_cube) if qd_cube is not None else None,
         },
+        "rbf_nodes": node_storage,
         "filter": {
             "EL": cfg.el,
             "NC_input": cfg.nc,
