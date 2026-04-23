@@ -32,11 +32,15 @@ from filter_core import (
 from gaussian_potential_builder import GaussianPotentialBuilder, PotentialGrid
 from ho3d_solvers_v2 import build_3d_fft_operator
 from rbf_core import build_hamiltonian_matrix, build_qd_problem
+from rbf_core import RBFConfig, build_problem
 
 
 @dataclass
 class CompareConfig:
+    system: str = "qd"  # qd | ho
     qd_radius: int = 11
+    ho_N: int = 16
+    ho_L: float = 5.0
     el: float = -0.18
     nc: int = 500
     dE: float = 50.0
@@ -57,6 +61,8 @@ class CompareConfig:
     potential_r_cut: float = 7.0
 
     out_dir: str = "filter_compare_results"
+    power_steps: int = 30
+    fft_kinetic_cut: float = 30.0
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -89,6 +95,22 @@ def _rayleigh(H_apply, psi: np.ndarray) -> float:
     return float(np.vdot(psi, hpsi).real / np.vdot(psi, psi).real)
 
 
+def _power_method_energy(H_apply, psi0: np.ndarray, n_steps: int = 30) -> float:
+    psi = np.asarray(psi0, dtype=float).copy()
+    nrm = np.linalg.norm(psi)
+    if nrm == 0:
+        raise ValueError("power method 初始向量范数为 0")
+    psi /= nrm
+
+    for _ in range(n_steps):
+        psi = H_apply(psi)
+        nrm = np.linalg.norm(psi)
+        if nrm == 0:
+            raise RuntimeError("power method 迭代中向量范数变为 0")
+        psi /= nrm
+    return _rayleigh(H_apply, psi)
+
+
 def _make_qd_potential(cube_path: Path, cfg: CompareConfig) -> PotentialGrid:
     N, d_qd, origin_qd = _read_cube_header(cube_path)
 
@@ -116,19 +138,25 @@ def _make_qd_potential(cube_path: Path, cfg: CompareConfig) -> PotentialGrid:
 
 
 def run(cfg: CompareConfig) -> Path:
-    qd_cube = Path(f"QD_Outputs/QD_R{cfg.qd_radius}.cube")
-    if not qd_cube.exists():
-        raise FileNotFoundError(
-            f"未找到 {qd_cube}。请先运行 generate_QD_cubes.py 或指定已存在的 QD 半径。"
-        )
-
     timings: dict[str, float] = {}
-    t0 = time.perf_counter()
-    pot = _make_qd_potential(qd_cube, cfg)
-    timings["build_qd_potential"] = time.perf_counter() - t0
+    qd_cube: Path | None = None
+    if cfg.system == "qd":
+        qd_cube = Path(f"QD_Outputs/QD_R{cfg.qd_radius}.cube")
+        if not qd_cube.exists():
+            raise FileNotFoundError(
+                f"未找到 {qd_cube}。请先运行 generate_QD_cubes.py 或指定已存在的 QD 半径。"
+            )
+        t0 = time.perf_counter()
+        pot = _make_qd_potential(qd_cube, cfg)
+        timings["build_qd_potential"] = time.perf_counter() - t0
+        N = pot.Nx
+    elif cfg.system == "ho":
+        pot = None
+        N = cfg.ho_N
+    else:
+        raise ValueError(f"--system 仅支持 qd 或 ho，收到: {cfg.system!r}")
 
-    N = pot.Nx
-    n_grid = N ** 3
+    n_grid = N**3
 
     dt = (cfg.nc / (cfg.dE * 2.5)) ** 2
     phys = PhysParams(dE=cfg.dE, Vmin=cfg.Vmin, dt=dt)
@@ -148,25 +176,46 @@ def run(cfg: CompareConfig) -> Path:
     timings["build_filter_coeff"] = time.perf_counter() - t1
 
     t2 = time.perf_counter()
-    H_fft, _, _ = build_3d_fft_operator(N=N, potential_grid=pot)
+    H_fft, _, _ = build_3d_fft_operator(
+        N=N, potential_grid=pot, L=cfg.ho_L, kinetic_cut=cfg.fft_kinetic_cut
+    )
     timings["build_fft_operator"] = time.perf_counter() - t2
 
     t3 = time.perf_counter()
-    problem = build_qd_problem(
-        cube_file=str(qd_cube),
-        domain="cube",
-        stencil_size=cfg.rbf_stencil_size,
-        phi=cfg.rbf_phi,
-        eps=cfg.rbf_eps,
-        order=cfg.rbf_order,
-        v_clip_percentile=cfg.rbf_v_clip_percentile,
-    )
+    if cfg.system == "qd":
+        assert qd_cube is not None
+        problem = build_qd_problem(
+            cube_file=str(qd_cube),
+            domain="cube",
+            stencil_size=cfg.rbf_stencil_size,
+            phi=cfg.rbf_phi,
+            eps=cfg.rbf_eps,
+            order=cfg.rbf_order,
+            v_clip_percentile=cfg.rbf_v_clip_percentile,
+        )
+    else:
+        rbf_cfg = RBFConfig(
+            L=cfg.ho_L,
+            grid_N=cfg.ho_N,
+            stencil_size=cfg.rbf_stencil_size,
+            phi=cfg.rbf_phi,
+            eps=cfg.rbf_eps,
+            order=cfg.rbf_order,
+        )
+        problem = build_problem(config=rbf_cfg, build_interpolation=False)
     H_rbf = build_hamiltonian_matrix(problem, symmetrize=True)
     H_rbf_op = spla.aslinearoperator(H_rbf)
     interior_idx = problem.interior_idx
     timings["build_rbf_operator"] = time.perf_counter() - t3
 
     rng = np.random.default_rng(cfg.seed)
+
+    t_power = time.perf_counter()
+    psi_power_full = rng.standard_normal(n_grid)
+    psi_power_int = psi_power_full[interior_idx]
+    Emax_fft = _power_method_energy(H_fft.matvec, psi_power_full, n_steps=cfg.power_steps)
+    Emax_rbf = _power_method_energy(H_rbf_op.matvec, psi_power_int, n_steps=cfg.power_steps)
+    timings["power_method"] = time.perf_counter() - t_power
 
     per_state = []
     fft_basis = []
@@ -257,7 +306,7 @@ def run(cfg: CompareConfig) -> Path:
             "N": N,
             "N_grid": n_grid,
             "n_interior_rbf": int(len(interior_idx)),
-            "qd_cube": str(qd_cube),
+            "qd_cube": str(qd_cube) if qd_cube is not None else None,
         },
         "filter": {
             "EL": cfg.el,
@@ -267,6 +316,13 @@ def run(cfg: CompareConfig) -> Path:
             "Vmin": cfg.Vmin,
             "dt": dt,
             "sigma": float(1.0 / np.sqrt(2.0 * dt)),
+        },
+        "power_method": {
+            "steps": int(cfg.power_steps),
+            "max_energy_fft": float(Emax_fft),
+            "max_energy_rbf": float(Emax_rbf),
+            "abs_diff": float(abs(Emax_fft - Emax_rbf)),
+            "signed_diff": float(Emax_rbf - Emax_fft),
         },
         "rr": {
             "rank_fft": int(rank_fft),
@@ -298,7 +354,10 @@ def run(cfg: CompareConfig) -> Path:
 
 def parse_args() -> CompareConfig:
     p = argparse.ArgumentParser(description="Compare FFT and RBF filter on QD")
+    p.add_argument("--system", type=str, choices=["qd", "ho"], default="qd")
     p.add_argument("--qd-radius", type=int, default=11)
+    p.add_argument("--ho-N", type=int, default=16)
+    p.add_argument("--ho-L", type=float, default=5.0)
     p.add_argument("--el", type=float, default=-0.18)
     p.add_argument("--nc", type=int, default=500)
     p.add_argument("--dE", type=float, default=50.0)
@@ -312,11 +371,16 @@ def parse_args() -> CompareConfig:
     p.add_argument("--rbf-eps", type=float, default=0.5)
     p.add_argument("--rbf-order", type=int, default=2)
     p.add_argument("--rbf-v-clip-percentile", type=float, default=99.9)
+    p.add_argument("--power-steps", type=int, default=30)
+    p.add_argument("--fft-kinetic-cut", type=float, default=30.0)
     p.add_argument("--out-dir", type=str, default="filter_compare_results")
 
     a = p.parse_args()
     return CompareConfig(
+        system=a.system,
         qd_radius=a.qd_radius,
+        ho_N=a.ho_N,
+        ho_L=a.ho_L,
         el=a.el,
         nc=a.nc,
         dE=a.dE,
@@ -330,6 +394,8 @@ def parse_args() -> CompareConfig:
         rbf_eps=a.rbf_eps,
         rbf_order=a.rbf_order,
         rbf_v_clip_percentile=a.rbf_v_clip_percentile,
+        power_steps=a.power_steps,
+        fft_kinetic_cut=a.fft_kinetic_cut,
         out_dir=a.out_dir,
     )
 
