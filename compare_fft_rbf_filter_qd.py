@@ -50,6 +50,7 @@ class CompareConfig:
     max_energies: int = 30
     seed: int = 42
 
+    rbf_spacing: float = 0.5
     rbf_stencil_size: int = 80
     rbf_phi: str = "phs3"
     rbf_eps: float = 0.5
@@ -195,8 +196,8 @@ def run(cfg: CompareConfig) -> Path:
         )
     else:
         rbf_cfg = RBFConfig(
+            spacing=cfg.rbf_spacing,
             L=cfg.ho_L,
-            grid_N=cfg.ho_N,
             stencil_size=cfg.rbf_stencil_size,
             phi=cfg.rbf_phi,
             eps=cfg.rbf_eps,
@@ -208,13 +209,19 @@ def run(cfg: CompareConfig) -> Path:
     interior_idx = problem.interior_idx
     timings["build_rbf_operator"] = time.perf_counter() - t3
 
-    rng = np.random.default_rng(cfg.seed)
+    # FFT 和 RBF 生活在完全不同的向量空间：
+    #   FFT: 均匀网格，维度 n_grid = N³
+    #   RBF: 散点节点，维度 n_interior（与 n_grid 无关）
+    # 必须为两者各自独立生成随机向量，不能用 psi_full[interior_idx] 互相索引。
+    n_interior = int(len(interior_idx))
+    rng_fft = np.random.default_rng(cfg.seed)
+    rng_rbf = np.random.default_rng(cfg.seed + 1)
 
     t_power = time.perf_counter()
-    psi_power_full = rng.standard_normal(n_grid)
-    psi_power_int = psi_power_full[interior_idx]
-    Emax_fft = _power_method_energy(H_fft.matvec, psi_power_full, n_steps=cfg.power_steps)
-    Emax_rbf = _power_method_energy(H_rbf_op.matvec, psi_power_int, n_steps=cfg.power_steps)
+    psi_power_fft = rng_fft.standard_normal(n_grid)
+    psi_power_rbf = rng_rbf.standard_normal(n_interior)
+    Emax_fft = _power_method_energy(H_fft.matvec, psi_power_fft, n_steps=cfg.power_steps)
+    Emax_rbf = _power_method_energy(H_rbf_op.matvec, psi_power_rbf, n_steps=cfg.power_steps)
     timings["power_method"] = time.perf_counter() - t_power
 
     per_state = []
@@ -223,9 +230,9 @@ def run(cfg: CompareConfig) -> Path:
 
     t4 = time.perf_counter()
     for i in range(cfg.n_random):
-        psi_full = rng.standard_normal(n_grid)
+        psi_full = rng_fft.standard_normal(n_grid)
         psi_full /= np.linalg.norm(psi_full)
-        psi_int = psi_full[interior_idx]
+        psi_int = rng_rbf.standard_normal(n_interior)
         psi_int /= np.linalg.norm(psi_int)
 
         fft_filt = apply_filter_H_all_op(H_fft.matvec, psi_full, samp, an, phys)[0]
@@ -303,9 +310,9 @@ def run(cfg: CompareConfig) -> Path:
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "config": asdict(cfg),
         "grid": {
-            "N": N,
-            "N_grid": n_grid,
-            "n_interior_rbf": int(len(interior_idx)),
+            "N_fft": N,
+            "N_grid_fft": n_grid,
+            "n_interior_rbf": n_interior,
             "qd_cube": str(qd_cube) if qd_cube is not None else None,
         },
         "filter": {
@@ -366,6 +373,7 @@ def parse_args() -> CompareConfig:
     p.add_argument("--svd-tol", type=float, default=1e-3)
     p.add_argument("--max-energies", type=int, default=30)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--rbf-spacing", type=float, default=0.5)
     p.add_argument("--rbf-stencil-size", type=int, default=80)
     p.add_argument("--rbf-phi", type=str, default="phs3")
     p.add_argument("--rbf-eps", type=float, default=0.5)
@@ -389,6 +397,7 @@ def parse_args() -> CompareConfig:
         svd_tol=a.svd_tol,
         max_energies=a.max_energies,
         seed=a.seed,
+        rbf_spacing=a.rbf_spacing,
         rbf_stencil_size=a.rbf_stencil_size,
         rbf_phi=a.rbf_phi,
         rbf_eps=a.rbf_eps,
