@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
+from datetime import datetime
 from pathlib import Path
 
 from rbf_core import (RBFConfig, build_problem, build_qd_problem,
+                       build_hamiltonian_matrix,
                        iterate_hamiltonian, relative_laplacian_error,
                        solve_lowest_eigenvalues, sweep_rbf_kernels,
                        sweep_stencil_eps,
@@ -19,7 +22,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stencil-size", type=int, default=80, help="Stencil size n in weight_matrix.")
     parser.add_argument("--phi", type=str, default="ga", help="RBF basis name, e.g. ga (Gaussian), phs3, phs5.")
     parser.add_argument("--eps", type=float, default=0.5, help="RBF epsilon parameter.")
-    parser.add_argument("--order", type=int, default=2, help="Polynomial augmentation order.")
+    parser.add_argument(
+        "--order", type=int, nargs="+", default=[2],
+        help="Polynomial augmentation order(s). "
+             "Use one value for normal runs (e.g. --order 2), "
+             "or multiple values with --sweep-order (e.g. --order 0 1 2 3).",
+    )
     parser.add_argument("--grid-N", type=int, default=60, help="Regular grid size for interpolation matrices.")
     parser.add_argument("--n-max", type=int, default=10, help="Number of H^n iterations.")
     parser.add_argument(
@@ -95,6 +103,18 @@ def parse_args() -> argparse.Namespace:
         help="Output directory for 2D sweep JSON and PNG.",
     )
 
+    # ── Order sweep mode ────────────────────────────────────────────────────
+    so = parser.add_argument_group("Order sweep (activated by --sweep-order)")
+    so.add_argument(
+        "--sweep-order", action="store_true",
+        help="Sweep multiple polynomial augmentation orders with fixed "
+             "spacing/phi/eps/stencil_size.",
+    )
+    so.add_argument(
+        "--sweep-order-output-dir", type=str, default=".",
+        help="Output directory for order-sweep JSON.",
+    )
+
     # ── QD mode ──────────────────────────────────────────────────────────────
     qd = parser.add_argument_group("QD mode (activated when --qd-cube is given)")
     qd.add_argument(
@@ -119,8 +139,207 @@ def parse_args() -> argparse.Namespace:
         "--csv", type=str, default="",
         help="Optional CSV output path for iteration summary.",
     )
+    parser.add_argument(
+        "--save-artifacts", action="store_true",
+        help="Save generated nodes and sparse Hamiltonian matrix to files.",
+    )
+    parser.add_argument(
+        "--artifacts-dir", type=str, default="rbf_artifacts",
+        help="Output directory for saved nodes/matrix/metadata files.",
+    )
+    parser.add_argument(
+        "--artifact-tag", type=str, default="",
+        help="Optional extra tag appended to artifact filenames.",
+    )
     return parser.parse_args()
 
+
+def _single_order(args) -> int:
+    """Return the first order value for modes that require exactly one order."""
+    if not args.order:
+        return 2
+    return int(args.order[0])
+
+
+def _save_problem_artifacts(problem, *, mode: str, order: int, args) -> None:
+    """Save nodes + sparse Hamiltonian + metadata to disk."""
+    import numpy as np
+    import scipy.sparse as sp
+
+    out_dir = Path(args.artifacts_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    extra = f"_{args.artifact_tag}" if args.artifact_tag else ""
+    stem = f"{mode}_order{order}{extra}_{ts}"
+
+    nodes_path = out_dir / f"{stem}_nodes.npy"
+    interior_path = out_dir / f"{stem}_interior_idx.npy"
+    matrix_path = out_dir / f"{stem}_H_sparse.npz"
+    meta_path = out_dir / f"{stem}_meta.json"
+
+    np.save(nodes_path, problem.nodes)
+    np.save(interior_path, problem.interior_idx)
+
+    H = build_hamiltonian_matrix(problem, symmetrize=args.symmetrize).tocsr()
+    sp.save_npz(matrix_path, H)
+
+    n_rows, n_cols = H.shape
+    n_boundary = int(len(problem.nodes) - len(problem.interior_idx))
+    density = float(H.nnz / (n_rows * n_cols)) if n_rows and n_cols else 0.0
+
+    meta = {
+        "description": "RBF-FD generated nodes and sparse Hamiltonian artifacts",
+        "saved_at": datetime.now().isoformat(),
+        "mode": mode,
+        "order": int(order),
+        "symmetrize": bool(args.symmetrize),
+        "phi": args.phi,
+        "eps": float(args.eps),
+        "stencil_size": int(args.stencil_size),
+        "spacing": float(args.spacing),
+        "L": float(args.L),
+        "n_nodes_total": int(problem.nodes.shape[0]),
+        "n_interior_nodes": int(problem.interior_idx.shape[0]),
+        "n_boundary_nodes": n_boundary,
+        "matrix_shape": [int(n_rows), int(n_cols)],
+        "matrix_nnz": int(H.nnz),
+        "matrix_density": density,
+        "files": {
+            "nodes_npy": str(nodes_path),
+            "interior_idx_npy": str(interior_path),
+            "hamiltonian_npz": str(matrix_path),
+        },
+    }
+    if getattr(args, "qd_cube", ""):
+        meta["qd"] = {
+            "cube_file": args.qd_cube,
+            "domain": args.qd_domain,
+            "R": float(args.qd_R),
+            "sphere_subdivide": int(args.qd_sphere_subdivide),
+        }
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    print("-" * 72)
+    print(f"Saved artifacts:")
+    print(f"  nodes      → {nodes_path}")
+    print(f"  interior   → {interior_path}")
+    print(f"  H sparse   → {matrix_path}")
+    print(f"  metadata   → {meta_path}")
+
+
+def _ho_exact_levels(n: int) -> list[float]:
+    levels: list[float] = []
+    for s in range(100):
+        e = s + 1.5
+        deg = (s + 1) * (s + 2) // 2
+        levels.extend([e] * deg)
+        if len(levels) >= n:
+            break
+    return levels[:n]
+
+
+def _run_sweep_order(args) -> None:
+    import datetime
+    import json
+    import numpy as np
+    from pathlib import Path
+
+    orders = sorted(set(int(o) for o in args.order))
+    print("=" * 72)
+    print("Order sweep — 3D harmonic oscillator")
+    print(f"  orders={orders}")
+    print(f"  spacing={args.spacing}  L={args.L}  stencil_size={args.stencil_size}")
+    print(f"  phi={args.phi}  eps={args.eps}  n_eigs={args.n_eigs}"
+          f"  device={args.device}  symmetrize={args.symmetrize}")
+    print("-" * 72)
+
+    exact = _ho_exact_levels(args.n_eigs)
+    results = []
+    for order in orders:
+        print(f"[order={order}] building problem...")
+        config = RBFConfig(
+            spacing=args.spacing,
+            L=args.L,
+            stencil_size=args.stencil_size,
+            phi=args.phi,
+            eps=args.eps,
+            order=order,
+            grid_N=args.grid_N,
+        )
+        problem = build_problem(config=config, build_interpolation=not args.no_interp)
+        if args.save_artifacts:
+            _save_problem_artifacts(problem, mode="ho_sweep_order", order=order, args=args)
+        err = relative_laplacian_error(problem)
+
+        row = {
+            "order": order,
+            "n_nodes_total": int(problem.nodes.shape[0]),
+            "n_interior": int(problem.interior_idx.shape[0]),
+            "laplacian_error": err,
+            "status": "ok",
+        }
+
+        if not args.no_eigs:
+            try:
+                vals, _ = solve_lowest_eigenvalues(
+                    problem, n_eigs=args.n_eigs, device=args.device,
+                    symmetrize=args.symmetrize,
+                )
+                vals_real = [float(v.real) for v in vals]
+                rel_errs = [
+                    abs(vals_real[i] - exact[i]) / abs(exact[i])
+                    if exact[i] != 0 else float("nan")
+                    for i in range(min(len(vals_real), len(exact)))
+                ]
+                row.update({
+                    "eigenvalues": vals_real,
+                    "mean_rel_err_eigs": float(np.mean(rel_errs)) if rel_errs else None,
+                    "max_rel_err_eigs": float(np.max(rel_errs)) if rel_errs else None,
+                })
+                print(f"  mean_rel_err_eigs={row['mean_rel_err_eigs']:.4e}")
+            except Exception as e:
+                row["status"] = "failed"
+                row["error"] = str(e)
+                print(f"  FAILED: {e}")
+        results.append(row)
+
+    ok = [r for r in results if r["status"] == "ok" and "mean_rel_err_eigs" in r]
+    if ok:
+        ok_sorted = sorted(ok, key=lambda r: r["mean_rel_err_eigs"])
+        best_order = ok_sorted[0]["order"]
+        print("-" * 72)
+        print(f"Best order by mean_rel_err_eigs: {best_order}")
+    else:
+        best_order = None
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(args.sweep_order_output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = {
+        "description": "Polynomial-order sweep on 3D harmonic oscillator",
+        "datetime": datetime.datetime.now().isoformat(),
+        "config": {
+            "orders": orders,
+            "spacing": args.spacing,
+            "L": args.L,
+            "stencil_size": args.stencil_size,
+            "phi": args.phi,
+            "eps": args.eps,
+            "grid_N": args.grid_N,
+            "n_eigs": args.n_eigs,
+            "device": args.device,
+            "symmetrize": args.symmetrize,
+            "no_interp": args.no_interp,
+            "no_eigs": args.no_eigs,
+        },
+        "best_order": best_order,
+        "results": results,
+    }
+    json_path = out_dir / f"sweep_order_{ts}.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False, default=float)
+    print(f"JSON → {json_path}")
 
 
 def _run_sweep_kernels(args) -> None:
@@ -136,7 +355,8 @@ def _run_sweep_kernels(args) -> None:
     print("=" * 72)
     print("Kernel sweep — 3D harmonic oscillator (nodes fixed)")
     print(f"  spacing={args.spacing}  L={args.L}  stencil_size={args.stencil_size}")
-    print(f"  eps={args.eps}  order={args.order}  n_eigs={args.n_eigs}"
+    order = _single_order(args)
+    print(f"  eps={args.eps}  order={order}  n_eigs={args.n_eigs}"
           f"  device={args.device}  symmetrize={args.symmetrize}")
     print("  Generating nodes once (fixed for all kernels)...")
     nodes, groups = generate_nodes(spacing=args.spacing, L=args.L)
@@ -148,7 +368,7 @@ def _run_sweep_kernels(args) -> None:
         nodes=nodes, groups=groups,
         stencil_size=args.stencil_size,
         eps=args.eps,
-        order=args.order,
+        order=order,
         n_eigs=args.n_eigs,
         device=args.device,
         symmetrize=args.symmetrize,
@@ -179,7 +399,7 @@ def _run_sweep_kernels(args) -> None:
             "n_interior":    int(interior_idx.shape[0]),
             "stencil_size":  args.stencil_size,
             "eps":           args.eps,
-            "order":         args.order,
+            "order":         order,
             "n_eigs":        args.n_eigs,
             "device":        args.device,
             "symmetrize":    args.symmetrize,
@@ -223,7 +443,7 @@ def _run_sweep_kernels(args) -> None:
     ax.set_yscale("log")
     ax.set_ylabel("Mean relative spectral error")
     ax.set_title(f"RBF kernel sweep — 3D HO "
-                 f"(spacing={args.spacing}, n={args.stencil_size}, eps={args.eps}, order={args.order})")
+                 f"(spacing={args.spacing}, n={args.stencil_size}, eps={args.eps}, order={order})")
     ax.grid(True, axis="y", alpha=0.3)
     legend_elems = [Patch(facecolor=c, label=g) for g, c in group_colors.items()]
     ax.legend(handles=legend_elems, fontsize=8, loc="upper left")
@@ -262,7 +482,8 @@ def _run_sweep_stencil_eps(args) -> None:
     phi           = args.sweep2_phi
 
     print("=" * 72)
-    print(f"2D sweep: stencil_size × eps   phi={phi}  order={args.order}")
+    order = _single_order(args)
+    print(f"2D sweep: stencil_size × eps   phi={phi}  order={order}")
     print(f"  stencil_sizes = {stencil_sizes}")
     print(f"  eps_values    = {[round(e, 2) for e in eps_values]}")
     print(f"  spacing={args.spacing}  L={args.L}  n_eigs={args.n_eigs}"
@@ -278,7 +499,7 @@ def _run_sweep_stencil_eps(args) -> None:
         phi=phi,
         stencil_sizes=stencil_sizes,
         eps_values=eps_values,
-        order=args.order,
+        order=order,
         n_eigs=args.n_eigs,
         device=args.device,
         symmetrize=args.symmetrize,
@@ -320,7 +541,7 @@ def _run_sweep_stencil_eps(args) -> None:
             "n_nodes_total":  int(nodes.shape[0]),
             "n_interior":     int(interior_idx.shape[0]),
             "phi":            phi,
-            "order":          args.order,
+            "order":          order,
             "n_eigs":         args.n_eigs,
             "device":         args.device,
             "symmetrize":     args.symmetrize,
@@ -373,7 +594,7 @@ def _run_sweep_stencil_eps(args) -> None:
     ax.set_yticks(n_st_arr)
     ax.set_yticklabels(n_st_arr)
     ax.set_title(f"3D HO spectral error  phi={phi}  spacing={args.spacing}"
-                 f"  order={args.order}")
+                 f"  order={order}")
     # mark best
     if ok:
         ax.scatter([best["eps"]], [best["stencil_size"]],
@@ -449,6 +670,11 @@ def _print_eigs(vals: "np.ndarray", n_eigs: int, is_ho: bool) -> None:
 def main() -> None:
     args = parse_args()
 
+    # ── Order sweep mode ────────────────────────────────────────────────────
+    if args.sweep_order:
+        _run_sweep_order(args)
+        return
+
     # ── Kernel sweep mode ────────────────────────────────────────────────────
     if args.sweep_kernels:
         _run_sweep_kernels(args)
@@ -461,13 +687,14 @@ def main() -> None:
 
     # ── QD mode ──────────────────────────────────────────────────────────────
     if args.qd_cube:
+        order = _single_order(args)
         print("=" * 72)
         print(f"QD mode  cube={args.qd_cube}  domain={args.qd_domain}")
         if args.qd_domain == "sphere":
             print(f"  sphere R={args.qd_R} Bohr  spacing={args.spacing}"
                   f"  sphere_subdivide={args.qd_sphere_subdivide}")
         print(f"  stencil_size={args.stencil_size}  phi={args.phi}"
-              f"  eps={args.eps}  order={args.order}")
+              f"  eps={args.eps}  order={order}")
         print("Building problem (may take a while for large grids)...")
         problem = build_qd_problem(
             cube_file=args.qd_cube,
@@ -477,12 +704,14 @@ def main() -> None:
             stencil_size=args.stencil_size,
             phi=args.phi,
             eps=args.eps,
-            order=args.order,
+            order=order,
             sphere_subdivide=args.qd_sphere_subdivide,
         )
         print(f"nodes total    : {problem.nodes.shape[0]}")
         print(f"interior nodes : {problem.interior_idx.shape[0]}")
         print(f"V range        : [{problem.V_nodes.min():.4f}, {problem.V_nodes.max():.4f}] Ha")
+        if args.save_artifacts:
+            _save_problem_artifacts(problem, mode="qd", order=order, args=args)
         if not args.no_eigs:
             print("-" * 72)
             print(f"Sparse eigenvalue solve  n_eigs={args.n_eigs}  device={args.device}"
@@ -500,11 +729,13 @@ def main() -> None:
         stencil_size=args.stencil_size,
         phi=args.phi,
         eps=args.eps,
-        order=args.order,
+        order=_single_order(args),
         grid_N=args.grid_N,
     )
 
     problem = build_problem(config=config, build_interpolation=not args.no_interp)
+    if args.save_artifacts:
+        _save_problem_artifacts(problem, mode="ho", order=config.order, args=args)
 
     err = relative_laplacian_error(problem)
     print("=" * 72)

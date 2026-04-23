@@ -163,15 +163,34 @@ def svd_rayleigh_ritz_op(
     r        : 有效秩
     """
     # 列归一化，去除零列 / inf 列
+    if basis_mat.ndim != 2:
+        raise ValueError(f"basis_mat must be 2-D, got shape={basis_mat.shape}")
+
     norms = np.linalg.norm(basis_mat, axis=0)
     mask = np.isfinite(norms) & (norms > 0)
+    n_grid = basis_mat.shape[0]
+    if not np.any(mask):
+        # 所有列都无效（零向量/NaN/Inf），返回空结果而不是在后续索引崩溃
+        empty_Ur = np.zeros((n_grid, 0), dtype=np.result_type(basis_mat.dtype, np.float64))
+        empty_evals = np.array([], dtype=np.float64)
+        return empty_evals, empty_Ur, 0
+
     B = basis_mat[:, mask] / norms[None, mask]
 
     # QR + SVD → 正交基
     Q, R = np.linalg.qr(B, mode="reduced")
     U1, sigma, _ = np.linalg.svd(R, full_matrices=False)
-    r = max(1, int(np.sum(sigma > svd_tol)))
+    if sigma.size == 0:
+        empty_Ur = np.zeros((n_grid, 0), dtype=np.result_type(B.dtype, np.float64))
+        empty_evals = np.array([], dtype=np.float64)
+        return empty_evals, empty_Ur, 0
+
+    r_eff = int(np.sum(sigma > svd_tol))
+    r = max(1, r_eff)
     Ur = (Q @ U1)[:, :r]
+    if Ur.shape[1] == 0:
+        empty_evals = np.array([], dtype=np.float64)
+        return empty_evals, Ur, 0
 
     # H̃[i,j] = ⟨ur_i|H|ur_j⟩
     H_tilde = np.zeros((r, r), dtype=np.result_type(Ur.dtype, np.float64))
