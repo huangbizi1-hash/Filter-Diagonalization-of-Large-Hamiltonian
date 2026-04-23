@@ -51,12 +51,6 @@ class CompareConfig:
     rbf_eps: float = 0.5
     rbf_order: int = 2
     rbf_v_clip_percentile: float = 99.9
-    rbf_domain: str = "cube"  # cube | sphere | atoms
-    rbf_spacing: float = 0.8
-    rbf_R: float = 20.0
-    rbf_sphere_subdivide: int = 3
-    rbf_augment: str = "poisson_disc"  # atoms domain only: poisson_disc | none
-    rbf_exclude_radius: float = 0.0
 
     potential_cube_file: str = "localPot.cube"
     potential_params_file: str = "gaussian_fit_params.json"
@@ -160,16 +154,11 @@ def run(cfg: CompareConfig) -> Path:
     t3 = time.perf_counter()
     problem = build_qd_problem(
         cube_file=str(qd_cube),
-        domain=cfg.rbf_domain,
-        spacing=cfg.rbf_spacing,
-        R=cfg.rbf_R,
+        domain="cube",
         stencil_size=cfg.rbf_stencil_size,
         phi=cfg.rbf_phi,
         eps=cfg.rbf_eps,
         order=cfg.rbf_order,
-        sphere_subdivide=cfg.rbf_sphere_subdivide,
-        augment=cfg.rbf_augment,
-        exclude_radius=cfg.rbf_exclude_radius,
         v_clip_percentile=cfg.rbf_v_clip_percentile,
     )
     H_rbf = build_hamiltonian_matrix(problem, symmetrize=True)
@@ -184,18 +173,11 @@ def run(cfg: CompareConfig) -> Path:
     rbf_basis = []
 
     t4 = time.perf_counter()
-    same_state_mode = (cfg.rbf_domain == "cube")
     for i in range(cfg.n_random):
         psi_full = rng.standard_normal(n_grid)
         psi_full /= np.linalg.norm(psi_full)
-        if same_state_mode:
-            psi_int = psi_full[interior_idx]
-            psi_int /= np.linalg.norm(psi_int)
-        else:
-            # 非 cube 节点域（sphere/atoms）与 FFT 网格自由度不同，
-            # 无法做一一映射，因此用同一 RNG 下独立抽样保证可复现。
-            psi_int = rng.standard_normal(len(interior_idx))
-            psi_int /= np.linalg.norm(psi_int)
+        psi_int = psi_full[interior_idx]
+        psi_int /= np.linalg.norm(psi_int)
 
         fft_filt = apply_filter_H_all_op(H_fft.matvec, psi_full, samp, an, phys)[0]
         rbf_filt = apply_filter_H_all_op(H_rbf_op.matvec, psi_int, samp, an, phys)[0]
@@ -219,7 +201,6 @@ def run(cfg: CompareConfig) -> Path:
                 "energy_rbf": E_rbf,
                 "abs_diff": abs(E_fft - E_rbf),
                 "signed_diff": E_rbf - E_fft,
-                "same_state_mode": same_state_mode,
             }
         )
 
@@ -277,7 +258,6 @@ def run(cfg: CompareConfig) -> Path:
             "N_grid": n_grid,
             "n_interior_rbf": int(len(interior_idx)),
             "qd_cube": str(qd_cube),
-            "same_state_mode": same_state_mode,
         },
         "filter": {
             "EL": cfg.el,
@@ -332,14 +312,6 @@ def parse_args() -> CompareConfig:
     p.add_argument("--rbf-eps", type=float, default=0.5)
     p.add_argument("--rbf-order", type=int, default=2)
     p.add_argument("--rbf-v-clip-percentile", type=float, default=99.9)
-    p.add_argument("--rbf-domain", type=str, default="cube",
-                   choices=["cube", "sphere", "atoms"])
-    p.add_argument("--rbf-spacing", type=float, default=0.8)
-    p.add_argument("--rbf-R", type=float, default=20.0)
-    p.add_argument("--rbf-sphere-subdivide", type=int, default=3)
-    p.add_argument("--rbf-augment", type=str, default="poisson_disc",
-                   choices=["poisson_disc", "none"])
-    p.add_argument("--rbf-exclude-radius", type=float, default=0.0)
     p.add_argument("--out-dir", type=str, default="filter_compare_results")
 
     a = p.parse_args()
@@ -358,12 +330,6 @@ def parse_args() -> CompareConfig:
         rbf_eps=a.rbf_eps,
         rbf_order=a.rbf_order,
         rbf_v_clip_percentile=a.rbf_v_clip_percentile,
-        rbf_domain=a.rbf_domain,
-        rbf_spacing=a.rbf_spacing,
-        rbf_R=a.rbf_R,
-        rbf_sphere_subdivide=a.rbf_sphere_subdivide,
-        rbf_augment=a.rbf_augment,
-        rbf_exclude_radius=a.rbf_exclude_radius,
         out_dir=a.out_dir,
     )
 
