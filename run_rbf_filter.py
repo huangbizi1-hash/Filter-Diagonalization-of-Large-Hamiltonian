@@ -94,9 +94,16 @@ CONFIG: Dict[str, Any] = {
     "out_root": "rbf_results",
     "tag": "rbf_filter_run",
 
-    # ---------- 势能来源（当前只支持 cube 文件） ----------
+    # ---------- 势能来源 ----------
+    # v_source:
+    #   'gaussian_direct' — 直接对节点调用高斯展开公式（与 cube 网格相同），
+    #                       无插值误差；需要 params_file。
+    #   'grid_interp'     — 从 cube 网格线性插值到节点（有插值误差）。
     "potential": {
         "cube_file":         "localPot.cube",
+        "params_file":       "gaussian_fit_params.json",
+        "r_cut":             7.0,
+        "v_source":          "gaussian_direct",
         "v_clip_percentile": 99.9,
     },
 
@@ -303,6 +310,11 @@ def run(cfg: Dict[str, Any]) -> None:
         conv_cell_parity               = cfg.get("conv_cell_parity", True),
         conv_cell_boundary_margin_frac = cfg.get("conv_cell_boundary_margin_frac", 0.5),
         conv_cell_use_rbf_poisson      = cfg.get("conv_cell_use_rbf_poisson", True),
+        v_source                       = pot.get("v_source", "grid_interp"),
+        gaussian_params_file           = (pot.get("params_file")
+                                           if pot.get("v_source") == "gaussian_direct"
+                                           else None),
+        r_cut                          = pot.get("r_cut", 7.0),
     )
     n_interior = len(problem.interior_idx)
     n_total    = len(problem.nodes)

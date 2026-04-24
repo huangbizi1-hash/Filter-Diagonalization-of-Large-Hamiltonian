@@ -1075,6 +1075,16 @@ def build_qd_problem(
     conv_cell_parity: bool = True,
     conv_cell_boundary_margin_frac: float = 0.06,
     conv_cell_use_rbf_poisson: bool = True,
+    # ── V_nodes source ──
+    # "grid_interp"     : linear-interpolate V from the cube-file grid to the
+    #                     node positions (legacy, has interp error)
+    # "gaussian_direct" : evaluate the Gaussian-fit analytic potential
+    #                     Σ_atom Σ_g A·exp(-α|r-r_atom|²) directly at nodes,
+    #                     using the same formula as the cube-grid builder.
+    #                     No V-interpolation error.  Requires gaussian_params_file.
+    v_source: str = "grid_interp",
+    gaussian_params_file: Optional[str] = None,
+    r_cut: float = 7.0,
 ) -> RBFProblem:
     """
     Build RBFProblem with QD potential from a Gaussian cube file.
@@ -1116,6 +1126,10 @@ def build_qd_problem(
     augment          : 'poisson_disc' | 'none' (atoms domain only)
     exclude_radius   : Bohr; Poisson candidates closer to any atom are dropped
     v_clip_percentile: clip V at this percentile to tame cube tail artefacts
+    v_source         : 'grid_interp'     — linear interp of cube V to nodes (legacy)
+                       'gaussian_direct' — direct analytic sum at nodes (no interp)
+    gaussian_params_file : path to Gaussian-fit JSON; required for gaussian_direct
+    r_cut            : Gaussian cutoff radius (Bohr) for gaussian_direct
     conv_cell_a              : lattice constant (Bohr, conv_cell only, default InAs 11.4523)
     conv_cell_d_min_frac     : d_min in fractional coords for the greedy filter (conv_cell)
     conv_cell_n_random       : target # of Poisson-like random points per cell
@@ -1196,8 +1210,28 @@ def build_qd_problem(
             "domain must be 'cube', 'sphere', 'atoms', or 'conv_cell', "
             f"got {domain!r}")
 
-    # QD potential on interior nodes (clamp tail artefacts near nuclei)
-    V_nodes = interp_fn(nodes[interior_idx]).astype(np.float64)
+    # ── QD potential on interior nodes ──────────────────────────────────────
+    if v_source == "gaussian_direct":
+        if gaussian_params_file is None:
+            raise ValueError(
+                "v_source='gaussian_direct' requires gaussian_params_file "
+                "(path to the Gaussian-fit JSON, e.g. gaussian_fit_params.json)")
+        from gaussian_potential_builder import GaussianPotentialBuilder
+        builder = GaussianPotentialBuilder(
+            cube_file=cube_file,
+            params_file=gaussian_params_file,
+            r_cut=r_cut,
+        )
+        V_nodes = builder.evaluate_at_points(nodes[interior_idx])
+    elif v_source == "grid_interp":
+        V_nodes = interp_fn(nodes[interior_idx]).astype(np.float64)
+    else:
+        raise ValueError(
+            "v_source must be 'grid_interp' or 'gaussian_direct', "
+            f"got {v_source!r}")
+
+    # Clamp tail artefacts (mostly relevant for grid_interp; harmless for
+    # gaussian_direct since the Gaussian fit is analytic and smooth)
     v_cap = float(np.percentile(V_nodes, v_clip_percentile))
     V_nodes = np.clip(V_nodes, None, v_cap)
 

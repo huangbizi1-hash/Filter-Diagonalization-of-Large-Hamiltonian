@@ -109,6 +109,11 @@ class CompareConfig:
     potential_cube_file: str = "localPot.cube"
     potential_params_file: str = "gaussian_fit_params.json"
     potential_r_cut: float = 7.0
+    # RBF 节点上 V 的来源：
+    #   'gaussian_direct' — 直接对节点调用 GaussianPotentialBuilder.evaluate_at_points
+    #                       （与 cube 网格 V 共用同一套高斯展开公式，零插值误差）
+    #   'grid_interp'     — 从 cube 网格线性插值到节点（老路径，有插值误差）
+    rbf_v_source: str = "gaussian_direct"
 
     out_dir: str = "filter_compare_results"
     power_steps: int = 30
@@ -252,11 +257,10 @@ def _build_problem_from_nodes_json(path: Path, cfg: "CompareConfig",
 
     Node positions and group assignments are loaded from the file as-is.
     The RBF-FD Laplacian and V_nodes are recomputed using the **current** CLI
-    parameters (stencil_size / phi / eps / order / v_clip_percentile), so you
-    can reuse the same node layout while sweeping RBF kernels.
+    parameters (stencil_size / phi / eps / order / v_clip_percentile / v_source),
+    so you can reuse the same node layout while sweeping RBF kernels.
     """
     from rbf.pde.fd import weight_matrix
-    from scipy.interpolate import RegularGridInterpolator
 
     with path.open("r", encoding="utf-8") as f:
         saved = json.load(f)
@@ -268,13 +272,23 @@ def _build_problem_from_nodes_json(path: Path, cfg: "CompareConfig",
             f"saved nodes JSON {path} missing 'interior' group")
     interior_idx = groups["interior"]
 
-    # V_nodes: interpolate the QD potential at the saved interior positions
-    x_cube, y_cube, z_cube, pot_3d = read_cube_file(str(cube_path))
-    interp = RegularGridInterpolator(
-        (x_cube, y_cube, z_cube), pot_3d,
-        method="linear", bounds_error=False, fill_value=0.0,
-    )
-    V_nodes = interp(nodes[interior_idx]).astype(np.float64)
+    # V_nodes: honour cfg.rbf_v_source (same semantics as build_qd_problem)
+    if cfg.rbf_v_source == "gaussian_direct":
+        from gaussian_potential_builder import GaussianPotentialBuilder
+        builder = GaussianPotentialBuilder(
+            cube_file=str(cube_path),
+            params_file=cfg.potential_params_file,
+            r_cut=cfg.potential_r_cut,
+        )
+        V_nodes = builder.evaluate_at_points(nodes[interior_idx])
+    else:
+        from scipy.interpolate import RegularGridInterpolator
+        x_cube, y_cube, z_cube, pot_3d = read_cube_file(str(cube_path))
+        interp = RegularGridInterpolator(
+            (x_cube, y_cube, z_cube), pot_3d,
+            method="linear", bounds_error=False, fill_value=0.0,
+        )
+        V_nodes = interp(nodes[interior_idx]).astype(np.float64)
     v_cap = float(np.percentile(V_nodes, cfg.rbf_v_clip_percentile))
     V_nodes = np.clip(V_nodes, None, v_cap)
 
@@ -439,6 +453,11 @@ def run(cfg: CompareConfig) -> Path:
             conv_cell_parity=cfg.conv_cell_parity,
             conv_cell_boundary_margin_frac=cfg.conv_cell_boundary_margin_frac,
             conv_cell_use_rbf_poisson=cfg.conv_cell_use_rbf_poisson,
+            v_source=cfg.rbf_v_source,
+            gaussian_params_file=(cfg.potential_params_file
+                                  if cfg.rbf_v_source == "gaussian_direct"
+                                  else None),
+            r_cut=cfg.potential_r_cut,
         )
     else:
         rbf_cfg = RBFConfig(
@@ -757,6 +776,11 @@ def parse_args() -> CompareConfig:
     p.add_argument("--rbf-eps", type=float, default=0.5)
     p.add_argument("--rbf-order", type=int, default=2)
     p.add_argument("--rbf-v-clip-percentile", type=float, default=99.9)
+    p.add_argument("--rbf-v-source", type=str,
+                   choices=["gaussian_direct", "grid_interp"],
+                   default="gaussian_direct",
+                   help="RBF 节点上 V 的来源：gaussian_direct=直接用高斯展开求值（默认，"
+                        "零插值误差），grid_interp=从 cube 网格线性插值（老行为）")
 
     # QD 节点放置方式
     p.add_argument(
@@ -839,6 +863,7 @@ def parse_args() -> CompareConfig:
         rbf_eps=a.rbf_eps,
         rbf_order=a.rbf_order,
         rbf_v_clip_percentile=a.rbf_v_clip_percentile,
+        rbf_v_source=a.rbf_v_source,
         rbf_node_method=a.rbf_node_method,
         rbf_R=a.rbf_R,
         rbf_sphere_subdivide=a.rbf_sphere_subdivide,
