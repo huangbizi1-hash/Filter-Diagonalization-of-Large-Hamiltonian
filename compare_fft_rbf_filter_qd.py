@@ -88,6 +88,11 @@ class CompareConfig:
     conv_cell_domain_shape: str = "cube"    # conv_cell 体域形状：cube | sphere
     conv_cell_sphere_radius: float = 0.0    # >0 时使用该球半径(Bohr)；<=0 自动取 bbox 内切球
     conv_cell_sphere_subdivide: int = 3     # sphere 边界 icosphere 细分级数
+    conv_cell_adaptive_random: bool = False
+    conv_cell_adaptive_grid_n: int = 36
+    conv_cell_adaptive_lambda_grad: float = 0.0
+    conv_cell_adaptive_lambda_lap: float = 0.0
+    conv_cell_adaptive_candidate_multiplier: float = 8.0
 
     # ── 节点质量度量 ───────────────────────────────────────────────────────
     quality_probe_method: str = "uniform"   # 'uniform' 或 'random'
@@ -452,6 +457,11 @@ def run(cfg: CompareConfig) -> Path:
         "conv_cell_domain_shape":         cfg.conv_cell_domain_shape,
         "conv_cell_sphere_radius":        cfg.conv_cell_sphere_radius,
         "conv_cell_sphere_subdivide":     cfg.conv_cell_sphere_subdivide,
+        "conv_cell_adaptive_random":      cfg.conv_cell_adaptive_random,
+        "conv_cell_adaptive_grid_n":      cfg.conv_cell_adaptive_grid_n,
+        "conv_cell_adaptive_lambda_grad": cfg.conv_cell_adaptive_lambda_grad,
+        "conv_cell_adaptive_lambda_lap":  cfg.conv_cell_adaptive_lambda_lap,
+        "conv_cell_adaptive_candidate_multiplier": cfg.conv_cell_adaptive_candidate_multiplier,
         "ho_L":            cfg.ho_L,
         "loaded_from":     cfg.load_nodes or None,
     }
@@ -498,6 +508,11 @@ def run(cfg: CompareConfig) -> Path:
                 if cfg.conv_cell_sphere_radius > 0.0 else None
             ),
             conv_cell_sphere_subdivide=cfg.conv_cell_sphere_subdivide,
+            conv_cell_adaptive_random=cfg.conv_cell_adaptive_random,
+            conv_cell_adaptive_grid_n=cfg.conv_cell_adaptive_grid_n,
+            conv_cell_adaptive_lambda_grad=cfg.conv_cell_adaptive_lambda_grad,
+            conv_cell_adaptive_lambda_lap=cfg.conv_cell_adaptive_lambda_lap,
+            conv_cell_adaptive_candidate_multiplier=cfg.conv_cell_adaptive_candidate_multiplier,
             v_source=cfg.rbf_v_source,
             gaussian_params_file=(cfg.potential_params_file
                                   if cfg.rbf_v_source == "gaussian_direct"
@@ -871,6 +886,16 @@ def parse_args() -> CompareConfig:
                    help="conv_cell sphere 模式球半径(Bohr)；<=0 自动取 bbox 内切球半径")
     p.add_argument("--conv-cell-sphere-subdivide", type=int, default=3,
                    help="conv_cell sphere 边界的 icosphere 细分级数")
+    p.add_argument("--conv-cell-adaptive-random", action="store_true",
+                   help="conv_cell: 启用势能自适应随机点采样（细密网格+接受概率+KDTree 过滤）")
+    p.add_argument("--conv-cell-adaptive-grid-n", type=int, default=36,
+                   help="conv_cell 自适应采样时，一个原胞细密均匀网格每轴点数")
+    p.add_argument("--conv-cell-adaptive-lambda-grad", type=float, default=0.0,
+                   help="conv_cell 自适应采样 λ1（h = h_max/(1+λ1|∇V|+λ2|ΔV|)）")
+    p.add_argument("--conv-cell-adaptive-lambda-lap", type=float, default=0.0,
+                   help="conv_cell 自适应采样 λ2（h = h_max/(1+λ1|∇V|+λ2|ΔV|)）")
+    p.add_argument("--conv-cell-adaptive-candidate-multiplier", type=float, default=8.0,
+                   help="conv_cell 自适应采样候选预算倍数（相对 n_random）")
 
     # 节点质量度量
     p.add_argument("--quality-probe-method", type=str,
@@ -938,6 +963,11 @@ def parse_args() -> CompareConfig:
         conv_cell_domain_shape=a.conv_cell_domain_shape,
         conv_cell_sphere_radius=a.conv_cell_sphere_radius,
         conv_cell_sphere_subdivide=a.conv_cell_sphere_subdivide,
+        conv_cell_adaptive_random=a.conv_cell_adaptive_random,
+        conv_cell_adaptive_grid_n=a.conv_cell_adaptive_grid_n,
+        conv_cell_adaptive_lambda_grad=a.conv_cell_adaptive_lambda_grad,
+        conv_cell_adaptive_lambda_lap=a.conv_cell_adaptive_lambda_lap,
+        conv_cell_adaptive_candidate_multiplier=a.conv_cell_adaptive_candidate_multiplier,
         quality_probe_method=a.quality_probe_method,
         quality_probe_n=a.quality_probe_n,
         power_steps=a.power_steps,

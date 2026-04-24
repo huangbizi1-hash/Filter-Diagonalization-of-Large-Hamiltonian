@@ -132,6 +132,11 @@ CONFIG: Dict[str, Any] = {
     "conv_cell_domain_shape":         "cube",  # "cube" | "sphere"
     "conv_cell_sphere_radius":        0.0,     # >0 用该半径(Bohr)；<=0 自动内切球
     "conv_cell_sphere_subdivide":     3,
+    "conv_cell_adaptive_random":               False,
+    "conv_cell_adaptive_grid_n":               36,
+    "conv_cell_adaptive_lambda_grad":          0.0,
+    "conv_cell_adaptive_lambda_lap":           0.0,
+    "conv_cell_adaptive_candidate_multiplier": 8.0,
     # 节点质量检测（运行时计算 q, h, ρ 并打印 / 写 JSON）：
     "quality_probe_method":           "uniform",
     "quality_probe_n":                0,
@@ -335,6 +340,12 @@ def run(cfg: Dict[str, Any]) -> None:
             if float(cfg.get("conv_cell_sphere_radius", 0.0)) > 0.0 else None
         ),
         conv_cell_sphere_subdivide     = cfg.get("conv_cell_sphere_subdivide", 3),
+        conv_cell_adaptive_random      = cfg.get("conv_cell_adaptive_random", False),
+        conv_cell_adaptive_grid_n      = cfg.get("conv_cell_adaptive_grid_n", 36),
+        conv_cell_adaptive_lambda_grad = cfg.get("conv_cell_adaptive_lambda_grad", 0.0),
+        conv_cell_adaptive_lambda_lap  = cfg.get("conv_cell_adaptive_lambda_lap", 0.0),
+        conv_cell_adaptive_candidate_multiplier = cfg.get(
+            "conv_cell_adaptive_candidate_multiplier", 8.0),
         v_source                       = pot.get("v_source", "grid_interp"),
         gaussian_params_file           = (pot.get("params_file")
                                            if pot.get("v_source") == "gaussian_direct"
@@ -355,6 +366,7 @@ def run(cfg: Dict[str, Any]) -> None:
         print(f"   d_min_frac       : {cfg.get('conv_cell_d_min_frac')}")
         print(f"   n_random/cell    : {cfg.get('conv_cell_n_random')}")
         print(f"   parity           : {cfg.get('conv_cell_parity')}")
+        print(f"   adaptive_random  : {cfg.get('conv_cell_adaptive_random', False)}")
         print(f"   shape            : {cfg.get('conv_cell_domain_shape', 'cube')}")
         if cfg.get("conv_cell_domain_shape", "cube") == "sphere":
             r_show = cfg.get("conv_cell_sphere_radius", 0.0)
