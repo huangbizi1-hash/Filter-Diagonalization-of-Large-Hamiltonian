@@ -259,6 +259,22 @@ def _plot_nodes(problem, out_dir: Path) -> None:
     plt.close(fig)
 
 
+def _save_conv_cell_template_nodes(problem, out_dir: Path) -> None:
+    nodes_frac = problem.groups.get("conv_cell_template_nodes_frac")
+    nodes_cart = problem.groups.get("conv_cell_template_nodes_cart")
+    roles = problem.groups.get("conv_cell_template_roles")
+    if nodes_frac is None or nodes_cart is None or roles is None:
+        return
+    np.savez(
+        out_dir / "nodes_conv_cell_template.npz",
+        nodes_frac=np.asarray(nodes_frac, dtype=np.float64),
+        nodes_cart=np.asarray(nodes_cart, dtype=np.float64),
+        roles=np.asarray(roles, dtype=np.int64),
+    )
+    print(f"   saved one-cell template nodes -> "
+          f"{out_dir / 'nodes_conv_cell_template.npz'}")
+
+
 # ============================================================
 # 主运行函数
 # ============================================================
@@ -352,6 +368,8 @@ def run(cfg: Dict[str, Any]) -> None:
     print(f"   Time: {timings['build_problem']:.3f} s")
 
     _plot_nodes(problem, out_dir)
+    if cfg["domain"] == "conv_cell":
+        _save_conv_cell_template_nodes(problem, out_dir)
 
     # 频谱覆盖检查（H_max 用 Gershgorin 近似上界）
     H_max_est = float(problem.V_nodes.max()) + 50.0  # 保守；用户可覆盖 dE

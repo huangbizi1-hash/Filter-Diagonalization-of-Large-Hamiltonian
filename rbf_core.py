@@ -692,7 +692,7 @@ def generate_conv_cell_nodes(
     use_rbf_poisson: bool = True,
     boundary_margin_frac: float = 0.06,
     verbose: bool = True,
-) -> Tuple[Array, Dict[str, Array], Dict[str, int]]:
+) -> Tuple[Array, Dict[str, Array], Dict[str, Any]]:
     """
     Hybrid node generator on a conventional cubic cell (zincblende by default),
     tiled to fill an axis-aligned box.
@@ -733,7 +733,11 @@ def generate_conv_cell_nodes(
               ('atoms' etc. are *template-role* groups relative to the one-cell
               template; after tiling they index every tiled copy)
     stats   : counts {cell_skeleton, cell_random, cell_accepted_parity,
-                      cell_after_filter, tiled_total}
+                      cell_after_filter, tiled_total} plus one-cell template
+              arrays for saving/inspection:
+                  cell_template_nodes_frac : (N_cell, 3), [0,1)^3
+                  cell_template_nodes_cart : (N_cell, 3), Bohr
+                  cell_template_roles      : (N_cell,), 0/1/2/3
     """
     bbox_min = np.asarray(bbox_min, dtype=np.float64).reshape(3)
     bbox_max = np.asarray(bbox_max, dtype=np.float64).reshape(3)
@@ -836,11 +840,14 @@ def generate_conv_cell_nodes(
         cell_role_idx.append(assigned)
     cell_role_idx = np.asarray(cell_role_idx, dtype=np.int64)
 
-    cell_stats = {
+    cell_stats: Dict[str, Any] = {
         "cell_skeleton":         int(len(skeleton_frac)),
         "cell_random":           int(len(random_frac)),
         "cell_accepted_parity":  int(len(parity_frac)),
         "cell_after_filter":     int(len(cell_nodes_frac)),
+        "cell_template_nodes_frac": cell_nodes_frac.copy(),
+        "cell_template_nodes_cart": (cell_nodes_frac * a).copy(),
+        "cell_template_roles":      cell_role_idx.copy(),
     }
 
     # ── tile the one-cell template to cover [bbox_min, bbox_max) ─────────────
@@ -1202,6 +1209,9 @@ def build_qd_problem(
             boundary_margin_frac=conv_cell_boundary_margin_frac,
             use_rbf_poisson=conv_cell_use_rbf_poisson,
         )
+        groups["conv_cell_template_nodes_frac"] = _cell_stats["cell_template_nodes_frac"]
+        groups["conv_cell_template_nodes_cart"] = _cell_stats["cell_template_nodes_cart"]
+        groups["conv_cell_template_roles"] = _cell_stats["cell_template_roles"]
         interior_idx = groups["interior"]
         cfg_L = float(np.max(np.abs(nodes))) if len(nodes) else 0.0
 
