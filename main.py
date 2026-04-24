@@ -329,15 +329,33 @@ def _read_cube_atoms(filename: str) -> Tuple[List[Dict], List[str]]:
     return atoms, atom_types
 
 
+def _build_template_metadata(atoms: List[Dict], atom_types: List[str]) -> Dict[str, Any]:
+    """Build JSON-friendly crystal template metadata with node coordinates."""
+    template_nodes = []
+    for atom, atom_type in zip(atoms, atom_types):
+        pos = atom["position"]
+        template_nodes.append({
+            "atom_type": atom_type,
+            "atomic_number": int(atom["atomic_number"]),
+            "charge": float(atom["charge"]),
+            "position": [float(pos[0]), float(pos[1]), float(pos[2])],
+        })
+    return {
+        "n_nodes": len(template_nodes),
+        "nodes": template_nodes,
+    }
+
+
 def build_potential_from_config(cfg: Dict, N: int) -> Tuple[np.ndarray, ...]:
     """
     Dispatch to the correct potential builder based on cfg['potential']['type'].
 
-    Returns x, y, z, X, Y, Z, x_grid, V
+    Returns x, y, z, X, Y, Z, x_grid, V, potential_meta
     """
     pot  = cfg["potential"]
     ptype = pot["type"]
     kinetic_cut = cfg.get("kinetic_cut", 30.0)
+    potential_meta: Dict[str, Any] = {}
 
     if ptype == "ho3d":
         x, y, z, X, Y, Z, x_grid = build_grid(N, pot["d"])
@@ -365,11 +383,12 @@ def build_potential_from_config(cfg: Dict, N: int) -> Tuple[np.ndarray, ...]:
         x = x_raw; y = y_raw; z = z_raw
         X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
         x_grid  = [x, y, z]
+        potential_meta["template"] = _build_template_metadata(builder.atoms, builder.atom_types)
 
     else:
         raise ValueError(f"Unknown potential type: '{ptype}'")
 
-    return x, y, z, X, Y, Z, x_grid, V
+    return x, y, z, X, Y, Z, x_grid, V, potential_meta
 
 
 # ============================================================
@@ -688,7 +707,7 @@ def run(cfg: Dict[str, Any]) -> None:
     t0 = time.perf_counter()
 
     N   = cfg["N"]
-    x, y, z, X, Y, Z, x_grid, V = build_potential_from_config(cfg, N)
+    x, y, z, X, Y, Z, x_grid, V, potential_meta = build_potential_from_config(cfg, N)
     Nx = Ny = Nz = N
 
     timings["build_potential"] = time.perf_counter() - t0
@@ -836,6 +855,7 @@ def run(cfg: Dict[str, Any]) -> None:
             "V_min":  float(V.min()),
             "V_max":  float(V.max()),
             "V_mean": float(V.mean()),
+            **potential_meta,
         },
         "filter": {
             "nc":     nc,
