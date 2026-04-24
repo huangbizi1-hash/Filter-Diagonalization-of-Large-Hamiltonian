@@ -137,6 +137,9 @@ CONFIG: Dict[str, Any] = {
     "conv_cell_adaptive_lambda_grad":          0.0,
     "conv_cell_adaptive_lambda_lap":           0.0,
     "conv_cell_adaptive_candidate_multiplier": 8.0,
+    "conv_cell_use_fcc_refined":               False,
+    "conv_cell_fcc_scale_factor":              16,
+    "conv_cell_fcc_r0_frac":                   [0.0, 0.0, 0.0],
     # 节点质量检测（运行时计算 q, h, ρ 并打印 / 写 JSON）：
     "quality_probe_method":           "uniform",
     "quality_probe_n":                0,
@@ -346,6 +349,9 @@ def run(cfg: Dict[str, Any]) -> None:
         conv_cell_adaptive_lambda_lap  = cfg.get("conv_cell_adaptive_lambda_lap", 0.0),
         conv_cell_adaptive_candidate_multiplier = cfg.get(
             "conv_cell_adaptive_candidate_multiplier", 8.0),
+        conv_cell_use_fcc_refined      = cfg.get("conv_cell_use_fcc_refined", False),
+        conv_cell_fcc_scale_factor     = cfg.get("conv_cell_fcc_scale_factor", 4),
+        conv_cell_fcc_r0_frac          = cfg.get("conv_cell_fcc_r0_frac", [0.0, 0.0, 0.0]),
         v_source                       = pot.get("v_source", "grid_interp"),
         gaussian_params_file           = (pot.get("params_file")
                                            if pot.get("v_source") == "gaussian_direct"
@@ -367,6 +373,10 @@ def run(cfg: Dict[str, Any]) -> None:
         print(f"   n_random/cell    : {cfg.get('conv_cell_n_random')}")
         print(f"   parity           : {cfg.get('conv_cell_parity')}")
         print(f"   adaptive_random  : {cfg.get('conv_cell_adaptive_random', False)}")
+        print(f"   use_fcc_refined  : {cfg.get('conv_cell_use_fcc_refined', False)}")
+        if cfg.get("conv_cell_use_fcc_refined", False):
+            print(f"   fcc_scale_factor : {cfg.get('conv_cell_fcc_scale_factor', 4)}")
+            print(f"   fcc_r0_frac      : {cfg.get('conv_cell_fcc_r0_frac', [0.0, 0.0, 0.0])}")
         print(f"   shape            : {cfg.get('conv_cell_domain_shape', 'cube')}")
         if cfg.get("conv_cell_domain_shape", "cube") == "sphere":
             r_show = cfg.get("conv_cell_sphere_radius", 0.0)
