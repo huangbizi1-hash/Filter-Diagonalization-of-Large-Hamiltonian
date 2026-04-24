@@ -188,10 +188,17 @@ def _build_node_storage(
 
     groups_full: dict[str, list[int]] = {}
     group_counts: dict[str, int] = {}
+    aux_groups: dict[str, Any] = {}
     for name, idx in problem.groups.items():
-        arr = np.asarray(idx, dtype=int)
-        groups_full[str(name)] = arr.tolist()
-        group_counts[str(name)] = int(len(arr))
+        arr = np.asarray(idx)
+        name_s = str(name)
+        # 仅把“索引分组”放进 groups（兼容 --load-nodes）；其他辅助数组单独存 aux
+        if arr.ndim == 1 and np.issubdtype(arr.dtype, np.integer):
+            arr_i = arr.astype(int, copy=False)
+            groups_full[name_s] = arr_i.tolist()
+            group_counts[name_s] = int(len(arr_i))
+        else:
+            aux_groups[name_s] = arr
 
     # q, h, ρ on interior nodes (what the Hamiltonian actually sees)
     quality: dict[str, Any] = {}
@@ -223,7 +230,33 @@ def _build_node_storage(
         "coordinates_all": nodes.tolist(),
         "coordinates_interior": interior_nodes.tolist(),
         "groups": groups_full,
+        "aux_groups": _to_jsonable(aux_groups),
     }
+
+
+def _save_conv_cell_template_json(problem: RBFProblem, nodes_json_path: Path) -> Path | None:
+    nodes_frac = problem.groups.get("conv_cell_template_nodes_frac")
+    nodes_cart = problem.groups.get("conv_cell_template_nodes_cart")
+    roles = problem.groups.get("conv_cell_template_roles")
+    if nodes_frac is None or nodes_cart is None or roles is None:
+        return None
+
+    out = nodes_json_path.with_name(nodes_json_path.stem + "_conv_cell_template.json")
+    payload = {
+        "nodes_frac": np.asarray(nodes_frac, dtype=float).tolist(),
+        "nodes_cart": np.asarray(nodes_cart, dtype=float).tolist(),
+        "roles": np.asarray(roles, dtype=int).tolist(),
+        "role_legend": {
+            "0": "atoms",
+            "1": "level3",
+            "2": "random",
+            "3": "parity",
+        },
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    return out
 
 
 def _save_nodes_json(node_storage: dict[str, Any], path: Path) -> Path:
@@ -502,6 +535,10 @@ def run(cfg: CompareConfig) -> Path:
             nodes_json_path = p_user
         _save_nodes_json(node_storage, nodes_json_path)
         print(f"节点 JSON 已保存: {nodes_json_path}")
+        if cfg.rbf_node_method == "conv_cell":
+            template_path = _save_conv_cell_template_json(problem, nodes_json_path)
+            if template_path is not None:
+                print(f"原胞模板节点已保存: {template_path}")
 
     # FFT 和 RBF 生活在完全不同的向量空间：
     #   FFT: 均匀网格，维度 n_grid = N³
