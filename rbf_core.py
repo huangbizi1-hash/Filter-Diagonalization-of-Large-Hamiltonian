@@ -1107,8 +1107,10 @@ def generate_conv_cell_nodes(
         sphere_center = None
         sphere_radius_eff = None
     else:
-        # Sphere mode: keep tiled template points inside the sphere and add
-        # explicit boundary nodes on the sphere surface.
+        # Sphere mode: keep tiled template points inside the sphere and derive
+        # boundary nodes directly from the existing tiled template (radial shell
+        # near the target sphere radius). This avoids extra Poisson sampling on
+        # the sphere surface and guarantees boundary group existence.
         sphere_center = 0.5 * (bbox_min + bbox_max)
         if sphere_radius is None:
             sphere_radius_eff = 0.5 * float(np.min(bbox_max - bbox_min))
@@ -1119,34 +1121,29 @@ def generate_conv_cell_nodes(
                 f"sphere_radius must be > 0, got {sphere_radius_eff}")
 
         r = np.linalg.norm(nodes - sphere_center[None, :], axis=1)
-        inside = r < sphere_radius_eff
+        # keep points on/inside sphere; small tolerance guards roundoff
+        rad_tol = max(1e-8, 1e-6 * a)
+        inside = r <= (sphere_radius_eff + rad_tol)
+        nodes = nodes[inside]
+        roles = roles[inside]
+        r_in = r[inside]
 
-        nodes_in = nodes[inside]
-        roles_in = roles[inside]
-
-        vert_s, smp_s = _make_icosphere(sphere_radius_eff, sphere_subdivide)
-        vert_s = vert_s + sphere_center[None, :]
-        spacing_surf = max(d_min_frac * a, 1e-6)
-        surf_nodes_all, surf_groups, _ = poisson_disc_nodes(spacing_surf, (vert_s, smp_s))
-        surf_boundary = surf_nodes_all[surf_groups["boundary"]]
-
-        # Keep only boundary points to avoid adding volume fill from the sphere
-        # Poisson solve; boundary points are on the triangulated surface.
-        if len(nodes_in):
-            nodes = np.vstack([nodes_in, surf_boundary])
+        if len(nodes) == 0:
+            boundary_idx = np.empty(0, dtype=np.int64)
+            interior_idx = np.empty(0, dtype=np.int64)
         else:
-            nodes = surf_boundary.copy()
-        roles = np.concatenate([roles_in, -np.ones(len(surf_boundary), dtype=np.int64)])
+            # radial shell used to mark boundary points from existing nodes
+            shell_tol = max(boundary_margin_frac * a, 0.5 * d_min_frac * a, rad_tol)
+            radial_delta = np.abs(r_in - sphere_radius_eff)
+            is_boundary = radial_delta <= shell_tol
 
-        nodes_q = np.round(nodes / 1e-8).astype(np.int64)
-        _, idx_u2 = np.unique(nodes_q, axis=0, return_index=True)
-        idx_u2 = np.sort(idx_u2)
-        nodes = nodes[idx_u2]
-        roles = roles[idx_u2]
+            # Fallback: ensure at least one boundary node exists.
+            if not np.any(is_boundary):
+                imin = int(np.argmin(radial_delta))
+                is_boundary[imin] = True
 
-        is_surf = roles < 0
-        boundary_idx = np.where(is_surf)[0].astype(np.int64)
-        interior_idx = np.where(~is_surf)[0].astype(np.int64)
+            boundary_idx = np.where(is_boundary)[0].astype(np.int64)
+            interior_idx = np.where(~is_boundary)[0].astype(np.int64)
         margin = 0.0
 
     nodes_after_domain = nodes.copy()
