@@ -81,6 +81,9 @@ class CompareConfig:
     conv_cell_n_random: int = 120           # 每个晶胞 Poisson-like 目标点数
     conv_cell_seed: int = 42
     conv_cell_parity: bool = True           # 是否加 1-r 反演对偶点
+    conv_cell_template_mode: str = "hybrid" # hybrid | fcc_refined
+    conv_cell_fcc_scale_factor: int = 8
+    conv_cell_fcc_origin_frac: tuple[float, float, float] = (0.0, 0.0, 0.0)
     # 面附近多近算 boundary：薄壳（≈1·d_min）才合理；以前 0.5 太大，会让中心
     # 立方只剩 ~36% 体积，视觉上像没铺满。默认 = d_min_frac。
     conv_cell_boundary_margin_frac: float = 0.06
@@ -93,6 +96,9 @@ class CompareConfig:
     conv_cell_adaptive_lambda_grad: float = 0.0
     conv_cell_adaptive_lambda_lap: float = 0.0
     conv_cell_adaptive_candidate_multiplier: float = 8.0
+    include_interior: bool = True
+    include_boundary: bool = True
+    node_min_dist: float = 0.0
 
     # ── 节点质量度量 ───────────────────────────────────────────────────────
     quality_probe_method: str = "uniform"   # 'uniform' 或 'random'
@@ -259,6 +265,7 @@ def _save_conv_cell_template_json(problem: RBFProblem, nodes_json_path: Path) ->
             "1": "level3",
             "2": "random",
             "3": "parity",
+            "4": "fcc",
         },
     }
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -452,6 +459,9 @@ def run(cfg: CompareConfig) -> Path:
         "conv_cell_n_random":   cfg.conv_cell_n_random,
         "conv_cell_seed":       cfg.conv_cell_seed,
         "conv_cell_parity":     cfg.conv_cell_parity,
+        "conv_cell_template_mode": cfg.conv_cell_template_mode,
+        "conv_cell_fcc_scale_factor": cfg.conv_cell_fcc_scale_factor,
+        "conv_cell_fcc_origin_frac": list(cfg.conv_cell_fcc_origin_frac),
         "conv_cell_boundary_margin_frac": cfg.conv_cell_boundary_margin_frac,
         "conv_cell_use_rbf_poisson":      cfg.conv_cell_use_rbf_poisson,
         "conv_cell_domain_shape":         cfg.conv_cell_domain_shape,
@@ -462,6 +472,9 @@ def run(cfg: CompareConfig) -> Path:
         "conv_cell_adaptive_lambda_grad": cfg.conv_cell_adaptive_lambda_grad,
         "conv_cell_adaptive_lambda_lap":  cfg.conv_cell_adaptive_lambda_lap,
         "conv_cell_adaptive_candidate_multiplier": cfg.conv_cell_adaptive_candidate_multiplier,
+        "include_interior": cfg.include_interior,
+        "include_boundary": cfg.include_boundary,
+        "node_min_dist": cfg.node_min_dist,
         "ho_L":            cfg.ho_L,
         "loaded_from":     cfg.load_nodes or None,
     }
@@ -500,6 +513,9 @@ def run(cfg: CompareConfig) -> Path:
             conv_cell_n_random=cfg.conv_cell_n_random,
             conv_cell_seed=cfg.conv_cell_seed,
             conv_cell_parity=cfg.conv_cell_parity,
+            conv_cell_template_mode=cfg.conv_cell_template_mode,
+            conv_cell_fcc_scale_factor=cfg.conv_cell_fcc_scale_factor,
+            conv_cell_fcc_origin_frac=np.asarray(cfg.conv_cell_fcc_origin_frac, dtype=np.float64),
             conv_cell_boundary_margin_frac=cfg.conv_cell_boundary_margin_frac,
             conv_cell_use_rbf_poisson=cfg.conv_cell_use_rbf_poisson,
             conv_cell_domain_shape=cfg.conv_cell_domain_shape,
@@ -513,6 +529,9 @@ def run(cfg: CompareConfig) -> Path:
             conv_cell_adaptive_lambda_grad=cfg.conv_cell_adaptive_lambda_grad,
             conv_cell_adaptive_lambda_lap=cfg.conv_cell_adaptive_lambda_lap,
             conv_cell_adaptive_candidate_multiplier=cfg.conv_cell_adaptive_candidate_multiplier,
+            include_interior=cfg.include_interior,
+            include_boundary=cfg.include_boundary,
+            node_min_dist=cfg.node_min_dist,
             v_source=cfg.rbf_v_source,
             gaussian_params_file=(cfg.potential_params_file
                                   if cfg.rbf_v_source == "gaussian_direct"
@@ -874,6 +893,14 @@ def parse_args() -> CompareConfig:
                    help="conv_cell 随机种子")
     p.add_argument("--conv-cell-no-parity", action="store_true",
                    help="不加 1-r 反演对偶点")
+    p.add_argument("--conv-cell-template-mode", type=str,
+                   choices=["hybrid", "fcc_refined"], default="hybrid",
+                   help="conv_cell 模板模式：hybrid(默认) 或 fcc_refined(确定性FCC)")
+    p.add_argument("--conv-cell-fcc-scale-factor", type=int, default=8,
+                   help="fcc_refined 模式每轴细分 scale_factor（总点数约 4*sf^3/胞）")
+    p.add_argument("--conv-cell-fcc-origin-frac", type=float, nargs=3,
+                   default=[0.0, 0.0, 0.0], metavar=("FX", "FY", "FZ"),
+                   help="fcc_refined 模式 FCC 原点分数坐标偏移")
     p.add_argument("--conv-cell-boundary-margin-frac", type=float, default=0.06,
                    help="距 bbox 面小于 margin*a 的节点判为 boundary；"
                         "默认 0.06 = d_min_frac，薄壳；设 0 关闭 boundary 划分")
@@ -896,6 +923,12 @@ def parse_args() -> CompareConfig:
                    help="conv_cell 自适应采样 λ2（h = h_max/(1+λ1|∇V|+λ2|ΔV|)）")
     p.add_argument("--conv-cell-adaptive-candidate-multiplier", type=float, default=8.0,
                    help="conv_cell 自适应采样候选预算倍数（相对 n_random）")
+    p.add_argument("--exclude-boundary", action="store_true",
+                   help="仅保留 interior 节点（去掉 boundary）")
+    p.add_argument("--exclude-interior", action="store_true",
+                   help="仅保留 boundary 节点（去掉 interior）")
+    p.add_argument("--node-min-dist", type=float, default=0.0,
+                   help="节点最小距离过滤阈值（Bohr，0=关闭）")
 
     # 节点质量度量
     p.add_argument("--quality-probe-method", type=str,
@@ -925,6 +958,8 @@ def parse_args() -> CompareConfig:
     p.add_argument("--out-dir", type=str, default="filter_compare_results")
 
     a = p.parse_args()
+    if a.exclude_interior and a.exclude_boundary:
+        p.error("--exclude-interior 和 --exclude-boundary 不能同时设置")
     return CompareConfig(
         system=a.system,
         qd_radius=a.qd_radius,
@@ -958,6 +993,9 @@ def parse_args() -> CompareConfig:
         conv_cell_n_random=a.conv_cell_n_random,
         conv_cell_seed=a.conv_cell_seed,
         conv_cell_parity=(not a.conv_cell_no_parity),
+        conv_cell_template_mode=a.conv_cell_template_mode,
+        conv_cell_fcc_scale_factor=a.conv_cell_fcc_scale_factor,
+        conv_cell_fcc_origin_frac=tuple(float(v) for v in a.conv_cell_fcc_origin_frac),
         conv_cell_boundary_margin_frac=a.conv_cell_boundary_margin_frac,
         conv_cell_use_rbf_poisson=(not a.conv_cell_use_legacy_poisson),
         conv_cell_domain_shape=a.conv_cell_domain_shape,
@@ -968,6 +1006,9 @@ def parse_args() -> CompareConfig:
         conv_cell_adaptive_lambda_grad=a.conv_cell_adaptive_lambda_grad,
         conv_cell_adaptive_lambda_lap=a.conv_cell_adaptive_lambda_lap,
         conv_cell_adaptive_candidate_multiplier=a.conv_cell_adaptive_candidate_multiplier,
+        include_interior=(not a.exclude_interior),
+        include_boundary=(not a.exclude_boundary),
+        node_min_dist=a.node_min_dist,
         quality_probe_method=a.quality_probe_method,
         quality_probe_n=a.quality_probe_n,
         power_steps=a.power_steps,
