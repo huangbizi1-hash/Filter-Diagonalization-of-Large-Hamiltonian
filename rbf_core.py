@@ -12,6 +12,12 @@ from rbf.pde.nodes import poisson_disc_nodes
 
 Array = np.ndarray
 
+
+def _periodic_delta_frac(x: Array, y: Array) -> Array:
+    """Minimum-image signed displacement in fractional coordinates."""
+    d = np.asarray(x, dtype=np.float64) - np.asarray(y, dtype=np.float64)
+    return d - np.round(d)
+
 # ─── All supported RBF kernels ───────────────────────────────────────────────
 
 KERNELS_ALL: list[str] = [
@@ -639,12 +645,111 @@ def _unique_cart_rows(arr: Array, tol: float = 1e-8) -> Array:
 
 
 def _periodic_diff(x: Array, y: Array) -> Array:
-    d = np.abs(x - y)
-    return np.minimum(d, 1.0 - d)
+    return np.abs(_periodic_delta_frac(x, y))
 
 
 def _periodic_dist(x: Array, y: Array) -> float:
     return float(np.linalg.norm(_periodic_diff(x, y)))
+
+
+def _build_uniform_frac_grid(n_per_axis: int) -> Array:
+    if n_per_axis < 2:
+        raise ValueError(f"n_per_axis must be >= 2, got {n_per_axis}")
+    t = np.linspace(0.0, 1.0, int(n_per_axis), endpoint=False, dtype=np.float64)
+    gx, gy, gz = np.meshgrid(t, t, t, indexing="ij")
+    return np.column_stack([gx.ravel(), gy.ravel(), gz.ravel()])
+
+
+def _estimate_grad_laplacian_uniform(
+    V: Array,
+    n_per_axis: int,
+    a: float,
+) -> tuple[Array, Array]:
+    """Estimate |∇V| and |ΔV| on a uniform [0,1)^3 grid of one conventional cell."""
+    V3 = np.asarray(V, dtype=np.float64).reshape(n_per_axis, n_per_axis, n_per_axis)
+    h = float(a) / float(n_per_axis)
+    # periodic finite differences
+    dVdx = (np.roll(V3, -1, axis=0) - np.roll(V3, 1, axis=0)) / (2.0 * h)
+    dVdy = (np.roll(V3, -1, axis=1) - np.roll(V3, 1, axis=1)) / (2.0 * h)
+    dVdz = (np.roll(V3, -1, axis=2) - np.roll(V3, 1, axis=2)) / (2.0 * h)
+    grad_norm = np.sqrt(dVdx * dVdx + dVdy * dVdy + dVdz * dVdz)
+    lap = (
+        np.roll(V3, -1, axis=0) + np.roll(V3, 1, axis=0) +
+        np.roll(V3, -1, axis=1) + np.roll(V3, 1, axis=1) +
+        np.roll(V3, -1, axis=2) + np.roll(V3, 1, axis=2) -
+        6.0 * V3
+    ) / (h * h)
+    return grad_norm.ravel(), np.abs(lap.ravel())
+
+
+def _adaptive_accept_and_filter_periodic(
+    candidates_frac: Array,
+    weights_h: Array,
+    d_min_frac: float,
+    n_target: int,
+    rng: np.random.Generator,
+    pinned_frac: Optional[Array] = None,
+) -> Array:
+    """
+    Weighted accept-reject + periodic KDTree minimum-distance filter.
+    """
+    from scipy.spatial import cKDTree
+
+    cand = _wrap_frac(np.asarray(candidates_frac, dtype=np.float64).reshape(-1, 3))
+    if cand.size == 0 or n_target <= 0:
+        return np.empty((0, 3), dtype=np.float64)
+
+    w = np.asarray(weights_h, dtype=np.float64).reshape(-1)
+    if w.shape[0] != cand.shape[0]:
+        raise ValueError("weights_h size mismatch with candidates_frac")
+    h_max = float(np.max(w)) if w.size else 0.0
+    if h_max <= 0.0:
+        return np.empty((0, 3), dtype=np.float64)
+
+    p_accept = np.clip(w / h_max, 0.0, 1.0)
+    accepted_mask = rng.random(cand.shape[0]) < p_accept
+    accepted = cand[accepted_mask]
+    if accepted.shape[0] == 0:
+        accepted = cand[np.argsort(-w)[: min(8, cand.shape[0])]]
+
+    # process high-weight points first, improves quality for fixed budget
+    acc_w = w[accepted_mask] if np.any(accepted_mask) else np.full(len(accepted), h_max)
+    accepted = accepted[np.argsort(-acc_w)]
+
+    shifts = np.array(
+        [[i, j, k] for i in (-1.0, 0.0, 1.0)
+         for j in (-1.0, 0.0, 1.0)
+         for k in (-1.0, 0.0, 1.0)],
+        dtype=np.float64,
+    )
+
+    kept: list[Array] = []
+    pinned = (_wrap_frac(np.asarray(pinned_frac, dtype=np.float64).reshape(-1, 3))
+              if pinned_frac is not None and len(pinned_frac) else
+              np.empty((0, 3), dtype=np.float64))
+
+    tree_points = pinned.copy()
+    tree_aug = np.vstack([tree_points + s for s in shifts]) if len(tree_points) else np.empty((0, 3))
+    tree = cKDTree(tree_aug) if len(tree_aug) else None
+    r = float(d_min_frac)
+
+    for x in accepted:
+        if len(kept) >= n_target:
+            break
+        if tree is not None and tree.query_ball_point(x, r):
+            continue
+        kept.append(x)
+        px = x[None, :]
+        if tree_points.size:
+            tree_points = np.vstack([tree_points, px])
+        else:
+            tree_points = px.copy()
+        tree_aug = np.vstack([tree_points + s for s in shifts])
+        tree = cKDTree(tree_aug)
+
+    if not kept:
+        return np.empty((0, 3), dtype=np.float64)
+    return np.stack(kept, axis=0)
 
 
 def _greedy_filter_by_dmin_periodic(points_frac: Array, d_min: float) -> Array:
@@ -694,6 +799,13 @@ def generate_conv_cell_nodes(
     domain_shape: str = "cube",
     sphere_radius: Optional[float] = None,
     sphere_subdivide: int = 3,
+    # adaptive random-node sampler options
+    adaptive_random: bool = False,
+    adaptive_grid_n: int = 36,
+    adaptive_lambda_grad: float = 0.0,
+    adaptive_lambda_lap: float = 0.0,
+    adaptive_candidate_multiplier: float = 8.0,
+    adaptive_gaussian_builder: Optional[Any] = None,
     verbose: bool = True,
 ) -> Tuple[Array, Dict[str, Array], Dict[str, Any]]:
     """
@@ -772,9 +884,31 @@ def generate_conv_cell_nodes(
     # skeleton = atoms + level-3 (these are all pinned)
     skeleton_frac = _unique_rows_mod1(np.vstack([atom_frac, level3_frac]))
 
-    # ── Poisson-like random points in [0,1)^3 ────────────────────────────────
+    # ── Poisson-like / adaptive random points in [0,1)^3 ─────────────────────
     rng = np.random.default_rng(seed)
-    if use_rbf_poisson:
+    if adaptive_random:
+        if adaptive_gaussian_builder is None:
+            raise ValueError("adaptive_random=True requires adaptive_gaussian_builder")
+        n_grid = int(adaptive_grid_n)
+        cand_frac = _build_uniform_frac_grid(n_grid)
+        cand_cart = cand_frac * a
+        V_cand = np.asarray(adaptive_gaussian_builder.evaluate_at_points(cand_cart),
+                            dtype=np.float64)
+        gnorm, lap_abs = _estimate_grad_laplacian_uniform(V_cand, n_grid, a)
+        denom = 1.0 + float(adaptive_lambda_grad) * gnorm + float(adaptive_lambda_lap) * lap_abs
+        h_w = 1.0 / np.maximum(denom, 1e-12)
+        n_candidates = int(max(1, round(float(adaptive_candidate_multiplier) * n_random_target)))
+        # draw top-weight-biased subset first to reduce KDTree insert loops
+        take = np.argsort(-h_w)[: min(n_candidates, len(h_w))]
+        random_frac = _adaptive_accept_and_filter_periodic(
+            candidates_frac=cand_frac[take],
+            weights_h=h_w[take],
+            d_min_frac=d_min_frac,
+            n_target=n_random_target,
+            rng=rng,
+            pinned_frac=skeleton_frac,
+        )
+    elif use_rbf_poisson:
         # Use the repo's Poisson-disc sampler on the unit cube [0,a]^3 with
         # the skeleton pinned.  radius = d_min_frac*a (Cartesian).
         vert, smp = _make_unit_cube_surface(a)
@@ -971,6 +1105,7 @@ def generate_conv_cell_nodes(
         "tiled_total": int(len(nodes)),
         "domain_shape": domain_shape,
         "sphere_radius": (float(sphere_radius_eff) if sphere_radius_eff is not None else None),
+        "adaptive_random": bool(adaptive_random),
     }
 
     if verbose:
@@ -1154,6 +1289,11 @@ def build_qd_problem(
     conv_cell_domain_shape: str = "cube",
     conv_cell_sphere_radius: Optional[float] = None,
     conv_cell_sphere_subdivide: int = 3,
+    conv_cell_adaptive_random: bool = False,
+    conv_cell_adaptive_grid_n: int = 36,
+    conv_cell_adaptive_lambda_grad: float = 0.0,
+    conv_cell_adaptive_lambda_lap: float = 0.0,
+    conv_cell_adaptive_candidate_multiplier: float = 8.0,
     # ── V_nodes source ──
     # "grid_interp"     : linear-interpolate V from the cube-file grid to the
     #                     node positions (legacy, has interp error)
@@ -1222,6 +1362,13 @@ def build_qd_problem(
     conv_cell_sphere_radius  : sphere radius (Bohr) when conv_cell_domain_shape='sphere';
                                None means 0.5*min(bbox side lengths)
     conv_cell_sphere_subdivide : icosphere subdivision for spherical boundary
+    conv_cell_adaptive_random : if True, random template points are sampled by
+                                dense-grid potential-adaptive accept/reject
+    conv_cell_adaptive_grid_n : one-cell dense uniform grid resolution per axis
+    conv_cell_adaptive_lambda_grad : λ1 in h = h_max/(1+λ1|∇V|+λ2|ΔV|)
+    conv_cell_adaptive_lambda_lap  : λ2 in h = h_max/(1+λ1|∇V|+λ2|ΔV|)
+    conv_cell_adaptive_candidate_multiplier : preselection budget multiplier
+                                              before accept+KDTree filtering
     """
     from scipy.interpolate import RegularGridInterpolator
 
@@ -1274,6 +1421,18 @@ def build_qd_problem(
                               y_grid[-1] + (y_grid[1] - y_grid[0]),
                               z_grid[-1] + (z_grid[1] - z_grid[0])],
                              dtype=np.float64)
+        adaptive_builder = None
+        if conv_cell_adaptive_random:
+            if gaussian_params_file is None:
+                raise ValueError(
+                    "conv_cell_adaptive_random=True requires gaussian_params_file "
+                    "(to evaluate one-cell dense-grid potential).")
+            from gaussian_potential_builder import GaussianPotentialBuilder
+            adaptive_builder = GaussianPotentialBuilder(
+                cube_file=cube_file,
+                params_file=gaussian_params_file,
+                r_cut=r_cut,
+            )
         nodes, groups, _cell_stats = generate_conv_cell_nodes(
             bbox_min=bbox_min,
             bbox_max=bbox_max,
@@ -1287,6 +1446,12 @@ def build_qd_problem(
             domain_shape=conv_cell_domain_shape,
             sphere_radius=conv_cell_sphere_radius,
             sphere_subdivide=conv_cell_sphere_subdivide,
+            adaptive_random=conv_cell_adaptive_random,
+            adaptive_grid_n=conv_cell_adaptive_grid_n,
+            adaptive_lambda_grad=conv_cell_adaptive_lambda_grad,
+            adaptive_lambda_lap=conv_cell_adaptive_lambda_lap,
+            adaptive_candidate_multiplier=conv_cell_adaptive_candidate_multiplier,
+            adaptive_gaussian_builder=adaptive_builder,
         )
         groups["conv_cell_template_nodes_frac"] = _cell_stats["cell_template_nodes_frac"]
         groups["conv_cell_template_nodes_cart"] = _cell_stats["cell_template_nodes_cart"]
