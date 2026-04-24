@@ -277,8 +277,8 @@ def run(cfg: Dict[str, Any]) -> None:
     print("1. Building potential ...")
     t0 = time.perf_counter()
 
-    N = cfg["N"]
-    x, y, z, X, Y, Z, x_grid, V = build_potential_from_config(cfg, N)
+    N   = cfg["N"]
+    x, y, z, X, Y, Z, x_grid, V, potential_meta = build_potential_from_config(cfg, N)
     Nx = Ny = Nz = N
 
     timings["build_potential"] = time.perf_counter() - t0
@@ -571,6 +571,7 @@ def run(cfg: Dict[str, Any]) -> None:
             "V_min":  float(V.min()),
             "V_max":  float(V.max()),
             "V_mean": float(V.mean()),
+            **potential_meta,
         },
         "filter": {
             "filter_type": filter_type,
