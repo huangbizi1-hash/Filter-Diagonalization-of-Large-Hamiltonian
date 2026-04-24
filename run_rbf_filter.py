@@ -129,6 +129,9 @@ CONFIG: Dict[str, Any] = {
     # 面附近多近算 boundary：薄壳（≈1·d_min）才合理；= d_min_frac 是好默认
     "conv_cell_boundary_margin_frac": 0.06,
     "conv_cell_use_rbf_poisson":      True,
+    "conv_cell_domain_shape":         "cube",  # "cube" | "sphere"
+    "conv_cell_sphere_radius":        0.0,     # >0 用该半径(Bohr)；<=0 自动内切球
+    "conv_cell_sphere_subdivide":     3,
     # 节点质量检测（运行时计算 q, h, ρ 并打印 / 写 JSON）：
     "quality_probe_method":           "uniform",
     "quality_probe_n":                0,
@@ -326,6 +329,12 @@ def run(cfg: Dict[str, Any]) -> None:
         conv_cell_parity               = cfg.get("conv_cell_parity", True),
         conv_cell_boundary_margin_frac = cfg.get("conv_cell_boundary_margin_frac", 0.5),
         conv_cell_use_rbf_poisson      = cfg.get("conv_cell_use_rbf_poisson", True),
+        conv_cell_domain_shape         = cfg.get("conv_cell_domain_shape", "cube"),
+        conv_cell_sphere_radius        = (
+            cfg.get("conv_cell_sphere_radius")
+            if float(cfg.get("conv_cell_sphere_radius", 0.0)) > 0.0 else None
+        ),
+        conv_cell_sphere_subdivide     = cfg.get("conv_cell_sphere_subdivide", 3),
         v_source                       = pot.get("v_source", "grid_interp"),
         gaussian_params_file           = (pot.get("params_file")
                                            if pot.get("v_source") == "gaussian_direct"
@@ -346,6 +355,10 @@ def run(cfg: Dict[str, Any]) -> None:
         print(f"   d_min_frac       : {cfg.get('conv_cell_d_min_frac')}")
         print(f"   n_random/cell    : {cfg.get('conv_cell_n_random')}")
         print(f"   parity           : {cfg.get('conv_cell_parity')}")
+        print(f"   shape            : {cfg.get('conv_cell_domain_shape', 'cube')}")
+        if cfg.get("conv_cell_domain_shape", "cube") == "sphere":
+            r_show = cfg.get("conv_cell_sphere_radius", 0.0)
+            print(f"   sphere radius    : {r_show} Bohr (<=0 means auto)")
     print(f"   n_nodes total    : {n_total}")
     print(f"   n_interior       : {n_interior}")
 

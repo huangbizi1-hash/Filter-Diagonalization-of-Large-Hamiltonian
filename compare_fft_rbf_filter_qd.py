@@ -85,6 +85,9 @@ class CompareConfig:
     # 立方只剩 ~36% 体积，视觉上像没铺满。默认 = d_min_frac。
     conv_cell_boundary_margin_frac: float = 0.06
     conv_cell_use_rbf_poisson: bool = True  # True=rbf.poisson_disc_nodes, False=周期拒绝采样
+    conv_cell_domain_shape: str = "cube"    # conv_cell 体域形状：cube | sphere
+    conv_cell_sphere_radius: float = 0.0    # >0 时使用该球半径(Bohr)；<=0 自动取 bbox 内切球
+    conv_cell_sphere_subdivide: int = 3     # sphere 边界 icosphere 细分级数
 
     # ── 节点质量度量 ───────────────────────────────────────────────────────
     quality_probe_method: str = "uniform"   # 'uniform' 或 'random'
@@ -413,6 +416,9 @@ def run(cfg: CompareConfig) -> Path:
         "conv_cell_parity":     cfg.conv_cell_parity,
         "conv_cell_boundary_margin_frac": cfg.conv_cell_boundary_margin_frac,
         "conv_cell_use_rbf_poisson":      cfg.conv_cell_use_rbf_poisson,
+        "conv_cell_domain_shape":         cfg.conv_cell_domain_shape,
+        "conv_cell_sphere_radius":        cfg.conv_cell_sphere_radius,
+        "conv_cell_sphere_subdivide":     cfg.conv_cell_sphere_subdivide,
         "ho_L":            cfg.ho_L,
         "loaded_from":     cfg.load_nodes or None,
     }
@@ -453,6 +459,12 @@ def run(cfg: CompareConfig) -> Path:
             conv_cell_parity=cfg.conv_cell_parity,
             conv_cell_boundary_margin_frac=cfg.conv_cell_boundary_margin_frac,
             conv_cell_use_rbf_poisson=cfg.conv_cell_use_rbf_poisson,
+            conv_cell_domain_shape=cfg.conv_cell_domain_shape,
+            conv_cell_sphere_radius=(
+                cfg.conv_cell_sphere_radius
+                if cfg.conv_cell_sphere_radius > 0.0 else None
+            ),
+            conv_cell_sphere_subdivide=cfg.conv_cell_sphere_subdivide,
             v_source=cfg.rbf_v_source,
             gaussian_params_file=(cfg.potential_params_file
                                   if cfg.rbf_v_source == "gaussian_direct"
@@ -815,6 +827,13 @@ def parse_args() -> CompareConfig:
                         "默认 0.06 = d_min_frac，薄壳；设 0 关闭 boundary 划分")
     p.add_argument("--conv-cell-use-legacy-poisson", action="store_true",
                    help="用用户原版周期拒绝采样而不是 rbf.poisson_disc_nodes")
+    p.add_argument("--conv-cell-domain-shape", type=str,
+                   choices=["cube", "sphere"], default="cube",
+                   help="conv_cell 的体域形状：cube=平铺立方体(默认)，sphere=平铺球形体域")
+    p.add_argument("--conv-cell-sphere-radius", type=float, default=0.0,
+                   help="conv_cell sphere 模式球半径(Bohr)；<=0 自动取 bbox 内切球半径")
+    p.add_argument("--conv-cell-sphere-subdivide", type=int, default=3,
+                   help="conv_cell sphere 边界的 icosphere 细分级数")
 
     # 节点质量度量
     p.add_argument("--quality-probe-method", type=str,
@@ -879,6 +898,9 @@ def parse_args() -> CompareConfig:
         conv_cell_parity=(not a.conv_cell_no_parity),
         conv_cell_boundary_margin_frac=a.conv_cell_boundary_margin_frac,
         conv_cell_use_rbf_poisson=(not a.conv_cell_use_legacy_poisson),
+        conv_cell_domain_shape=a.conv_cell_domain_shape,
+        conv_cell_sphere_radius=a.conv_cell_sphere_radius,
+        conv_cell_sphere_subdivide=a.conv_cell_sphere_subdivide,
         quality_probe_method=a.quality_probe_method,
         quality_probe_n=a.quality_probe_n,
         power_steps=a.power_steps,
