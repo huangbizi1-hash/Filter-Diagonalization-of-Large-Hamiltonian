@@ -119,7 +119,8 @@ CONFIG: Dict[str, Any] = {
     "conv_cell_n_random":             120,
     "conv_cell_seed":                 42,
     "conv_cell_parity":               True,
-    "conv_cell_boundary_margin_frac": 0.5,
+    # 面附近多近算 boundary：薄壳（≈1·d_min）才合理；= d_min_frac 是好默认
+    "conv_cell_boundary_margin_frac": 0.06,
     "conv_cell_use_rbf_poisson":      True,
     # 节点质量检测（运行时计算 q, h, ρ 并打印 / 写 JSON）：
     "quality_probe_method":           "uniform",

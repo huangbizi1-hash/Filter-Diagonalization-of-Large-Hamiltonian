@@ -81,7 +81,9 @@ class CompareConfig:
     conv_cell_n_random: int = 120           # 每个晶胞 Poisson-like 目标点数
     conv_cell_seed: int = 42
     conv_cell_parity: bool = True           # 是否加 1-r 反演对偶点
-    conv_cell_boundary_margin_frac: float = 0.5  # bbox 面附近多近算 boundary
+    # 面附近多近算 boundary：薄壳（≈1·d_min）才合理；以前 0.5 太大，会让中心
+    # 立方只剩 ~36% 体积，视觉上像没铺满。默认 = d_min_frac。
+    conv_cell_boundary_margin_frac: float = 0.06
     conv_cell_use_rbf_poisson: bool = True  # True=rbf.poisson_disc_nodes, False=周期拒绝采样
 
     # ── 节点质量度量 ───────────────────────────────────────────────────────
@@ -784,8 +786,9 @@ def parse_args() -> CompareConfig:
                    help="conv_cell 随机种子")
     p.add_argument("--conv-cell-no-parity", action="store_true",
                    help="不加 1-r 反演对偶点")
-    p.add_argument("--conv-cell-boundary-margin-frac", type=float, default=0.5,
-                   help="距 bbox 面小于 margin*a 的节点判为 boundary")
+    p.add_argument("--conv-cell-boundary-margin-frac", type=float, default=0.06,
+                   help="距 bbox 面小于 margin*a 的节点判为 boundary；"
+                        "默认 0.06 = d_min_frac，薄壳；设 0 关闭 boundary 划分")
     p.add_argument("--conv-cell-use-legacy-poisson", action="store_true",
                    help="用用户原版周期拒绝采样而不是 rbf.poisson_disc_nodes")
 

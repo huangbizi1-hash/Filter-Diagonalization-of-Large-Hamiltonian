@@ -690,7 +690,8 @@ def generate_conv_cell_nodes(
     atom_frac: Optional[Array] = None,
     level3_base_frac: Optional[Array] = None,
     use_rbf_poisson: bool = True,
-    boundary_margin_frac: float = 0.5,
+    boundary_margin_frac: float = 0.06,
+    verbose: bool = True,
 ) -> Tuple[Array, Dict[str, Array], Dict[str, int]]:
     """
     Hybrid node generator on a conventional cubic cell (zincblende by default),
@@ -900,6 +901,29 @@ def generate_conv_cell_nodes(
         "parity":   np.where(roles == 3)[0].astype(np.int64),
     }
     stats = {**cell_stats, "tiled_total": int(len(nodes))}
+
+    if verbose:
+        tile_range = (nmax - nmin + 1).tolist()
+        a_bbox_min = nodes.min(axis=0)
+        a_bbox_max = nodes.max(axis=0)
+        i_bbox_min = (nodes[interior_idx].min(axis=0)
+                      if len(interior_idx) else np.full(3, np.nan))
+        i_bbox_max = (nodes[interior_idx].max(axis=0)
+                      if len(interior_idx) else np.full(3, np.nan))
+        print(f"[conv_cell] a={a:.4f}  bbox={bbox_min.tolist()} → {bbox_max.tolist()}")
+        print(f"[conv_cell]   cell template: {cell_stats['cell_after_filter']} nodes "
+              f"(skeleton={cell_stats['cell_skeleton']}, random={cell_stats['cell_random']}, "
+              f"parity={cell_stats['cell_accepted_parity']})")
+        print(f"[conv_cell]   tile shifts: {tile_range[0]}×{tile_range[1]}×{tile_range[2]} "
+              f"→ {len(nodes)} tiled nodes")
+        print(f"[conv_cell]   all-node bbox     : {np.round(a_bbox_min, 3).tolist()} → "
+              f"{np.round(a_bbox_max, 3).tolist()}")
+        print(f"[conv_cell]   margin={margin:.3f} Bohr  (frac={boundary_margin_frac})")
+        print(f"[conv_cell]   interior / boundary = "
+              f"{len(interior_idx)} / {len(boundary_idx)}")
+        if len(interior_idx):
+            print(f"[conv_cell]   interior bbox     : {np.round(i_bbox_min, 3).tolist()} → "
+                  f"{np.round(i_bbox_max, 3).tolist()}")
     return nodes, groups, stats
 
 
@@ -1049,7 +1073,7 @@ def build_qd_problem(
     conv_cell_n_random: int = 120,
     conv_cell_seed: int = 42,
     conv_cell_parity: bool = True,
-    conv_cell_boundary_margin_frac: float = 0.5,
+    conv_cell_boundary_margin_frac: float = 0.06,
     conv_cell_use_rbf_poisson: bool = True,
 ) -> RBFProblem:
     """
