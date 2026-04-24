@@ -691,6 +691,9 @@ def generate_conv_cell_nodes(
     level3_base_frac: Optional[Array] = None,
     use_rbf_poisson: bool = True,
     boundary_margin_frac: float = 0.06,
+    domain_shape: str = "cube",
+    sphere_radius: Optional[float] = None,
+    sphere_subdivide: int = 3,
     verbose: bool = True,
 ) -> Tuple[Array, Dict[str, Array], Dict[str, Any]]:
     """
@@ -721,9 +724,16 @@ def generate_conv_cell_nodes(
     tiled by integer shifts `(nx, ny, nz) · a` to cover [bbox_min, bbox_max).
 
     Interior / boundary assignment on the tiled set:
-        - a node within `boundary_margin_frac * a` of any face of the bbox is
-          flagged as boundary (Dirichlet)
-        - everything else is interior
+        domain_shape='cube' (default):
+            - a node within `boundary_margin_frac * a` of any face of the bbox
+              is flagged as boundary (Dirichlet)
+            - everything else is interior
+        domain_shape='sphere':
+            - keep only tiled template points inside a sphere
+            - add explicit spherical-surface boundary nodes from an icosphere
+              Poisson-disc boundary set
+            - all kept template points are interior, sphere-surface nodes are
+              boundary
 
     Returns
     -------
@@ -888,16 +898,65 @@ def generate_conv_cell_nodes(
     nodes = nodes[idx_u]
     roles = roles[idx_u]
 
-    # Interior / boundary: mark nodes within `boundary_margin_frac * a` of any
-    # bbox face as boundary.
-    margin = boundary_margin_frac * a
-    near_face = (
-        (nodes[:, 0] < bbox_min[0] + margin) | (nodes[:, 0] > bbox_max[0] - margin) |
-        (nodes[:, 1] < bbox_min[1] + margin) | (nodes[:, 1] > bbox_max[1] - margin) |
-        (nodes[:, 2] < bbox_min[2] + margin) | (nodes[:, 2] > bbox_max[2] - margin)
-    )
-    interior_idx = np.where(~near_face)[0].astype(np.int64)
-    boundary_idx = np.where(near_face)[0].astype(np.int64)
+    if domain_shape not in ("cube", "sphere"):
+        raise ValueError(
+            f"domain_shape must be 'cube' or 'sphere', got {domain_shape!r}")
+
+    if domain_shape == "cube":
+        # Interior / boundary: mark nodes within `boundary_margin_frac * a` of
+        # any bbox face as boundary.
+        margin = boundary_margin_frac * a
+        near_face = (
+            (nodes[:, 0] < bbox_min[0] + margin) | (nodes[:, 0] > bbox_max[0] - margin) |
+            (nodes[:, 1] < bbox_min[1] + margin) | (nodes[:, 1] > bbox_max[1] - margin) |
+            (nodes[:, 2] < bbox_min[2] + margin) | (nodes[:, 2] > bbox_max[2] - margin)
+        )
+        interior_idx = np.where(~near_face)[0].astype(np.int64)
+        boundary_idx = np.where(near_face)[0].astype(np.int64)
+        sphere_center = None
+        sphere_radius_eff = None
+    else:
+        # Sphere mode: keep tiled template points inside the sphere and add
+        # explicit boundary nodes on the sphere surface.
+        sphere_center = 0.5 * (bbox_min + bbox_max)
+        if sphere_radius is None:
+            sphere_radius_eff = 0.5 * float(np.min(bbox_max - bbox_min))
+        else:
+            sphere_radius_eff = float(sphere_radius)
+        if sphere_radius_eff <= 0.0:
+            raise ValueError(
+                f"sphere_radius must be > 0, got {sphere_radius_eff}")
+
+        r = np.linalg.norm(nodes - sphere_center[None, :], axis=1)
+        inside = r < sphere_radius_eff
+
+        nodes_in = nodes[inside]
+        roles_in = roles[inside]
+
+        vert_s, smp_s = _make_icosphere(sphere_radius_eff, sphere_subdivide)
+        vert_s = vert_s + sphere_center[None, :]
+        spacing_surf = max(d_min_frac * a, 1e-6)
+        surf_nodes_all, surf_groups, _ = poisson_disc_nodes(spacing_surf, (vert_s, smp_s))
+        surf_boundary = surf_nodes_all[surf_groups["boundary"]]
+
+        # Keep only boundary points to avoid adding volume fill from the sphere
+        # Poisson solve; boundary points are on the triangulated surface.
+        if len(nodes_in):
+            nodes = np.vstack([nodes_in, surf_boundary])
+        else:
+            nodes = surf_boundary.copy()
+        roles = np.concatenate([roles_in, -np.ones(len(surf_boundary), dtype=np.int64)])
+
+        nodes_q = np.round(nodes / 1e-8).astype(np.int64)
+        _, idx_u2 = np.unique(nodes_q, axis=0, return_index=True)
+        idx_u2 = np.sort(idx_u2)
+        nodes = nodes[idx_u2]
+        roles = roles[idx_u2]
+
+        is_surf = roles < 0
+        boundary_idx = np.where(is_surf)[0].astype(np.int64)
+        interior_idx = np.where(~is_surf)[0].astype(np.int64)
+        margin = 0.0
 
     groups: Dict[str, Array] = {
         "interior": interior_idx,
@@ -907,7 +966,12 @@ def generate_conv_cell_nodes(
         "random":   np.where(roles == 2)[0].astype(np.int64),
         "parity":   np.where(roles == 3)[0].astype(np.int64),
     }
-    stats = {**cell_stats, "tiled_total": int(len(nodes))}
+    stats = {
+        **cell_stats,
+        "tiled_total": int(len(nodes)),
+        "domain_shape": domain_shape,
+        "sphere_radius": (float(sphere_radius_eff) if sphere_radius_eff is not None else None),
+    }
 
     if verbose:
         tile_range = (nmax - nmin + 1).tolist()
@@ -925,7 +989,12 @@ def generate_conv_cell_nodes(
               f"→ {len(nodes)} tiled nodes")
         print(f"[conv_cell]   all-node bbox     : {np.round(a_bbox_min, 3).tolist()} → "
               f"{np.round(a_bbox_max, 3).tolist()}")
-        print(f"[conv_cell]   margin={margin:.3f} Bohr  (frac={boundary_margin_frac})")
+        if domain_shape == "cube":
+            print(f"[conv_cell]   margin={margin:.3f} Bohr  (frac={boundary_margin_frac})")
+        else:
+            print(f"[conv_cell]   sphere center      : {np.round(sphere_center, 3).tolist()}")
+            print(f"[conv_cell]   sphere radius      : {sphere_radius_eff:.3f} Bohr")
+            print(f"[conv_cell]   sphere subdivide   : {sphere_subdivide}")
         print(f"[conv_cell]   interior / boundary = "
               f"{len(interior_idx)} / {len(boundary_idx)}")
         if len(interior_idx):
@@ -1082,6 +1151,9 @@ def build_qd_problem(
     conv_cell_parity: bool = True,
     conv_cell_boundary_margin_frac: float = 0.06,
     conv_cell_use_rbf_poisson: bool = True,
+    conv_cell_domain_shape: str = "cube",
+    conv_cell_sphere_radius: Optional[float] = None,
+    conv_cell_sphere_subdivide: int = 3,
     # ── V_nodes source ──
     # "grid_interp"     : linear-interpolate V from the cube-file grid to the
     #                     node positions (legacy, has interp error)
@@ -1146,6 +1218,10 @@ def build_qd_problem(
                                      bbox face are flagged boundary (conv_cell)
     conv_cell_use_rbf_poisson: use rbf's poisson_disc_nodes (default) vs.
                                periodic rejection sampler
+    conv_cell_domain_shape   : 'cube' (default) | 'sphere' (conv_cell domain)
+    conv_cell_sphere_radius  : sphere radius (Bohr) when conv_cell_domain_shape='sphere';
+                               None means 0.5*min(bbox side lengths)
+    conv_cell_sphere_subdivide : icosphere subdivision for spherical boundary
     """
     from scipy.interpolate import RegularGridInterpolator
 
@@ -1208,6 +1284,9 @@ def build_qd_problem(
             include_parity=conv_cell_parity,
             boundary_margin_frac=conv_cell_boundary_margin_frac,
             use_rbf_poisson=conv_cell_use_rbf_poisson,
+            domain_shape=conv_cell_domain_shape,
+            sphere_radius=conv_cell_sphere_radius,
+            sphere_subdivide=conv_cell_sphere_subdivide,
         )
         groups["conv_cell_template_nodes_frac"] = _cell_stats["cell_template_nodes_frac"]
         groups["conv_cell_template_nodes_cart"] = _cell_stats["cell_template_nodes_cart"]
