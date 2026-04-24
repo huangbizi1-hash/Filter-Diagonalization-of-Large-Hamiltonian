@@ -126,6 +126,9 @@ CONFIG: Dict[str, Any] = {
     "conv_cell_n_random":             120,
     "conv_cell_seed":                 42,
     "conv_cell_parity":               True,
+    "conv_cell_template_mode":        "hybrid",  # "hybrid" | "fcc_refined"
+    "conv_cell_fcc_scale_factor":     8,
+    "conv_cell_fcc_origin_frac":      [0.0, 0.0, 0.0],
     # 面附近多近算 boundary：薄壳（≈1·d_min）才合理；= d_min_frac 是好默认
     "conv_cell_boundary_margin_frac": 0.06,
     "conv_cell_use_rbf_poisson":      True,
@@ -137,6 +140,9 @@ CONFIG: Dict[str, Any] = {
     "conv_cell_adaptive_lambda_grad":          0.0,
     "conv_cell_adaptive_lambda_lap":           0.0,
     "conv_cell_adaptive_candidate_multiplier": 8.0,
+    "include_interior":               True,
+    "include_boundary":               True,
+    "node_min_dist":                  0.0,
     # 节点质量检测（运行时计算 q, h, ρ 并打印 / 写 JSON）：
     "quality_probe_method":           "uniform",
     "quality_probe_n":                0,
@@ -332,6 +338,10 @@ def run(cfg: Dict[str, Any]) -> None:
         conv_cell_n_random             = cfg.get("conv_cell_n_random", 120),
         conv_cell_seed                 = cfg.get("conv_cell_seed", 42),
         conv_cell_parity               = cfg.get("conv_cell_parity", True),
+        conv_cell_template_mode        = cfg.get("conv_cell_template_mode", "hybrid"),
+        conv_cell_fcc_scale_factor     = cfg.get("conv_cell_fcc_scale_factor", 8),
+        conv_cell_fcc_origin_frac      = np.asarray(
+            cfg.get("conv_cell_fcc_origin_frac", [0.0, 0.0, 0.0]), dtype=np.float64),
         conv_cell_boundary_margin_frac = cfg.get("conv_cell_boundary_margin_frac", 0.5),
         conv_cell_use_rbf_poisson      = cfg.get("conv_cell_use_rbf_poisson", True),
         conv_cell_domain_shape         = cfg.get("conv_cell_domain_shape", "cube"),
@@ -346,6 +356,9 @@ def run(cfg: Dict[str, Any]) -> None:
         conv_cell_adaptive_lambda_lap  = cfg.get("conv_cell_adaptive_lambda_lap", 0.0),
         conv_cell_adaptive_candidate_multiplier = cfg.get(
             "conv_cell_adaptive_candidate_multiplier", 8.0),
+        include_interior               = cfg.get("include_interior", True),
+        include_boundary               = cfg.get("include_boundary", True),
+        node_min_dist                  = cfg.get("node_min_dist", 0.0),
         v_source                       = pot.get("v_source", "grid_interp"),
         gaussian_params_file           = (pot.get("params_file")
                                            if pot.get("v_source") == "gaussian_direct"
