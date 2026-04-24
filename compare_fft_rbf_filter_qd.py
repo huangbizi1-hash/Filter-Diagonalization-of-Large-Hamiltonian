@@ -105,8 +105,8 @@ class CompareConfig:
     quality_probe_n: int = 0                # 0 = 自动（~32× n_nodes）
 
     # ── 节点持久化 ─────────────────────────────────────────────────────────
-    save_nodes: str = ""   # 非空则把节点单独写入此 JSON（无需后缀，未填则自动命名）
-    load_nodes: str = ""   # 非空则从此 JSON 加载节点，跳过节点生成；节点上的
+    save_nodes: str = ""   # 非空则把节点单独写入 NumPy 数据文件（.npz）
+    load_nodes: str = ""   # 非空则从已存节点文件（.npz/.json）加载节点，跳过节点生成；节点上的
                            #   laplacian / V_nodes 仍然会按 CLI 的 --rbf-phi / eps /
                            #   order / stencil-size / v-clip 等参数重新计算
 
@@ -248,37 +248,70 @@ def _build_node_storage(
     }
 
 
-def _save_conv_cell_template_json(problem: RBFProblem, nodes_json_path: Path) -> Path | None:
+def _save_conv_cell_template_npz(problem: RBFProblem, nodes_data_path: Path) -> Path | None:
     nodes_frac = problem.groups.get("conv_cell_template_nodes_frac")
     nodes_cart = problem.groups.get("conv_cell_template_nodes_cart")
     roles = problem.groups.get("conv_cell_template_roles")
     if nodes_frac is None or nodes_cart is None or roles is None:
         return None
 
-    out = nodes_json_path.with_name(nodes_json_path.stem + "_conv_cell_template.json")
-    payload = {
-        "nodes_frac": np.asarray(nodes_frac, dtype=float).tolist(),
-        "nodes_cart": np.asarray(nodes_cart, dtype=float).tolist(),
-        "roles": np.asarray(roles, dtype=int).tolist(),
-        "role_legend": {
-            "0": "atoms",
-            "1": "level3",
-            "2": "random",
-            "3": "parity",
-            "4": "fcc",
-        },
-    }
+    nodes_frac_arr = np.asarray(nodes_frac, dtype=np.float64)
+    nodes_cart_arr = np.asarray(nodes_cart, dtype=np.float64)
+    roles_arr = np.asarray(roles, dtype=np.int64)
+    atoms_cart_arr = nodes_cart_arr[roles_arr == 0]
+    out = nodes_data_path.with_name(nodes_data_path.stem + "_conv_cell_template.npz")
     out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    np.savez_compressed(
+        out,
+        atom_coordinates_cart=atoms_cart_arr,
+        node_coordinates_cart=nodes_cart_arr,
+        node_coordinates_frac=nodes_frac_arr,
+        node_roles=roles_arr,
+    )
     return out
 
 
-def _save_nodes_json(node_storage: dict[str, Any], path: Path) -> Path:
+def _save_nodes_npz(node_storage: dict[str, Any], path: Path) -> Path:
+    coords_all = np.asarray(node_storage["coordinates_all"], dtype=np.float64)
+    coords_interior = np.asarray(node_storage["coordinates_interior"], dtype=np.float64)
+    groups = node_storage.get("groups", {})
+    interior_idx = np.asarray(groups.get("interior", []), dtype=np.int64)
+    boundary_idx = np.asarray(groups.get("boundary", []), dtype=np.int64)
+    coords_boundary = (
+        coords_all[boundary_idx] if boundary_idx.size > 0 else np.empty((0, 3), dtype=np.float64)
+    )
+    metadata = {
+        "total_nodes": int(node_storage.get("total_nodes", coords_all.shape[0])),
+        "interior_nodes": int(node_storage.get("interior_nodes", coords_interior.shape[0])),
+        "group_counts": node_storage.get("group_counts", {}),
+        "metadata": node_storage.get("metadata", {}),
+        "quality": node_storage.get("quality", {}),
+        "source": node_storage.get("source", {}),
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(_to_jsonable(node_storage), f, ensure_ascii=False, indent=2)
+    np.savez_compressed(
+        path,
+        coordinates_all=coords_all,
+        coordinates_interior=coords_interior,
+        coordinates_boundary=coords_boundary,
+        interior_idx=interior_idx,
+        boundary_idx=boundary_idx,
+        metadata_json=np.array(json.dumps(_to_jsonable(metadata), ensure_ascii=False)),
+    )
     return path
+
+
+def _node_summary_for_result(node_storage: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "total_nodes": int(node_storage.get("total_nodes", 0)),
+        "interior_nodes": int(node_storage.get("interior_nodes", 0)),
+        "dimension": node_storage.get("dimension"),
+        "bbox_min": node_storage.get("bbox_min", []),
+        "bbox_max": node_storage.get("bbox_max", []),
+        "group_counts": node_storage.get("group_counts", {}),
+        "quality": node_storage.get("quality", {}),
+        "source": node_storage.get("source", {}),
+    }
 
 
 def _fft_grid_points(pot: PotentialGrid | None, N: int, ho_L: float) -> np.ndarray:
@@ -299,9 +332,9 @@ def _fft_grid_points(pot: PotentialGrid | None, N: int, ho_L: float) -> np.ndarr
     return np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
 
 
-def _build_problem_from_nodes_json(path: Path, cfg: "CompareConfig",
+def _build_problem_from_nodes_file(path: Path, cfg: "CompareConfig",
                                     cube_path: Path) -> tuple[RBFProblem, dict[str, Any]]:
-    """Reconstruct a RBFProblem from a saved nodes JSON.
+    """Reconstruct a RBFProblem from a saved nodes file (.npz/.json).
 
     Node positions and group assignments are loaded from the file as-is.
     The RBF-FD Laplacian and V_nodes are recomputed using the **current** CLI
@@ -310,15 +343,32 @@ def _build_problem_from_nodes_json(path: Path, cfg: "CompareConfig",
     """
     from rbf.pde.fd import weight_matrix
 
-    with path.open("r", encoding="utf-8") as f:
-        saved = json.load(f)
+    if path.suffix.lower() == ".npz":
+        with np.load(path, allow_pickle=False) as data:
+            nodes = np.asarray(data["coordinates_all"], dtype=np.float64)
+            interior_idx = np.asarray(data["interior_idx"], dtype=np.int64)
+            boundary_idx = np.asarray(data["boundary_idx"], dtype=np.int64)
+            groups = {
+                "interior": interior_idx,
+                "boundary": boundary_idx,
+            }
+            saved = {
+                "coordinates_all": nodes.tolist(),
+                "groups": {
+                    "interior": interior_idx.tolist(),
+                    "boundary": boundary_idx.tolist(),
+                },
+            }
+    else:
+        with path.open("r", encoding="utf-8") as f:
+            saved = json.load(f)
 
-    nodes = np.asarray(saved["coordinates_all"], dtype=float)
-    groups = {str(k): np.asarray(v, dtype=int) for k, v in saved["groups"].items()}
-    if "interior" not in groups:
-        raise ValueError(
-            f"saved nodes JSON {path} missing 'interior' group")
-    interior_idx = groups["interior"]
+        nodes = np.asarray(saved["coordinates_all"], dtype=float)
+        groups = {str(k): np.asarray(v, dtype=int) for k, v in saved["groups"].items()}
+        if "interior" not in groups:
+            raise ValueError(
+                f"saved nodes file {path} missing 'interior' group")
+        interior_idx = groups["interior"]
 
     # V_nodes: honour cfg.rbf_v_source (same semantics as build_qd_problem)
     if cfg.rbf_v_source == "gaussian_direct":
@@ -480,13 +530,13 @@ def run(cfg: CompareConfig) -> Path:
     }
 
     if cfg.load_nodes:
-        # 从已存节点 JSON 重建 RBFProblem（Laplacian + V 按当前 CLI 重新算）
+        # 从已存节点文件重建 RBFProblem（Laplacian + V 按当前 CLI 重新算）
         if cfg.system != "qd" or qd_cube is None:
             raise ValueError("--load-nodes 目前只支持 --system qd（需要 cube 文件做 V 插值）")
         load_path = Path(cfg.load_nodes)
         if not load_path.exists():
             raise FileNotFoundError(f"--load-nodes 指定的文件不存在: {load_path}")
-        problem, _saved_meta = _build_problem_from_nodes_json(load_path, cfg, qd_cube)
+        problem, _saved_meta = _build_problem_from_nodes_file(load_path, cfg, qd_cube)
         provenance["loaded_from"] = str(load_path)
     elif cfg.system == "qd":
         assert qd_cube is not None
@@ -566,8 +616,8 @@ def run(cfg: CompareConfig) -> Path:
               f"method={q_info.get('probe_method', '')})")
     timings["build_rbf_operator"] = time.perf_counter() - t3
 
-    # 按需单独落盘节点 JSON（便于后续 --load-nodes 复用，不依赖结果 JSON）
-    nodes_json_path: Path | None = None
+    # 按需单独落盘节点数据（便于后续 --load-nodes 复用，不依赖结果 JSON）
+    nodes_data_path: Path | None = None
     ts_nodes = datetime.now().strftime("%Y%m%d_%H%M%S")
     if cfg.save_nodes:
         # 用户给了路径——如果是目录则自动命名，否则当作完整文件路径
@@ -576,13 +626,13 @@ def run(cfg: CompareConfig) -> Path:
             p_user.mkdir(parents=True, exist_ok=True)
             tag = (f"qd_R{cfg.qd_radius}" if cfg.system == "qd"
                    else f"ho_N{cfg.ho_N}")
-            nodes_json_path = p_user / f"nodes_{tag}_{cfg.rbf_node_method}_{ts_nodes}.json"
+            nodes_data_path = p_user / f"nodes_{tag}_{cfg.rbf_node_method}_{ts_nodes}.npz"
         else:
-            nodes_json_path = p_user
-        _save_nodes_json(node_storage, nodes_json_path)
-        print(f"节点 JSON 已保存: {nodes_json_path}")
+            nodes_data_path = p_user if p_user.suffix.lower() == ".npz" else p_user.with_suffix(".npz")
+        _save_nodes_npz(node_storage, nodes_data_path)
+        print(f"节点数据文件已保存: {nodes_data_path}")
         if cfg.rbf_node_method == "conv_cell":
-            template_path = _save_conv_cell_template_json(problem, nodes_json_path)
+            template_path = _save_conv_cell_template_npz(problem, nodes_data_path)
             if template_path is not None:
                 print(f"原胞模板节点已保存: {template_path}")
 
@@ -778,9 +828,9 @@ def run(cfg: CompareConfig) -> Path:
             "n_interior_rbf": n_interior,
             "qd_cube": str(qd_cube) if qd_cube is not None else None,
         },
-        # 结果 JSON 中保留完整 node_storage；nodes_file 指向独立落盘的副本（如有）
-        "rbf_nodes": node_storage,
-        "rbf_nodes_file": str(nodes_json_path) if nodes_json_path else None,
+        # 结果 JSON 仅保留节点元数据；完整坐标在独立 .npz 文件中（如有）
+        "rbf_nodes": _node_summary_for_result(node_storage),
+        "rbf_nodes_file": str(nodes_data_path) if nodes_data_path else None,
         "filter": {
             "EL": cfg.el,
             "NC_input": cfg.nc,
@@ -947,11 +997,11 @@ def parse_args() -> CompareConfig:
     # 节点持久化
     p.add_argument(
         "--save-nodes", type=str, default="",
-        help="把节点单独存成 JSON（可以是目录或完整文件路径）；"
-             "目录时会自动命名为 nodes_<tag>_<method>_<ts>.json")
+        help="把节点单独存成 NumPy 数据文件 .npz（可以是目录或完整文件路径）；"
+             "目录时会自动命名为 nodes_<tag>_<method>_<ts>.npz")
     p.add_argument(
         "--load-nodes", type=str, default="",
-        help="从已存的节点 JSON 加载（跳过节点生成，Laplacian/V 仍按当前 CLI 重新算）")
+        help="从已存节点文件加载（.npz/.json；跳过节点生成，Laplacian/V 仍按当前 CLI 重新算）")
 
     p.add_argument("--power-steps", type=int, default=30)
     p.add_argument("--fft-kinetic-cut", type=float, default=30.0)
