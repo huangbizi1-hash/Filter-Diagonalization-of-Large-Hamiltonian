@@ -171,9 +171,59 @@ class GaussianPotentialBuilder:
                 V_atom[mask] += A * np.exp(-alpha * r[mask]**2)
             
             V += V_atom
-        
+
         return x, y, z, V
-    
+
+    def evaluate_at_points(self, points: np.ndarray,
+                            batch_size: int = 100_000) -> np.ndarray:
+        """
+        直接在任意 3D 点上求值 Gaussian 展开势能 V(r) = Σ_atom Σ_g A·exp(-α|r-r_atom|²)
+        与 build_potential 使用完全相同的公式和截断半径 r_cut，只是坐标来自用户，
+        避免"先在网格上采样、再线性插值回散点"的中间误差。
+
+        Parameters
+        ----------
+        points     : (N, 3) array，Bohr（与 cube 文件单位一致）
+        batch_size : 一次处理多少个点（内存权衡；大点集分批，减小距离矩阵峰值）
+
+        Returns
+        -------
+        V : (N,) 势能 (Hartree)
+        """
+        points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        N = points.shape[0]
+        V = np.zeros(N, dtype=np.float64)
+        r_cut2 = self.r_cut ** 2
+
+        # Collect Gaussian parameters per atom once
+        atom_work: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        for atom, atom_type in zip(self.atoms, self.atom_types):
+            if atom_type == 'Unknown':
+                continue
+            p = self.params['atoms'][atom_type]
+            pos = np.asarray(atom['position'], dtype=np.float64)
+            A   = np.asarray(p['amplitudes'], dtype=np.float64)
+            alp = np.asarray(p['exponents'],  dtype=np.float64)
+            atom_work.append((pos, A, alp))
+
+        # Process points in batches to cap peak memory
+        for start in range(0, N, batch_size):
+            stop = min(start + batch_size, N)
+            pts = points[start:stop]            # (M, 3)
+            v_chunk = np.zeros(stop - start, dtype=np.float64)
+            for pos, A, alp in atom_work:
+                d2 = np.sum((pts - pos) ** 2, axis=1)   # (M,)
+                mask = d2 <= r_cut2
+                if not np.any(mask):
+                    continue
+                d2m = d2[mask]                          # (k,)
+                # V_atom = Σ_g A_g · exp(-α_g · r²)
+                # (k, n_g): exp(-α·d²) for each gaussian
+                expo = np.exp(-alp[None, :] * d2m[:, None])   # (k, n_g)
+                v_chunk[mask] += expo @ A                     # (k,)
+            V[start:stop] = v_chunk
+        return V
+
     def get_grid_spacing(self, N: int, box_size: float = 40.0) -> float:
         """获取网格步长"""
         spatial_extent = self.x_max - self.x_min
