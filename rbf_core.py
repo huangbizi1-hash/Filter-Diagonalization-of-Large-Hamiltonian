@@ -416,11 +416,30 @@ def _make_icosphere(R: float, n_subdivide: int = 3) -> Tuple[Array, Array]:
 
 
 def generate_sphere_nodes(
-    spacing: float, R: float = 20.0, n_subdivide: int = 3
+    spacing: float, R: float = 20.0, n_subdivide: int = 3,
+    min_dist: float = 0.0,
 ):
     """Poisson disc nodes inside a sphere of radius R."""
     vert, smp = _make_icosphere(R, n_subdivide)
     nodes, groups, _ = poisson_disc_nodes(spacing, (vert, smp))
+    if min_dist > 0.0 and len(nodes) > 1:
+        from scipy.spatial import cKDTree
+        keep = []
+        tree = None
+        for i in range(len(nodes)):
+            x = nodes[i]
+            if tree is not None and tree.query_ball_point(x, min_dist):
+                continue
+            keep.append(i)
+            tree = cKDTree(nodes[np.array(keep, dtype=np.int64)])
+        keep = np.array(keep, dtype=np.int64)
+        remap = -np.ones(len(nodes), dtype=np.int64)
+        remap[keep] = np.arange(len(keep), dtype=np.int64)
+        groups = {
+            k: remap[np.asarray(v, dtype=np.int64)][remap[np.asarray(v, dtype=np.int64)] >= 0]
+            for k, v in groups.items()
+        }
+        nodes = nodes[keep]
     return nodes, groups
 
 
@@ -611,6 +630,25 @@ _FCC_OFFSETS_FRAC: Array = np.array(
     dtype=np.float64,
 )
 
+
+def _generate_shifted_refined_fcc_frac(
+    scale_factor: int,
+    origin_frac: Optional[Array] = None,
+) -> Array:
+    """Deterministic refined FCC nodes in one conventional cell, in [0,1)^3."""
+    if int(scale_factor) < 1:
+        raise ValueError(f"scale_factor must be >= 1, got {scale_factor}")
+    sf = int(scale_factor)
+    r0 = np.zeros(3, dtype=np.float64) if origin_frac is None else np.asarray(origin_frac, dtype=np.float64).reshape(3)
+    pts: list[Array] = []
+    for i in range(sf):
+        for j in range(sf):
+            for k in range(sf):
+                cell = np.array([i, j, k], dtype=np.float64) / sf
+                for off in _FCC_OFFSETS_FRAC:
+                    pts.append(r0 + cell + off / sf)
+    return _unique_rows_mod1(np.asarray(pts, dtype=np.float64))
+
 # level-3 "FCC high-symmetry" base points: the 8 corners of the sub-cube
 # spanned by fractional coordinates in {1/3, 2/3}.  Each base point is expanded
 # by the 4 FCC cosets → ≤32 cosets per cell (duplicates removed mod 1).
@@ -792,6 +830,9 @@ def generate_conv_cell_nodes(
     n_random_target: int = 120,
     seed: int = 42,
     include_parity: bool = True,
+    template_mode: str = "hybrid",
+    fcc_scale_factor: int = 8,
+    fcc_origin_frac: Optional[Array] = None,
     atom_frac: Optional[Array] = None,
     level3_base_frac: Optional[Array] = None,
     use_rbf_poisson: bool = True,
@@ -806,6 +847,9 @@ def generate_conv_cell_nodes(
     adaptive_lambda_lap: float = 0.0,
     adaptive_candidate_multiplier: float = 8.0,
     adaptive_gaussian_builder: Optional[Any] = None,
+    include_interior: bool = True,
+    include_boundary: bool = True,
+    min_dist_cart: float = 0.0,
     verbose: bool = True,
 ) -> Tuple[Array, Dict[str, Array], Dict[str, Any]]:
     """
@@ -881,125 +925,128 @@ def generate_conv_cell_nodes(
     ])
     level3_frac = _unique_rows_mod1(level3_frac)
 
-    # skeleton = atoms + level-3 (these are all pinned)
-    skeleton_frac = _unique_rows_mod1(np.vstack([atom_frac, level3_frac]))
+    if template_mode not in ("hybrid", "fcc_refined"):
+        raise ValueError(f"template_mode must be 'hybrid' or 'fcc_refined', got {template_mode!r}")
 
-    # ── Poisson-like / adaptive random points in [0,1)^3 ─────────────────────
-    rng = np.random.default_rng(seed)
-    if adaptive_random:
-        if adaptive_gaussian_builder is None:
-            raise ValueError("adaptive_random=True requires adaptive_gaussian_builder")
-        n_grid = int(adaptive_grid_n)
-        cand_frac = _build_uniform_frac_grid(n_grid)
-        cand_cart = cand_frac * a
-        V_cand = np.asarray(adaptive_gaussian_builder.evaluate_at_points(cand_cart),
-                            dtype=np.float64)
-        gnorm, lap_abs = _estimate_grad_laplacian_uniform(V_cand, n_grid, a)
-        denom = 1.0 + float(adaptive_lambda_grad) * gnorm + float(adaptive_lambda_lap) * lap_abs
-        h_w = 1.0 / np.maximum(denom, 1e-12)
-        n_candidates = int(max(1, round(float(adaptive_candidate_multiplier) * n_random_target)))
-        # draw top-weight-biased subset first to reduce KDTree insert loops
-        take = np.argsort(-h_w)[: min(n_candidates, len(h_w))]
-        random_frac = _adaptive_accept_and_filter_periodic(
-            candidates_frac=cand_frac[take],
-            weights_h=h_w[take],
-            d_min_frac=d_min_frac,
-            n_target=n_random_target,
-            rng=rng,
-            pinned_frac=skeleton_frac,
-        )
-    elif use_rbf_poisson:
-        # Use the repo's Poisson-disc sampler on the unit cube [0,a]^3 with
-        # the skeleton pinned.  radius = d_min_frac*a (Cartesian).
-        vert, smp = _make_unit_cube_surface(a)
-        pinned_cart = skeleton_frac * a
-        try:
-            rbf_nodes_cart, _rbf_groups, _ = poisson_disc_nodes(
-                d_min_frac * a, (vert, smp), pinned_nodes=pinned_cart,
-            )
-            # Drop the pinned copies — we already have them in skeleton_frac
-            # (rbf places pinned first in the interior group)
-            n_pin = len(pinned_cart)
-            extra_cart = rbf_nodes_cart[n_pin:]
-            # Drop boundary nodes from the Poisson output — the cube faces'
-            # boundary nodes aren't the user's "random" points
-            # (filter anything within 1e-6*a of a face)
-            face_tol = 1e-6 * a
-            in_interior = np.all(
-                (extra_cart > face_tol) & (extra_cart < a - face_tol), axis=1)
-            extra_cart = extra_cart[in_interior]
-            random_frac = extra_cart / a
-
-            # Optionally truncate / seed-permute to match n_random_target
-            if len(random_frac) > n_random_target:
-                perm = rng.permutation(len(random_frac))[:n_random_target]
-                random_frac = random_frac[perm]
-        except TypeError:
-            # Old rbf without pinned_nodes support — fall back to rejection
-            use_rbf_poisson = False
-
-    if not use_rbf_poisson:
-        # Periodic rejection sampler (user's original algorithm)
-        random_frac, _trials = _poisson_like_periodic(
-            skeleton_frac, n_random_target, d_min_frac,
-            max_trials=max(200_000, 2000 * n_random_target), rng=rng,
-        )
-
-    # ── parity counterparts ──────────────────────────────────────────────────
-    if include_parity and len(random_frac) > 0:
-        parity_frac = _wrap_frac(1.0 - random_frac)
+    if template_mode == "fcc_refined":
+        cell_nodes_frac = _generate_shifted_refined_fcc_frac(
+            scale_factor=fcc_scale_factor, origin_frac=fcc_origin_frac)
+        cell_role_idx = np.full(len(cell_nodes_frac), 4, dtype=np.int64)  # FCC deterministic role
+        cell_stats: Dict[str, Any] = {
+            "cell_skeleton":         0,
+            "cell_random":           0,
+            "cell_accepted_parity":  0,
+            "cell_after_filter":     int(len(cell_nodes_frac)),
+            "cell_template_nodes_frac": cell_nodes_frac.copy(),
+            "cell_template_nodes_cart": (cell_nodes_frac * a).copy(),
+            "cell_template_roles":      cell_role_idx.copy(),
+            "template_mode": "fcc_refined",
+            "fcc_scale_factor": int(fcc_scale_factor),
+        }
     else:
-        parity_frac = np.empty((0, 3), dtype=np.float64)
+        # skeleton = atoms + level-3 (these are all pinned)
+        skeleton_frac = _unique_rows_mod1(np.vstack([atom_frac, level3_frac]))
+
+        # ── Poisson-like / adaptive random points in [0,1)^3 ─────────────────────
+        rng = np.random.default_rng(seed)
+        if adaptive_random:
+            if adaptive_gaussian_builder is None:
+                raise ValueError("adaptive_random=True requires adaptive_gaussian_builder")
+            n_grid = int(adaptive_grid_n)
+            cand_frac = _build_uniform_frac_grid(n_grid)
+            cand_cart = cand_frac * a
+            V_cand = np.asarray(adaptive_gaussian_builder.evaluate_at_points(cand_cart),
+                                dtype=np.float64)
+            gnorm, lap_abs = _estimate_grad_laplacian_uniform(V_cand, n_grid, a)
+            denom = 1.0 + float(adaptive_lambda_grad) * gnorm + float(adaptive_lambda_lap) * lap_abs
+            h_w = 1.0 / np.maximum(denom, 1e-12)
+            n_candidates = int(max(1, round(float(adaptive_candidate_multiplier) * n_random_target)))
+            take = np.argsort(-h_w)[: min(n_candidates, len(h_w))]
+            random_frac = _adaptive_accept_and_filter_periodic(
+                candidates_frac=cand_frac[take],
+                weights_h=h_w[take],
+                d_min_frac=d_min_frac,
+                n_target=n_random_target,
+                rng=rng,
+                pinned_frac=skeleton_frac,
+            )
+        elif use_rbf_poisson:
+            vert, smp = _make_unit_cube_surface(a)
+            pinned_cart = skeleton_frac * a
+            try:
+                rbf_nodes_cart, _rbf_groups, _ = poisson_disc_nodes(
+                    d_min_frac * a, (vert, smp), pinned_nodes=pinned_cart,
+                )
+                n_pin = len(pinned_cart)
+                extra_cart = rbf_nodes_cart[n_pin:]
+                face_tol = 1e-6 * a
+                in_interior = np.all(
+                    (extra_cart > face_tol) & (extra_cart < a - face_tol), axis=1)
+                extra_cart = extra_cart[in_interior]
+                random_frac = extra_cart / a
+                if len(random_frac) > n_random_target:
+                    perm = rng.permutation(len(random_frac))[:n_random_target]
+                    random_frac = random_frac[perm]
+            except TypeError:
+                use_rbf_poisson = False
+
+        if not use_rbf_poisson:
+            random_frac, _trials = _poisson_like_periodic(
+                skeleton_frac, n_random_target, d_min_frac,
+                max_trials=max(200_000, 2000 * n_random_target), rng=rng,
+            )
+
+        # ── parity counterparts ──────────────────────────────────────────────────
+        if include_parity and len(random_frac) > 0:
+            parity_frac = _wrap_frac(1.0 - random_frac)
+        else:
+            parity_frac = np.empty((0, 3), dtype=np.float64)
 
     # ── assemble template with role labels, then greedy d_min filter ─────────
-    parts = [
-        ("atoms",  atom_frac),
-        ("level3", level3_frac),
-        ("random", random_frac),
-        ("parity", parity_frac),
-    ]
-    ordered_frac = np.vstack([p[1] for p in parts if len(p[1])])
-    ordered_frac = _unique_rows_mod1(ordered_frac)
-    # Track roles (by fractional coordinate lookup, using rounding)
-    role_map: Dict[str, Array] = {}
-    for name, arr in parts:
-        role_map[name] = _wrap_frac(arr) if len(arr) else np.empty((0, 3), dtype=np.float64)
+        parts = [
+            ("atoms",  atom_frac),
+            ("level3", level3_frac),
+            ("random", random_frac),
+            ("parity", parity_frac),
+        ]
+        ordered_frac = np.vstack([p[1] for p in parts if len(p[1])])
+        ordered_frac = _unique_rows_mod1(ordered_frac)
+        role_map: Dict[str, Array] = {}
+        for name, arr in parts:
+            role_map[name] = _wrap_frac(arr) if len(arr) else np.empty((0, 3), dtype=np.float64)
 
-    cell_nodes_frac = _greedy_filter_by_dmin_periodic(ordered_frac, d_min_frac)
-    cell_nodes_frac = _unique_rows_mod1(cell_nodes_frac)
+        cell_nodes_frac = _greedy_filter_by_dmin_periodic(ordered_frac, d_min_frac)
+        cell_nodes_frac = _unique_rows_mod1(cell_nodes_frac)
 
-    # For each surviving cell node, record which role set it came from
-    # (first match in priority order atoms > level3 > random > parity)
-    cell_role_idx: list[int] = []
-    role_priority = ["atoms", "level3", "random", "parity"]
-    for node in cell_nodes_frac:
-        assigned = 3  # fallback = parity
-        for ri, rname in enumerate(role_priority):
-            src = role_map[rname]
-            if len(src) == 0:
-                continue
-            if np.any(np.all(np.abs(_periodic_diff(src, node)) < 1e-9, axis=1)):
-                assigned = ri
-                break
-        cell_role_idx.append(assigned)
-    cell_role_idx = np.asarray(cell_role_idx, dtype=np.int64)
+        cell_role_idx = []
+        role_priority = ["atoms", "level3", "random", "parity"]
+        for node in cell_nodes_frac:
+            assigned = 3
+            for ri, rname in enumerate(role_priority):
+                src = role_map[rname]
+                if len(src) and np.any(np.all(np.abs(_periodic_diff(src, node)) < 1e-9, axis=1)):
+                    assigned = ri
+                    break
+            cell_role_idx.append(assigned)
+        cell_role_idx = np.asarray(cell_role_idx, dtype=np.int64)
 
-    cell_stats: Dict[str, Any] = {
-        "cell_skeleton":         int(len(skeleton_frac)),
-        "cell_random":           int(len(random_frac)),
-        "cell_accepted_parity":  int(len(parity_frac)),
-        "cell_after_filter":     int(len(cell_nodes_frac)),
-        "cell_template_nodes_frac": cell_nodes_frac.copy(),
-        "cell_template_nodes_cart": (cell_nodes_frac * a).copy(),
-        "cell_template_roles":      cell_role_idx.copy(),
-    }
+        cell_stats = {
+            "cell_skeleton":         int(len(skeleton_frac)),
+            "cell_random":           int(len(random_frac)),
+            "cell_accepted_parity":  int(len(parity_frac)),
+            "cell_after_filter":     int(len(cell_nodes_frac)),
+            "cell_template_nodes_frac": cell_nodes_frac.copy(),
+            "cell_template_nodes_cart": (cell_nodes_frac * a).copy(),
+            "cell_template_roles":      cell_role_idx.copy(),
+            "template_mode": "hybrid",
+        }
 
     # ── tile the one-cell template to cover [bbox_min, bbox_max) ─────────────
     cell_nodes_cart = cell_nodes_frac * a
     if len(cell_nodes_cart) == 0:
         return (np.empty((0, 3), dtype=np.float64),
                 {k: np.empty(0, dtype=np.int64)
-                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity")},
+                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity", "fcc")},
                 {**cell_stats, "tiled_total": 0})
 
     nmin = np.floor((bbox_min - cell_nodes_cart.max(axis=0)) / a).astype(int) - 1
@@ -1020,7 +1067,7 @@ def generate_conv_cell_nodes(
     if not tiled_nodes:
         return (np.empty((0, 3), dtype=np.float64),
                 {k: np.empty(0, dtype=np.int64)
-                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity")},
+                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity", "fcc")},
                 {**cell_stats, "tiled_total": 0})
 
     nodes = np.vstack(tiled_nodes)
@@ -1099,7 +1146,45 @@ def generate_conv_cell_nodes(
         "level3":   np.where(roles == 1)[0].astype(np.int64),
         "random":   np.where(roles == 2)[0].astype(np.int64),
         "parity":   np.where(roles == 3)[0].astype(np.int64),
+        "fcc":      np.where(roles == 4)[0].astype(np.int64),
     }
+
+    if min_dist_cart > 0.0 and len(nodes) > 1:
+        from scipy.spatial import cKDTree
+        # protect boundary and atom-aligned nodes first
+        protected = np.zeros(len(nodes), dtype=bool)
+        protected[groups["boundary"]] = True
+        protected[groups["atoms"]] = True
+        order_idx = np.concatenate([np.where(protected)[0], np.where(~protected)[0]])
+        keep: list[int] = []
+        tree = None
+        for i in order_idx:
+            p = nodes[i]
+            if tree is not None and tree.query_ball_point(p, min_dist_cart):
+                continue
+            keep.append(int(i))
+            tree = cKDTree(nodes[np.array(keep, dtype=np.int64)])
+        keep = np.array(sorted(keep), dtype=np.int64)
+        remap = -np.ones(len(nodes), dtype=np.int64)
+        remap[keep] = np.arange(len(keep), dtype=np.int64)
+        for k in list(groups.keys()):
+            mapped = remap[groups[k]]
+            groups[k] = mapped[mapped >= 0].astype(np.int64)
+        nodes = nodes[keep]
+
+    if not include_interior or not include_boundary:
+        keep_mask = np.zeros(len(nodes), dtype=bool)
+        if include_interior:
+            keep_mask[groups["interior"]] = True
+        if include_boundary:
+            keep_mask[groups["boundary"]] = True
+        keep = np.where(keep_mask)[0].astype(np.int64)
+        remap = -np.ones(len(nodes), dtype=np.int64)
+        remap[keep] = np.arange(len(keep), dtype=np.int64)
+        for k in list(groups.keys()):
+            mapped = remap[groups[k]]
+            groups[k] = mapped[mapped >= 0].astype(np.int64)
+        nodes = nodes[keep]
     stats = {
         **cell_stats,
         "tiled_total": int(len(nodes)),
@@ -1284,6 +1369,9 @@ def build_qd_problem(
     conv_cell_n_random: int = 120,
     conv_cell_seed: int = 42,
     conv_cell_parity: bool = True,
+    conv_cell_template_mode: str = "hybrid",
+    conv_cell_fcc_scale_factor: int = 8,
+    conv_cell_fcc_origin_frac: Optional[Array] = None,
     conv_cell_boundary_margin_frac: float = 0.06,
     conv_cell_use_rbf_poisson: bool = True,
     conv_cell_domain_shape: str = "cube",
@@ -1294,6 +1382,9 @@ def build_qd_problem(
     conv_cell_adaptive_lambda_grad: float = 0.0,
     conv_cell_adaptive_lambda_lap: float = 0.0,
     conv_cell_adaptive_candidate_multiplier: float = 8.0,
+    include_interior: bool = True,
+    include_boundary: bool = True,
+    node_min_dist: float = 0.0,
     # ── V_nodes source ──
     # "grid_interp"     : linear-interpolate V from the cube-file grid to the
     #                     node positions (legacy, has interp error)
@@ -1393,10 +1484,25 @@ def build_qd_problem(
             "interior": interior_idx,
             "boundary": np.where(on_boundary)[0],
         }
+        if (not include_interior) or (not include_boundary):
+            keep_mask = np.zeros(len(nodes), dtype=bool)
+            if include_interior:
+                keep_mask[groups["interior"]] = True
+            if include_boundary:
+                keep_mask[groups["boundary"]] = True
+            keep = np.where(keep_mask)[0].astype(np.int64)
+            remap = -np.ones(len(nodes), dtype=np.int64)
+            remap[keep] = np.arange(len(keep), dtype=np.int64)
+            groups["interior"] = remap[groups["interior"]]
+            groups["interior"] = groups["interior"][groups["interior"] >= 0]
+            groups["boundary"] = remap[groups["boundary"]]
+            groups["boundary"] = groups["boundary"][groups["boundary"] >= 0]
+            nodes = nodes[keep]
         cfg_L = float(np.max(np.abs(nodes)))
 
     elif domain == "sphere":
-        nodes, groups = generate_sphere_nodes(spacing, R, sphere_subdivide)
+        nodes, groups = generate_sphere_nodes(
+            spacing, R, sphere_subdivide, min_dist=node_min_dist)
         interior_idx = groups["interior"]
         cfg_L = R
 
@@ -1410,6 +1516,9 @@ def build_qd_problem(
             augment=augment,
             exclude_radius=exclude_radius,
             sphere_subdivide=sphere_subdivide,
+            include_interior=include_interior,
+            include_boundary=include_boundary,
+            min_dist=node_min_dist,
         )
         interior_idx = groups["interior"]
         cfg_L = R
@@ -1441,6 +1550,9 @@ def build_qd_problem(
             n_random_target=conv_cell_n_random,
             seed=conv_cell_seed,
             include_parity=conv_cell_parity,
+            template_mode=conv_cell_template_mode,
+            fcc_scale_factor=conv_cell_fcc_scale_factor,
+            fcc_origin_frac=conv_cell_fcc_origin_frac,
             boundary_margin_frac=conv_cell_boundary_margin_frac,
             use_rbf_poisson=conv_cell_use_rbf_poisson,
             domain_shape=conv_cell_domain_shape,
@@ -1452,6 +1564,9 @@ def build_qd_problem(
             adaptive_lambda_lap=conv_cell_adaptive_lambda_lap,
             adaptive_candidate_multiplier=conv_cell_adaptive_candidate_multiplier,
             adaptive_gaussian_builder=adaptive_builder,
+            include_interior=include_interior,
+            include_boundary=include_boundary,
+            min_dist_cart=node_min_dist,
         )
         groups["conv_cell_template_nodes_frac"] = _cell_stats["cell_template_nodes_frac"]
         groups["conv_cell_template_nodes_cart"] = _cell_stats["cell_template_nodes_cart"]
