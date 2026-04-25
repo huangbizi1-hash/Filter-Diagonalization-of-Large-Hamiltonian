@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from scipy.spatial import cKDTree
 from rbf.pde.fd import weight_matrix
 from rbf.pde.nodes import poisson_disc_nodes
 
@@ -1376,6 +1377,84 @@ def compute_node_quality(
     }
 
 
+def weight_matrix_conv_cell_reuse(
+    x: Array,
+    p: Array,
+    n: int,
+    diffs: Any,
+    phi: str,
+    eps: float,
+    order: int,
+    round_decimals: int = 8,
+) -> sp.csr_matrix:
+    """
+    Build an RBF-FD matrix while reusing repeated local stencil solves.
+
+    Useful for conv_cell domains where many interior stencils are translations
+    of one another. Output row/column semantics match `weight_matrix`.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    if x.ndim != 2 or x.shape[1] != 3:
+        raise ValueError(f"x must have shape (N, 3), got {x.shape}")
+    if p.ndim != 2 or p.shape[1] != 3:
+        raise ValueError(f"p must have shape (M, 3), got {p.shape}")
+    if n <= 0:
+        raise ValueError(f"n must be > 0, got {n}")
+
+    k = int(min(n, p.shape[0]))
+    if k == 0:
+        return sp.csr_matrix((x.shape[0], p.shape[0]), dtype=np.float64)
+
+    tree = cKDTree(p)
+    _dist, neigh = tree.query(x, k=k)
+    if neigh.ndim == 1:
+        neigh = neigh[:, None]
+
+    offsets = p[neigh] - x[:, None, :]
+    sort_idx = np.lexsort((
+        np.round(offsets[:, :, 2], round_decimals),
+        np.round(offsets[:, :, 1], round_decimals),
+        np.round(offsets[:, :, 0], round_decimals),
+    ), axis=1)
+    sorted_neigh = np.take_along_axis(neigh, sort_idx, axis=1)
+    sorted_offsets = np.take_along_axis(offsets, sort_idx[:, :, None], axis=1)
+    key_arr = np.round(sorted_offsets, round_decimals)
+    keys = [key_arr[i].tobytes() for i in range(key_arr.shape[0])]
+
+    unique_rows: dict[bytes, int] = {}
+    for i, key in enumerate(keys):
+        unique_rows.setdefault(key, i)
+
+    cached_sorted_w: dict[bytes, Array] = {}
+    for key, i_row in unique_rows.items():
+        center = x[i_row:i_row + 1]
+        neigh_ids_sorted = sorted_neigh[i_row]
+        local_p = p[neigh_ids_sorted]
+        local_w_sparse = weight_matrix(
+            x=center,
+            p=local_p,
+            n=k,
+            diffs=diffs,
+            phi=phi,
+            eps=eps,
+            order=order,
+        ).tocsr()
+        local_w = np.zeros(k, dtype=np.float64)
+        local_w[local_w_sparse.indices] = local_w_sparse.data
+        cached_sorted_w[key] = local_w
+
+    inv_perm = np.argsort(sort_idx, axis=1)
+    data = np.empty(x.shape[0] * k, dtype=np.float64)
+    indices = neigh.reshape(-1).astype(np.int64, copy=False)
+    indptr = np.arange(0, (x.shape[0] + 1) * k, k, dtype=np.int64)
+    for i, key in enumerate(keys):
+        w_sorted = cached_sorted_w[key]
+        data[i * k:(i + 1) * k] = w_sorted[inv_perm[i]]
+
+    return sp.csr_matrix((data, indices, indptr), shape=(x.shape[0], p.shape[0]))
+
+
 # ─── QD problem builder ──────────────────────────────────────────────────────
 
 def build_qd_problem(
@@ -1410,6 +1489,7 @@ def build_qd_problem(
     conv_cell_adaptive_lambda_grad: float = 0.0,
     conv_cell_adaptive_lambda_lap: float = 0.0,
     conv_cell_adaptive_candidate_multiplier: float = 8.0,
+    conv_cell_reuse_weights: bool = True,
     include_interior: bool = True,
     include_boundary: bool = True,
     node_min_dist: float = 0.0,
@@ -1488,6 +1568,8 @@ def build_qd_problem(
     conv_cell_adaptive_lambda_lap  : λ2 in h = h_max/(1+λ1|∇V|+λ2|ΔV|)
     conv_cell_adaptive_candidate_multiplier : preselection budget multiplier
                                               before accept+KDTree filtering
+    conv_cell_reuse_weights  : when True (default), reuse repeated stencil
+                               solves in conv_cell Laplacian assembly
     """
     from scipy.interpolate import RegularGridInterpolator
 
@@ -1639,15 +1721,26 @@ def build_qd_problem(
     v_cap = float(np.percentile(V_nodes, v_clip_percentile))
     V_nodes = np.clip(V_nodes, None, v_cap)
 
-    laplacian_matrix = weight_matrix(
-        x=nodes[interior_idx],
-        p=nodes,
-        n=stencil_size,
-        diffs=[[2, 0, 0], [0, 2, 0], [0, 0, 2]],
-        phi=phi,
-        eps=eps,
-        order=order,
-    )
+    if domain == "conv_cell" and conv_cell_reuse_weights:
+        laplacian_matrix = weight_matrix_conv_cell_reuse(
+            x=nodes[interior_idx],
+            p=nodes,
+            n=stencil_size,
+            diffs=[[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+            phi=phi,
+            eps=eps,
+            order=order,
+        )
+    else:
+        laplacian_matrix = weight_matrix(
+            x=nodes[interior_idx],
+            p=nodes,
+            n=stencil_size,
+            diffs=[[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+            phi=phi,
+            eps=eps,
+            order=order,
+        )
 
     cfg = RBFConfig(
         spacing=spacing, L=cfg_L,
