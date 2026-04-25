@@ -14,6 +14,24 @@ from rbf.pde.nodes import poisson_disc_nodes
 Array = np.ndarray
 
 
+def _raise_on_nonfinite(name: str, arr: Array, max_examples: int = 5) -> None:
+    """Raise ValueError with compact diagnostics when arr contains NaN/Inf."""
+    a = np.asarray(arr)
+    mask = ~np.isfinite(a)
+    if not np.any(mask):
+        return
+    bad_idx = np.argwhere(mask)
+    snippets = []
+    for idx in bad_idx[:max_examples]:
+        idx_t = tuple(int(i) for i in idx)
+        snippets.append(f"{idx_t}: {a[idx_t]!r}")
+    raise ValueError(
+        f"{name} contains non-finite values: "
+        f"{int(mask.sum())}/{int(a.size)} entries are NaN/Inf. "
+        f"Examples -> {'; '.join(snippets)}"
+    )
+
+
 def _periodic_delta_frac(x: Array, y: Array) -> Array:
     """Minimum-image signed displacement in fractional coordinates."""
     d = np.asarray(x, dtype=np.float64) - np.asarray(y, dtype=np.float64)
@@ -963,9 +981,22 @@ def generate_conv_cell_nodes(
             cand_cart = cand_frac * a
             V_cand = np.asarray(adaptive_gaussian_builder.evaluate_at_points(cand_cart),
                                 dtype=np.float64)
+            _raise_on_nonfinite("conv_cell adaptive V_cand", V_cand)
             gnorm, lap_abs = _estimate_grad_laplacian_uniform(V_cand, n_grid, a)
+            _raise_on_nonfinite("conv_cell adaptive |grad V|", gnorm)
+            _raise_on_nonfinite("conv_cell adaptive |lap V|", lap_abs)
             denom = 1.0 + float(adaptive_lambda_grad) * gnorm + float(adaptive_lambda_lap) * lap_abs
+            _raise_on_nonfinite("conv_cell adaptive denom", denom)
+            if np.any(denom <= 0.0):
+                dmin = float(np.min(denom))
+                n_nonpos = int(np.count_nonzero(denom <= 0.0))
+                raise ValueError(
+                    "conv_cell adaptive denom has non-positive entries "
+                    f"({n_nonpos}/{denom.size}); min={dmin:.6e}. "
+                    "Please reduce adaptive lambdas."
+                )
             h_w = 1.0 / np.maximum(denom, 1e-12)
+            _raise_on_nonfinite("conv_cell adaptive h_w", h_w)
             n_candidates = int(max(1, round(float(adaptive_candidate_multiplier) * n_random_target)))
             n_take = min(n_candidates, len(h_w))
             # 当 λ_grad=λ_lap=0（或权重近乎常数）时，不应由 argsort 的索引顺序
@@ -982,6 +1013,7 @@ def generate_conv_cell_nodes(
                 rng=rng,
                 pinned_frac=skeleton_frac,
             )
+            _raise_on_nonfinite("conv_cell adaptive random_frac", random_frac)
         elif use_rbf_poisson:
             vert, smp = _make_unit_cube_surface(a)
             pinned_cart = skeleton_frac * a
@@ -1757,6 +1789,7 @@ def build_qd_problem(
     # gaussian_direct since the Gaussian fit is analytic and smooth)
     v_cap = float(np.percentile(V_nodes, v_clip_percentile))
     V_nodes = np.clip(V_nodes, None, v_cap)
+    _raise_on_nonfinite("V_nodes (after clip)", V_nodes)
 
     if domain == "conv_cell" and conv_cell_reuse_weights:
         laplacian_matrix = weight_matrix_conv_cell_reuse(
@@ -1778,6 +1811,7 @@ def build_qd_problem(
             eps=eps,
             order=order,
         )
+    _raise_on_nonfinite("laplacian_matrix.data", laplacian_matrix.data)
 
     cfg = RBFConfig(
         spacing=spacing, L=cfg_L,
