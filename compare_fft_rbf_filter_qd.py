@@ -84,6 +84,8 @@ class CompareConfig:
     conv_cell_template_mode: str = "hybrid" # hybrid | fcc_refined
     conv_cell_fcc_scale_factor: int = 8
     conv_cell_fcc_origin_frac: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    conv_cell_fcc_atom_refine_factor: int = 0
+    conv_cell_fcc_atom_radius_frac: float = 0.0
     # 面附近多近算 boundary：薄壳（≈1·d_min）才合理；以前 0.5 太大，会让中心
     # 立方只剩 ~36% 体积，视觉上像没铺满。默认 = d_min_frac。
     conv_cell_boundary_margin_frac: float = 0.06
@@ -596,6 +598,8 @@ def run(cfg: CompareConfig) -> Path:
             "conv_cell_template_mode": cfg.conv_cell_template_mode,
             "conv_cell_fcc_scale_factor": cfg.conv_cell_fcc_scale_factor,
             "conv_cell_fcc_origin_frac": list(cfg.conv_cell_fcc_origin_frac),
+            "conv_cell_fcc_atom_refine_factor": cfg.conv_cell_fcc_atom_refine_factor,
+            "conv_cell_fcc_atom_radius_frac": cfg.conv_cell_fcc_atom_radius_frac,
             "conv_cell_boundary_margin_frac": cfg.conv_cell_boundary_margin_frac,
             "conv_cell_use_rbf_poisson":      cfg.conv_cell_use_rbf_poisson,
             "conv_cell_domain_shape":         cfg.conv_cell_domain_shape,
@@ -650,6 +654,8 @@ def run(cfg: CompareConfig) -> Path:
                 conv_cell_template_mode=cfg.conv_cell_template_mode,
                 conv_cell_fcc_scale_factor=cfg.conv_cell_fcc_scale_factor,
                 conv_cell_fcc_origin_frac=np.asarray(cfg.conv_cell_fcc_origin_frac, dtype=np.float64),
+                conv_cell_fcc_atom_refine_factor=cfg.conv_cell_fcc_atom_refine_factor,
+                conv_cell_fcc_atom_radius_frac=cfg.conv_cell_fcc_atom_radius_frac,
                 conv_cell_boundary_margin_frac=cfg.conv_cell_boundary_margin_frac,
                 conv_cell_use_rbf_poisson=cfg.conv_cell_use_rbf_poisson,
                 conv_cell_domain_shape=cfg.conv_cell_domain_shape,
@@ -1084,6 +1090,10 @@ def parse_args() -> CompareConfig:
     p.add_argument("--conv-cell-fcc-origin-frac", type=float, nargs=3,
                    default=[0.0, 0.0, 0.0], metavar=("FX", "FY", "FZ"),
                    help="fcc_refined 模式 FCC 原点分数坐标偏移")
+    p.add_argument("--conv-cell-fcc-atom-refine-factor", type=int, default=0,
+                   help="增强方法一：原子附近 local FCC 的更细密 scale_factor（0=关闭）")
+    p.add_argument("--conv-cell-fcc-atom-radius-frac", type=float, default=0.0,
+                   help="增强方法一：仅保留与任意原子周期距离 < radius_frac 的 local FCC 点（0=关闭）")
     p.add_argument("--conv-cell-boundary-margin-frac", type=float, default=0.06,
                    help="距 bbox 面小于 margin*a 的节点判为 boundary；"
                         "默认 0.06 = d_min_frac，薄壳；设 0 关闭 boundary 划分")
@@ -1181,6 +1191,8 @@ def parse_args() -> CompareConfig:
         conv_cell_template_mode=a.conv_cell_template_mode,
         conv_cell_fcc_scale_factor=a.conv_cell_fcc_scale_factor,
         conv_cell_fcc_origin_frac=tuple(float(v) for v in a.conv_cell_fcc_origin_frac),
+        conv_cell_fcc_atom_refine_factor=a.conv_cell_fcc_atom_refine_factor,
+        conv_cell_fcc_atom_radius_frac=a.conv_cell_fcc_atom_radius_frac,
         conv_cell_boundary_margin_frac=a.conv_cell_boundary_margin_frac,
         conv_cell_use_rbf_poisson=(not a.conv_cell_use_legacy_poisson),
         conv_cell_domain_shape=a.conv_cell_domain_shape,
