@@ -132,6 +132,7 @@ class CompareConfig:
     out_dir: str = "filter_compare_results"
     power_steps: int = 30
     fft_kinetic_cut: float = 30.0
+    fft_only: bool = False
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -493,133 +494,140 @@ def run(cfg: CompareConfig) -> Path:
     )
     timings["build_fft_operator"] = time.perf_counter() - t2
 
-    t3 = time.perf_counter()
-    provenance: dict[str, Any] = {
-        "system":          cfg.system,
-        "qd_radius":       cfg.qd_radius if cfg.system == "qd" else None,
-        "qd_cube":         str(qd_cube) if qd_cube is not None else None,
-        "node_method":     cfg.rbf_node_method,
-        "rbf_spacing":     cfg.rbf_spacing,
-        "rbf_R":           cfg.rbf_R,
-        "rbf_sphere_subdivide": cfg.rbf_sphere_subdivide,
-        "rbf_augment":     cfg.rbf_augment,
-        "rbf_exclude_radius": cfg.rbf_exclude_radius,
-        "conv_cell_a":     cfg.conv_cell_a,
-        "conv_cell_d_min_frac": cfg.conv_cell_d_min_frac,
-        "conv_cell_n_random":   cfg.conv_cell_n_random,
-        "conv_cell_seed":       cfg.conv_cell_seed,
-        "conv_cell_parity":     cfg.conv_cell_parity,
-        "conv_cell_template_mode": cfg.conv_cell_template_mode,
-        "conv_cell_fcc_scale_factor": cfg.conv_cell_fcc_scale_factor,
-        "conv_cell_fcc_origin_frac": list(cfg.conv_cell_fcc_origin_frac),
-        "conv_cell_boundary_margin_frac": cfg.conv_cell_boundary_margin_frac,
-        "conv_cell_use_rbf_poisson":      cfg.conv_cell_use_rbf_poisson,
-        "conv_cell_domain_shape":         cfg.conv_cell_domain_shape,
-        "conv_cell_sphere_radius":        cfg.conv_cell_sphere_radius,
-        "conv_cell_sphere_subdivide":     cfg.conv_cell_sphere_subdivide,
-        "conv_cell_adaptive_random":      cfg.conv_cell_adaptive_random,
-        "conv_cell_adaptive_grid_n":      cfg.conv_cell_adaptive_grid_n,
-        "conv_cell_adaptive_lambda_grad": cfg.conv_cell_adaptive_lambda_grad,
-        "conv_cell_adaptive_lambda_lap":  cfg.conv_cell_adaptive_lambda_lap,
-        "conv_cell_adaptive_candidate_multiplier": cfg.conv_cell_adaptive_candidate_multiplier,
-        "include_interior": cfg.include_interior,
-        "include_boundary": cfg.include_boundary,
-        "node_min_dist": cfg.node_min_dist,
-        "ho_L":            cfg.ho_L,
-        "loaded_from":     cfg.load_nodes or None,
-    }
+    provenance: dict[str, Any] = {}
+    node_storage: dict[str, Any] = {}
+    nodes_data_path: Path | None = None
+    n_interior = 0
+    H_rbf_op = None
+    interior_idx = np.array([], dtype=np.int64)
+    if not cfg.fft_only:
+        t3 = time.perf_counter()
+        provenance = {
+            "system":          cfg.system,
+            "qd_radius":       cfg.qd_radius if cfg.system == "qd" else None,
+            "qd_cube":         str(qd_cube) if qd_cube is not None else None,
+            "node_method":     cfg.rbf_node_method,
+            "rbf_spacing":     cfg.rbf_spacing,
+            "rbf_R":           cfg.rbf_R,
+            "rbf_sphere_subdivide": cfg.rbf_sphere_subdivide,
+            "rbf_augment":     cfg.rbf_augment,
+            "rbf_exclude_radius": cfg.rbf_exclude_radius,
+            "conv_cell_a":     cfg.conv_cell_a,
+            "conv_cell_d_min_frac": cfg.conv_cell_d_min_frac,
+            "conv_cell_n_random":   cfg.conv_cell_n_random,
+            "conv_cell_seed":       cfg.conv_cell_seed,
+            "conv_cell_parity":     cfg.conv_cell_parity,
+            "conv_cell_template_mode": cfg.conv_cell_template_mode,
+            "conv_cell_fcc_scale_factor": cfg.conv_cell_fcc_scale_factor,
+            "conv_cell_fcc_origin_frac": list(cfg.conv_cell_fcc_origin_frac),
+            "conv_cell_boundary_margin_frac": cfg.conv_cell_boundary_margin_frac,
+            "conv_cell_use_rbf_poisson":      cfg.conv_cell_use_rbf_poisson,
+            "conv_cell_domain_shape":         cfg.conv_cell_domain_shape,
+            "conv_cell_sphere_radius":        cfg.conv_cell_sphere_radius,
+            "conv_cell_sphere_subdivide":     cfg.conv_cell_sphere_subdivide,
+            "conv_cell_adaptive_random":      cfg.conv_cell_adaptive_random,
+            "conv_cell_adaptive_grid_n":      cfg.conv_cell_adaptive_grid_n,
+            "conv_cell_adaptive_lambda_grad": cfg.conv_cell_adaptive_lambda_grad,
+            "conv_cell_adaptive_lambda_lap":  cfg.conv_cell_adaptive_lambda_lap,
+            "conv_cell_adaptive_candidate_multiplier": cfg.conv_cell_adaptive_candidate_multiplier,
+            "include_interior": cfg.include_interior,
+            "include_boundary": cfg.include_boundary,
+            "node_min_dist": cfg.node_min_dist,
+            "ho_L":            cfg.ho_L,
+            "loaded_from":     cfg.load_nodes or None,
+        }
 
-    if cfg.load_nodes:
-        # 从已存节点文件重建 RBFProblem（Laplacian + V 按当前 CLI 重新算）
-        if cfg.system != "qd" or qd_cube is None:
-            raise ValueError("--load-nodes 目前只支持 --system qd（需要 cube 文件做 V 插值）")
-        load_path = Path(cfg.load_nodes)
-        if not load_path.exists():
-            raise FileNotFoundError(f"--load-nodes 指定的文件不存在: {load_path}")
-        problem, _saved_meta = _build_problem_from_nodes_file(load_path, cfg, qd_cube)
-        provenance["loaded_from"] = str(load_path)
-    elif cfg.system == "qd":
-        assert qd_cube is not None
-        if cfg.rbf_node_method not in ("cube", "sphere", "atoms", "conv_cell"):
-            raise ValueError(
-                "--rbf-node-method 仅支持 cube | sphere | atoms | conv_cell，"
-                f"收到 {cfg.rbf_node_method!r}"
+        if cfg.load_nodes:
+            # 从已存节点文件重建 RBFProblem（Laplacian + V 按当前 CLI 重新算）
+            if cfg.system != "qd" or qd_cube is None:
+                raise ValueError("--load-nodes 目前只支持 --system qd（需要 cube 文件做 V 插值）")
+            load_path = Path(cfg.load_nodes)
+            if not load_path.exists():
+                raise FileNotFoundError(f"--load-nodes 指定的文件不存在: {load_path}")
+            problem, _saved_meta = _build_problem_from_nodes_file(load_path, cfg, qd_cube)
+            provenance["loaded_from"] = str(load_path)
+        elif cfg.system == "qd":
+            assert qd_cube is not None
+            if cfg.rbf_node_method not in ("cube", "sphere", "atoms", "conv_cell"):
+                raise ValueError(
+                    "--rbf-node-method 仅支持 cube | sphere | atoms | conv_cell，"
+                    f"收到 {cfg.rbf_node_method!r}"
+                )
+            problem = build_qd_problem(
+                cube_file=str(qd_cube),
+                domain=cfg.rbf_node_method,
+                spacing=cfg.rbf_spacing,
+                R=cfg.rbf_R,
+                stencil_size=cfg.rbf_stencil_size,
+                phi=cfg.rbf_phi,
+                eps=cfg.rbf_eps,
+                order=cfg.rbf_order,
+                sphere_subdivide=cfg.rbf_sphere_subdivide,
+                augment=cfg.rbf_augment,
+                exclude_radius=cfg.rbf_exclude_radius,
+                v_clip_percentile=cfg.rbf_v_clip_percentile,
+                conv_cell_a=cfg.conv_cell_a,
+                conv_cell_d_min_frac=cfg.conv_cell_d_min_frac,
+                conv_cell_n_random=cfg.conv_cell_n_random,
+                conv_cell_seed=cfg.conv_cell_seed,
+                conv_cell_parity=cfg.conv_cell_parity,
+                conv_cell_template_mode=cfg.conv_cell_template_mode,
+                conv_cell_fcc_scale_factor=cfg.conv_cell_fcc_scale_factor,
+                conv_cell_fcc_origin_frac=np.asarray(cfg.conv_cell_fcc_origin_frac, dtype=np.float64),
+                conv_cell_boundary_margin_frac=cfg.conv_cell_boundary_margin_frac,
+                conv_cell_use_rbf_poisson=cfg.conv_cell_use_rbf_poisson,
+                conv_cell_domain_shape=cfg.conv_cell_domain_shape,
+                conv_cell_sphere_radius=(
+                    cfg.conv_cell_sphere_radius
+                    if cfg.conv_cell_sphere_radius > 0.0 else None
+                ),
+                conv_cell_sphere_subdivide=cfg.conv_cell_sphere_subdivide,
+                conv_cell_adaptive_random=cfg.conv_cell_adaptive_random,
+                conv_cell_adaptive_grid_n=cfg.conv_cell_adaptive_grid_n,
+                conv_cell_adaptive_lambda_grad=cfg.conv_cell_adaptive_lambda_grad,
+                conv_cell_adaptive_lambda_lap=cfg.conv_cell_adaptive_lambda_lap,
+                conv_cell_adaptive_candidate_multiplier=cfg.conv_cell_adaptive_candidate_multiplier,
+                include_interior=cfg.include_interior,
+                include_boundary=cfg.include_boundary,
+                node_min_dist=cfg.node_min_dist,
+                v_source=cfg.rbf_v_source,
+                gaussian_params_file=(cfg.potential_params_file
+                                      if cfg.rbf_v_source == "gaussian_direct"
+                                      else None),
+                r_cut=cfg.potential_r_cut,
             )
-        problem = build_qd_problem(
-            cube_file=str(qd_cube),
-            domain=cfg.rbf_node_method,
-            spacing=cfg.rbf_spacing,
-            R=cfg.rbf_R,
-            stencil_size=cfg.rbf_stencil_size,
-            phi=cfg.rbf_phi,
-            eps=cfg.rbf_eps,
-            order=cfg.rbf_order,
-            sphere_subdivide=cfg.rbf_sphere_subdivide,
-            augment=cfg.rbf_augment,
-            exclude_radius=cfg.rbf_exclude_radius,
-            v_clip_percentile=cfg.rbf_v_clip_percentile,
-            conv_cell_a=cfg.conv_cell_a,
-            conv_cell_d_min_frac=cfg.conv_cell_d_min_frac,
-            conv_cell_n_random=cfg.conv_cell_n_random,
-            conv_cell_seed=cfg.conv_cell_seed,
-            conv_cell_parity=cfg.conv_cell_parity,
-            conv_cell_template_mode=cfg.conv_cell_template_mode,
-            conv_cell_fcc_scale_factor=cfg.conv_cell_fcc_scale_factor,
-            conv_cell_fcc_origin_frac=np.asarray(cfg.conv_cell_fcc_origin_frac, dtype=np.float64),
-            conv_cell_boundary_margin_frac=cfg.conv_cell_boundary_margin_frac,
-            conv_cell_use_rbf_poisson=cfg.conv_cell_use_rbf_poisson,
-            conv_cell_domain_shape=cfg.conv_cell_domain_shape,
-            conv_cell_sphere_radius=(
-                cfg.conv_cell_sphere_radius
-                if cfg.conv_cell_sphere_radius > 0.0 else None
-            ),
-            conv_cell_sphere_subdivide=cfg.conv_cell_sphere_subdivide,
-            conv_cell_adaptive_random=cfg.conv_cell_adaptive_random,
-            conv_cell_adaptive_grid_n=cfg.conv_cell_adaptive_grid_n,
-            conv_cell_adaptive_lambda_grad=cfg.conv_cell_adaptive_lambda_grad,
-            conv_cell_adaptive_lambda_lap=cfg.conv_cell_adaptive_lambda_lap,
-            conv_cell_adaptive_candidate_multiplier=cfg.conv_cell_adaptive_candidate_multiplier,
-            include_interior=cfg.include_interior,
-            include_boundary=cfg.include_boundary,
-            node_min_dist=cfg.node_min_dist,
-            v_source=cfg.rbf_v_source,
-            gaussian_params_file=(cfg.potential_params_file
-                                  if cfg.rbf_v_source == "gaussian_direct"
-                                  else None),
-            r_cut=cfg.potential_r_cut,
+        else:
+            rbf_cfg = RBFConfig(
+                spacing=cfg.rbf_spacing,
+                L=cfg.ho_L,
+                stencil_size=cfg.rbf_stencil_size,
+                phi=cfg.rbf_phi,
+                eps=cfg.rbf_eps,
+                order=cfg.rbf_order,
+            )
+            problem = build_problem(config=rbf_cfg, build_interpolation=False)
+        H_rbf = build_hamiltonian_matrix(problem, symmetrize=True)
+        H_rbf_op = spla.aslinearoperator(H_rbf)
+        interior_idx = problem.interior_idx
+        n_interior = int(len(interior_idx))
+        node_storage = _build_node_storage(
+            problem,
+            provenance=provenance,
+            quality_probe_method=cfg.quality_probe_method,
+            quality_probe_n=cfg.quality_probe_n,
         )
-    else:
-        rbf_cfg = RBFConfig(
-            spacing=cfg.rbf_spacing,
-            L=cfg.ho_L,
-            stencil_size=cfg.rbf_stencil_size,
-            phi=cfg.rbf_phi,
-            eps=cfg.rbf_eps,
-            order=cfg.rbf_order,
-        )
-        problem = build_problem(config=rbf_cfg, build_interpolation=False)
-    H_rbf = build_hamiltonian_matrix(problem, symmetrize=True)
-    H_rbf_op = spla.aslinearoperator(H_rbf)
-    interior_idx = problem.interior_idx
-    node_storage = _build_node_storage(
-        problem,
-        provenance=provenance,
-        quality_probe_method=cfg.quality_probe_method,
-        quality_probe_n=cfg.quality_probe_n,
-    )
-    q_info = node_storage.get("quality", {})
-    if q_info:
-        print(f"[node quality] q={q_info.get('q', float('nan')):.4e}  "
-              f"h={q_info.get('h', float('nan')):.4e}  "
-              f"ρ={q_info.get('rho', float('nan')):.3f}  "
-              f"(n_probe={q_info.get('n_probe', 0)}, "
-              f"method={q_info.get('probe_method', '')})")
-    timings["build_rbf_operator"] = time.perf_counter() - t3
+        q_info = node_storage.get("quality", {})
+        if q_info:
+            print(f"[node quality] q={q_info.get('q', float('nan')):.4e}  "
+                  f"h={q_info.get('h', float('nan')):.4e}  "
+                  f"ρ={q_info.get('rho', float('nan')):.3f}  "
+                  f"(n_probe={q_info.get('n_probe', 0)}, "
+                  f"method={q_info.get('probe_method', '')})")
+        timings["build_rbf_operator"] = time.perf_counter() - t3
 
     # 按需单独落盘节点数据（便于后续 --load-nodes 复用，不依赖结果 JSON）
-    nodes_data_path: Path | None = None
     ts_nodes = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if cfg.save_nodes:
+    if cfg.save_nodes and (not cfg.fft_only):
         # 用户给了路径——如果是目录则自动命名，否则当作完整文件路径
         p_user = Path(cfg.save_nodes)
         if p_user.suffix == "" or p_user.is_dir():
@@ -640,15 +648,16 @@ def run(cfg: CompareConfig) -> Path:
     #   FFT: 均匀网格，维度 n_grid = N³
     #   RBF: 散点节点，维度 n_interior（与 n_grid 无关）
     # 必须为两者各自独立生成随机向量，不能用 psi_full[interior_idx] 互相索引。
-    n_interior = int(len(interior_idx))
     rng_fft = np.random.default_rng(cfg.seed)
-    rng_rbf = np.random.default_rng(cfg.seed + 1)
+    rng_rbf = np.random.default_rng(cfg.seed + 1) if not cfg.fft_only else None
 
     t_power = time.perf_counter()
     psi_power_fft = rng_fft.standard_normal(n_grid)
-    psi_power_rbf = rng_rbf.standard_normal(n_interior)
     Emax_fft = _power_method_energy(H_fft.matvec, psi_power_fft, n_steps=cfg.power_steps)
-    Emax_rbf = _power_method_energy(H_rbf_op.matvec, psi_power_rbf, n_steps=cfg.power_steps)
+    Emax_rbf = None
+    if not cfg.fft_only and rng_rbf is not None and H_rbf_op is not None:
+        psi_power_rbf = rng_rbf.standard_normal(n_interior)
+        Emax_rbf = _power_method_energy(H_rbf_op.matvec, psi_power_rbf, n_steps=cfg.power_steps)
     timings["power_method"] = time.perf_counter() - t_power
 
     per_state = []
@@ -659,21 +668,24 @@ def run(cfg: CompareConfig) -> Path:
     for i in range(cfg.n_random):
         psi_full = rng_fft.standard_normal(n_grid)
         psi_full /= np.linalg.norm(psi_full)
-        psi_int = rng_rbf.standard_normal(n_interior)
-        psi_int /= np.linalg.norm(psi_int)
-
         fft_filt = apply_filter_H_all_op(H_fft.matvec, psi_full, samp, an, phys)[0]
-        rbf_filt = apply_filter_H_all_op(H_rbf_op.matvec, psi_int, samp, an, phys)[0]
-
         norm_fft = float(np.linalg.norm(fft_filt))
-        norm_rbf = float(np.linalg.norm(rbf_filt))
         if norm_fft > 0:
             fft_filt = fft_filt / norm_fft
-        if norm_rbf > 0:
-            rbf_filt = rbf_filt / norm_rbf
 
         E_fft = _rayleigh(H_fft.matvec, fft_filt)
-        E_rbf = _rayleigh(H_rbf_op.matvec, rbf_filt)
+
+        norm_rbf = None
+        E_rbf = None
+        if not cfg.fft_only and rng_rbf is not None and H_rbf_op is not None:
+            psi_int = rng_rbf.standard_normal(n_interior)
+            psi_int /= np.linalg.norm(psi_int)
+            rbf_filt = apply_filter_H_all_op(H_rbf_op.matvec, psi_int, samp, an, phys)[0]
+            norm_rbf = float(np.linalg.norm(rbf_filt))
+            if norm_rbf > 0:
+                rbf_filt = rbf_filt / norm_rbf
+            E_rbf = _rayleigh(H_rbf_op.matvec, rbf_filt)
+            rbf_basis.append(rbf_filt)
 
         per_state.append(
             {
@@ -682,19 +694,16 @@ def run(cfg: CompareConfig) -> Path:
                 "filter_norm_rbf": norm_rbf,
                 "energy_fft": E_fft,
                 "energy_rbf": E_rbf,
-                "abs_diff": abs(E_fft - E_rbf),
-                "signed_diff": E_rbf - E_fft,
+                "abs_diff": abs(E_fft - E_rbf) if E_rbf is not None else None,
+                "signed_diff": (E_rbf - E_fft) if E_rbf is not None else None,
             }
         )
 
         fft_basis.append(fft_filt)
-        rbf_basis.append(rbf_filt)
 
     timings["filter_states"] = time.perf_counter() - t4
 
     fft_basis_mat = np.column_stack(fft_basis)
-    rbf_basis_mat = np.column_stack(rbf_basis)
-
     t5 = time.perf_counter()
     evals_fft, _, rank_fft = svd_rayleigh_ritz_op(
         fft_basis_mat,
@@ -705,15 +714,19 @@ def run(cfg: CompareConfig) -> Path:
     )
     timings["rr_fft"] = time.perf_counter() - t5
 
-    t6 = time.perf_counter()
-    evals_rbf, _, rank_rbf = svd_rayleigh_ritz_op(
-        rbf_basis_mat,
-        H_rbf_op.matvec,
-        svd_tol=cfg.svd_tol,
-        max_energies=cfg.max_energies,
-        hermitian=True,
-    )
-    timings["rr_rbf"] = time.perf_counter() - t6
+    evals_rbf: np.ndarray = np.array([], dtype=np.float64)
+    rank_rbf = 0
+    if not cfg.fft_only and H_rbf_op is not None:
+        rbf_basis_mat = np.column_stack(rbf_basis)
+        t6 = time.perf_counter()
+        evals_rbf, _, rank_rbf = svd_rayleigh_ritz_op(
+            rbf_basis_mat,
+            H_rbf_op.matvec,
+            svd_tol=cfg.svd_tol,
+            max_energies=cfg.max_energies,
+            hermitian=True,
+        )
+        timings["rr_rbf"] = time.perf_counter() - t6
 
     # ── 可选：带插值的对照 Ritz ─────────────────────────────────────────────
     # 把 RBF 滤波基从 n_interior 非均匀节点插到 FFT 均匀格点 (n_grid)，
@@ -724,7 +737,7 @@ def run(cfg: CompareConfig) -> Path:
     t_rr_rbf_interp = 0.0
     per_state_interp: list[dict[str, Any]] = []
 
-    if cfg.rbf_interp_ritz:
+    if cfg.rbf_interp_ritz and (not cfg.fft_only):
         t_ib0 = time.perf_counter()
         from rbf.pde.fd import weight_matrix as _weight_matrix_for_interp
 
@@ -812,7 +825,8 @@ def run(cfg: CompareConfig) -> Path:
                 "signed_diff": float(evals_rbf_interp[i] - evals_fft[i]),
             })
 
-    avg_state_err = float(np.mean([x["abs_diff"] for x in per_state])) if per_state else None
+    state_abs_diffs = [x["abs_diff"] for x in per_state if x["abs_diff"] is not None]
+    avg_state_err = float(np.mean(state_abs_diffs)) if state_abs_diffs else None
     avg_eval_err = float(np.mean([x["abs_diff"] for x in paired])) if paired else None
     avg_interp_eff = (
         float(np.mean([x["abs_diff"] for x in paired_rbf_interp_vs_nodes]))
@@ -825,7 +839,7 @@ def run(cfg: CompareConfig) -> Path:
         "grid": {
             "N_fft": N,
             "N_grid_fft": n_grid,
-            "n_interior_rbf": n_interior,
+            "n_interior_rbf": n_interior if not cfg.fft_only else None,
             "qd_cube": str(qd_cube) if qd_cube is not None else None,
         },
         # 结果 JSON 仅保留节点元数据；完整坐标在独立 .npz 文件中（如有）
@@ -843,9 +857,9 @@ def run(cfg: CompareConfig) -> Path:
         "power_method": {
             "steps": int(cfg.power_steps),
             "max_energy_fft": float(Emax_fft),
-            "max_energy_rbf": float(Emax_rbf),
-            "abs_diff": float(abs(Emax_fft - Emax_rbf)),
-            "signed_diff": float(Emax_rbf - Emax_fft),
+            "max_energy_rbf": float(Emax_rbf) if Emax_rbf is not None else None,
+            "abs_diff": float(abs(Emax_fft - Emax_rbf)) if Emax_rbf is not None else None,
+            "signed_diff": float(Emax_rbf - Emax_fft) if Emax_rbf is not None else None,
         },
         "rr": {
             # evals_rbf 始终是"直接在非均匀节点上 Ritz"的结果（无波函数插值）
@@ -869,7 +883,7 @@ def run(cfg: CompareConfig) -> Path:
         "summary": {
             "avg_abs_error_per_state_filtered_energy": avg_state_err,
             "avg_abs_error_eigenvalues": avg_eval_err,
-            "max_abs_error_per_state_filtered_energy": float(np.max([x["abs_diff"] for x in per_state])) if per_state else None,
+            "max_abs_error_per_state_filtered_energy": float(np.max(state_abs_diffs)) if state_abs_diffs else None,
             "max_abs_error_eigenvalues": float(np.max([x["abs_diff"] for x in paired])) if paired else None,
             "avg_abs_error_interp_effect_eigenvalues": avg_interp_eff,
             "max_abs_error_interp_effect_eigenvalues": (
@@ -1005,6 +1019,8 @@ def parse_args() -> CompareConfig:
 
     p.add_argument("--power-steps", type=int, default=30)
     p.add_argument("--fft-kinetic-cut", type=float, default=30.0)
+    p.add_argument("--fft-only", action="store_true",
+                   help="只运行 FFT filter + Ritz，跳过 RBF 建点/哈密顿量/对比项")
     p.add_argument("--out-dir", type=str, default="filter_compare_results")
 
     a = p.parse_args()
@@ -1063,6 +1079,7 @@ def parse_args() -> CompareConfig:
         quality_probe_n=a.quality_probe_n,
         power_steps=a.power_steps,
         fft_kinetic_cut=a.fft_kinetic_cut,
+        fft_only=a.fft_only,
         out_dir=a.out_dir,
     )
 
