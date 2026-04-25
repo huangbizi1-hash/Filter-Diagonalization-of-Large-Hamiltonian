@@ -643,6 +643,7 @@ def run(cfg: CompareConfig) -> Path:
     n_interior = 0
     H_rbf_op = None
     h_rbf_matrix_stats: dict[str, Any] | None = None
+    rbf_min_eig_info: dict[str, Any] | None = None
     interior_idx = np.array([], dtype=np.int64)
     if not cfg.fft_only:
         t3 = time.perf_counter()
@@ -768,6 +769,36 @@ def run(cfg: CompareConfig) -> Path:
                 "Try adjusting node/stencil parameters (e.g. --rbf-stencil-size, "
                 "--rbf-eps, --conv-cell-d-min-frac) to improve conditioning."
             )
+        t_min_eval = time.perf_counter()
+        try:
+            eig_min_arr = spla.eigs(
+                H_rbf,
+                k=1,
+                which="SR",
+                return_eigenvectors=False,
+                tol=1e-8,
+                maxiter=max(2000, 5 * H_rbf.shape[0]),
+            )
+            eig_min = complex(eig_min_arr[0])
+            rbf_min_eig_info = {
+                "success": True,
+                "which": "SR",
+                "value": {
+                    "real": float(np.real(eig_min)),
+                    "imag": float(np.imag(eig_min)),
+                },
+                "abs": float(np.abs(eig_min)),
+            }
+            print("[rbf] 稀疏矩阵最小特征值(复数, which='SR') = "
+                  f"{eig_min.real:+.10e} {eig_min.imag:+.10e}j")
+        except Exception as exc:
+            rbf_min_eig_info = {
+                "success": False,
+                "which": "SR",
+                "error": str(exc),
+            }
+            print(f"[rbf] 警告：最小特征值计算失败（which='SR'）：{exc}")
+        timings["rbf_min_eigenvalue"] = time.perf_counter() - t_min_eval
         H_rbf_op = spla.aslinearoperator(H_rbf)
         interior_idx = problem.interior_idx
         n_interior = int(len(interior_idx))
@@ -1115,6 +1146,8 @@ def run(cfg: CompareConfig) -> Path:
     }
     if h_rbf_matrix_stats is not None:
         out["rbf_operator"] = {"matrix_data_stats": h_rbf_matrix_stats}
+        if rbf_min_eig_info is not None:
+            out["rbf_operator"]["min_eigenvalue_complex"] = rbf_min_eig_info
 
     if cfg.rbf_node_method == "conv_cell" and not cfg.fft_only and not cfg.load_nodes:
         grp = problem.groups
