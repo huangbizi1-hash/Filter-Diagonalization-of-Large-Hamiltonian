@@ -24,7 +24,6 @@ from scipy.interpolate import RegularGridInterpolator
 
 from filter_core import (
     PhysParams,
-    apply_filter_H_all_op,
     build_filter_coefficients,
     make_filter_func,
     svd_rayleigh_ritz_op,
@@ -137,6 +136,7 @@ class CompareConfig:
     power_steps: int = 30
     fft_kinetic_cut: float = 30.0
     fft_only: bool = False
+    filter_norm_blowup_threshold: float = 1e200
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -258,6 +258,70 @@ def _power_method_energy(H_apply, psi0: np.ndarray, n_steps: int = 30) -> float:
             raise RuntimeError("power method 迭代中向量范数变为 0")
         psi /= nrm
     return _rayleigh(H_apply, psi)
+
+
+def _apply_filter_with_blowup_guard(
+    H_apply,
+    psi: np.ndarray,
+    nodes: np.ndarray,
+    an: np.ndarray,
+    par: PhysParams,
+    norm_blowup_threshold: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Apply filter with per-step norm diagnostics.
+
+    Returns (results, diag), where diag["blowup_step"] is the H-apply count
+    when norms first become non-finite / zero / exceed threshold.
+    """
+    ms, nc = an.shape
+    idx = (slice(None),) + (None,) * psi.ndim
+    results = an[:, 0][idx] * psi[None, ...]
+
+    psi_prev = psi.copy()
+    diag: dict[str, Any] = {
+        "blowup_step": None,
+        "reason": None,
+        "psi_curr_norm": None,
+        "result_norm": None,
+    }
+
+    for j in range(1, nc):
+        H_psi = H_apply(psi_prev)
+        psi_curr = ((4.0 / par.dE) * (H_psi - par.Vmin * psi_prev)
+                    - 2.0 * psi_prev
+                    - nodes[j - 1] * psi_prev)
+        results = results + an[:, j][idx] * psi_curr[None, ...]
+
+        psi_curr_norm = float(np.linalg.norm(psi_curr))
+        result_norm = float(np.linalg.norm(results[0]))
+        if (not np.isfinite(psi_curr_norm)) or (not np.isfinite(result_norm)):
+            diag.update({
+                "blowup_step": j,
+                "reason": "nonfinite_norm",
+                "psi_curr_norm": psi_curr_norm,
+                "result_norm": result_norm,
+            })
+            break
+        if psi_curr_norm == 0.0:
+            diag.update({
+                "blowup_step": j,
+                "reason": "zero_norm",
+                "psi_curr_norm": psi_curr_norm,
+                "result_norm": result_norm,
+            })
+            break
+        if (psi_curr_norm >= norm_blowup_threshold) or (result_norm >= norm_blowup_threshold):
+            diag.update({
+                "blowup_step": j,
+                "reason": "norm_threshold_exceeded",
+                "psi_curr_norm": psi_curr_norm,
+                "result_norm": result_norm,
+            })
+            break
+
+        psi_prev = psi_curr
+
+    return results, diag
 
 
 def _build_node_storage(
@@ -766,7 +830,15 @@ def run(cfg: CompareConfig) -> Path:
     for i in range(cfg.n_random):
         psi_full = rng_fft.standard_normal(n_grid)
         psi_full /= np.linalg.norm(psi_full)
-        fft_filt = apply_filter_H_all_op(H_fft.matvec, psi_full, samp, an, phys)[0]
+        fft_filt, fft_filter_diag = _apply_filter_with_blowup_guard(
+            H_apply=H_fft.matvec,
+            psi=psi_full,
+            nodes=samp,
+            an=an,
+            par=phys,
+            norm_blowup_threshold=cfg.filter_norm_blowup_threshold,
+        )
+        fft_filt = fft_filt[0]
         norm_fft = float(np.linalg.norm(fft_filt))
         if norm_fft > 0:
             fft_filt = fft_filt / norm_fft
@@ -778,8 +850,24 @@ def run(cfg: CompareConfig) -> Path:
         if not cfg.fft_only and rng_rbf is not None and H_rbf_op is not None:
             psi_int = rng_rbf.standard_normal(n_interior)
             psi_int /= np.linalg.norm(psi_int)
-            rbf_filt = apply_filter_H_all_op(H_rbf_op.matvec, psi_int, samp, an, phys)[0]
+            rbf_filt_all, rbf_filter_diag = _apply_filter_with_blowup_guard(
+                H_apply=H_rbf_op.matvec,
+                psi=psi_int,
+                nodes=samp,
+                an=an,
+                par=phys,
+                norm_blowup_threshold=cfg.filter_norm_blowup_threshold,
+            )
+            rbf_filt = rbf_filt_all[0]
             norm_rbf = float(np.linalg.norm(rbf_filt))
+            if rbf_filter_diag["blowup_step"] is not None:
+                print(
+                    "[RBF filter blowup] "
+                    f"state={i}, H_apply_count={rbf_filter_diag['blowup_step']}, "
+                    f"reason={rbf_filter_diag['reason']}, "
+                    f"psi_curr_norm={rbf_filter_diag['psi_curr_norm']}, "
+                    f"result_norm={rbf_filter_diag['result_norm']}"
+                )
             is_valid_rbf = np.isfinite(norm_rbf) and (norm_rbf > 0.0) and np.all(np.isfinite(rbf_filt))
             if is_valid_rbf:
                 rbf_filt = rbf_filt / norm_rbf
@@ -793,6 +881,7 @@ def run(cfg: CompareConfig) -> Path:
                         "filter_norm_rbf": norm_rbf,
                         "filter_stats": _finite_stats("rbf_filt", rbf_filt),
                         "nonfinite_detail": _first_nonfinite_detail(rbf_filt),
+                        "filter_diag": rbf_filter_diag,
                         "matvec_trace": _trace_matvec_nonfinite(
                             H_rbf_op.matvec, psi_int, n_steps=min(8, cfg.nc), stage_name="rbf_filter_input"
                         ),
@@ -805,6 +894,7 @@ def run(cfg: CompareConfig) -> Path:
                     "filter_norm_rbf": norm_rbf,
                     "filter_stats": _finite_stats("rbf_filt", rbf_filt),
                     "nonfinite_detail": _first_nonfinite_detail(rbf_filt),
+                    "filter_diag": rbf_filter_diag,
                     "matvec_trace": _trace_matvec_nonfinite(
                         H_rbf_op.matvec, psi_int, n_steps=min(8, cfg.nc), stage_name="rbf_filter_input"
                     ),
@@ -816,6 +906,8 @@ def run(cfg: CompareConfig) -> Path:
                 "state_index": i,
                 "filter_norm_fft": norm_fft,
                 "filter_norm_rbf": norm_rbf,
+                "filter_diag_fft": fft_filter_diag,
+                "filter_diag_rbf": (rbf_filter_diag if (not cfg.fft_only and H_rbf_op is not None) else None),
                 "energy_fft": E_fft,
                 "energy_rbf": E_rbf,
                 "abs_diff": abs(E_fft - E_rbf) if E_rbf is not None else None,
