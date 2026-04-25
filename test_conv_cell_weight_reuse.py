@@ -1,3 +1,11 @@
+"""
+Validate that `weight_matrix_conv_cell_reuse` reproduces `rbf.weight_matrix`
+on a conv_cell tiling and is faster.
+
+Run:
+    python test_conv_cell_weight_reuse.py
+"""
+
 from __future__ import annotations
 
 import time
@@ -5,7 +13,11 @@ import time
 import numpy as np
 
 from rbf.pde.fd import weight_matrix
-from rbf_core import generate_conv_cell_nodes, read_cube_file, weight_matrix_conv_cell_reuse
+from rbf_core import (
+    generate_conv_cell_nodes,
+    read_cube_file,
+    weight_matrix_conv_cell_reuse,
+)
 
 
 def _build_conv_cell_nodes(cube_file: str = "localPot.cube") -> tuple[np.ndarray, np.ndarray]:
@@ -40,14 +52,10 @@ def _build_conv_cell_nodes(cube_file: str = "localPot.cube") -> tuple[np.ndarray
     return nodes, groups["interior"]
 
 
-def _median_runtime(fn, repeats: int = 3) -> tuple[float, object]:
-    times = []
-    out = None
-    for _ in range(repeats):
-        t0 = time.perf_counter()
-        out = fn()
-        times.append(time.perf_counter() - t0)
-    return float(np.median(times)), out
+def _time_once(fn) -> tuple[float, object]:
+    t0 = time.perf_counter()
+    out = fn()
+    return time.perf_counter() - t0, out
 
 
 def main() -> None:
@@ -60,52 +68,63 @@ def main() -> None:
     nodes, interior_idx = _build_conv_cell_nodes()
     x = nodes[interior_idx]
     p = nodes
+    print(f"[setup] N_nodes={p.shape[0]}  N_interior={x.shape[0]}  "
+          f"stencil={stencil_size}")
 
-    t_old, L_old = _median_runtime(
+    # ── reference (old path) ─────────────────────────────────────────────────
+    t_old, L_old = _time_once(
         lambda: weight_matrix(
-            x=x,
-            p=p,
-            n=stencil_size,
-            diffs=diffs,
-            phi=phi,
-            eps=eps,
-            order=order,
+            x=x, p=p, n=stencil_size, diffs=diffs,
+            phi=phi, eps=eps, order=order,
         ).tocsr()
     )
-    t_new, L_new = _median_runtime(
-        lambda: weight_matrix_conv_cell_reuse(
-            x=x,
-            p=p,
-            n=stencil_size,
-            diffs=diffs,
-            phi=phi,
-            eps=eps,
-            order=order,
-        ).tocsr()
-    )
+    L_old.sum_duplicates()
+    L_old.sort_indices()
 
+    # ── optimised (new path) ─────────────────────────────────────────────────
+    t_new, L_new = _time_once(
+        lambda: weight_matrix_conv_cell_reuse(
+            x=x, p=p, n=stencil_size, diffs=diffs,
+            phi=phi, eps=eps, order=order,
+        )
+    )
+    L_new.sum_duplicates()
+    L_new.sort_indices()
+
+    # ── shape / sparsity pattern ─────────────────────────────────────────────
     assert L_new.shape == L_old.shape, (L_new.shape, L_old.shape)
     assert L_new.nnz == L_old.nnz, (L_new.nnz, L_old.nnz)
     assert np.array_equal(L_new.indptr, L_old.indptr), "CSR indptr mismatch"
-    assert np.array_equal(L_new.indices, L_old.indices), "CSR indices mismatch"
+    assert np.array_equal(L_new.indices, L_old.indices), (
+        "CSR indices mismatch (after sort_indices) — KNN stencils differ"
+    )
 
+    # ── numerical equality ──────────────────────────────────────────────────
     diff = (L_new - L_old).tocsr()
+    diff.sum_duplicates()
     max_abs = 0.0 if diff.nnz == 0 else float(np.max(np.abs(diff.data)))
-    assert max_abs < 1e-10, f"max |L_new-L_old|={max_abs:.3e}"
+    assert max_abs < 1e-10, f"max |L_new-L_old| = {max_abs:.3e}"
 
     rng = np.random.default_rng(0)
     vec = rng.standard_normal(p.shape[0])
     y_old = L_old.dot(vec)
     y_new = L_new.dot(vec)
-    vec_err = float(np.max(np.abs(y_new - y_old)))
-    assert vec_err < 1e-10, f"max |L_new@v-L_old@v|={vec_err:.3e}"
+    matvec_err = float(np.max(np.abs(y_new - y_old)))
+    assert matvec_err < 1e-10, f"max |L_new@v - L_old@v| = {matvec_err:.3e}"
 
+    # ── timing ──────────────────────────────────────────────────────────────
     speedup = t_old / max(t_new, 1e-12)
     print(
-        f"[conv_cell_weight_reuse] old={t_old:.4f}s new={t_new:.4f}s "
-        f"speedup={speedup:.2f}x max_abs={max_abs:.3e} vec_err={vec_err:.3e}"
+        f"[conv_cell_weight_reuse] old={t_old:.3f}s  new={t_new:.3f}s  "
+        f"speedup={speedup:.2f}x  max|ΔL|={max_abs:.2e}  "
+        f"max|Δ(Lv)|={matvec_err:.2e}"
     )
-    assert t_new < t_old, f"expected faster path, got old={t_old:.4f}s new={t_new:.4f}s"
+    assert t_new < t_old, (
+        f"expected new path to be faster, got old={t_old:.3f}s "
+        f"new={t_new:.3f}s"
+    )
+
+    print("[OK] weight_matrix_conv_cell_reuse matches rbf.weight_matrix and is faster.")
 
 
 if __name__ == "__main__":

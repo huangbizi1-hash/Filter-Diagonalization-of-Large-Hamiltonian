@@ -1388,13 +1388,23 @@ def weight_matrix_conv_cell_reuse(
     round_decimals: int = 8,
 ) -> sp.csr_matrix:
     """
-    Build an RBF-FD matrix while reusing repeated local stencil solves.
+    RBF-FD weight matrix that reuses repeated local stencil solves.
 
-    Useful for conv_cell domains where many interior stencils are translations
-    of one another. Output row/column semantics match `weight_matrix`.
+    For domains built by tiling a single template (e.g. ``conv_cell``), most
+    interior stencils are exact translations of each other.  Because the
+    Laplacian (and any constant-coefficient differential operator) commutes
+    with translation, the resulting RBF-FD weights are identical across all
+    translation-equivalent stencils.  This routine groups rows by their
+    canonicalised stencil offset pattern and runs the local linear solve once
+    per equivalence class.
+
+    The output sparse matrix is row/column-compatible with
+    ``rbf.pde.fd.weight_matrix(x, p, n, diffs, ...).tocsr()`` (same shape,
+    same nonzero pattern, same numerical values up to floating-point round-off)
+    and is returned in *canonical* CSR form (column indices sorted per row).
     """
-    x = np.asarray(x, dtype=np.float64)
-    p = np.asarray(p, dtype=np.float64)
+    x = np.ascontiguousarray(np.asarray(x, dtype=np.float64))
+    p = np.ascontiguousarray(np.asarray(p, dtype=np.float64))
     if x.ndim != 2 or x.shape[1] != 3:
         raise ValueError(f"x must have shape (N, 3), got {x.shape}")
     if p.ndim != 2 or p.shape[1] != 3:
@@ -1402,35 +1412,44 @@ def weight_matrix_conv_cell_reuse(
     if n <= 0:
         raise ValueError(f"n must be > 0, got {n}")
 
-    k = int(min(n, p.shape[0]))
-    if k == 0:
-        return sp.csr_matrix((x.shape[0], p.shape[0]), dtype=np.float64)
+    N, M = x.shape[0], p.shape[0]
+    k = int(min(n, M))
+    if k == 0 or N == 0:
+        return sp.csr_matrix((N, M), dtype=np.float64)
 
+    # 1) Stencils via k-nearest neighbours (matches rbf.weight_matrix's choice).
     tree = cKDTree(p)
     _dist, neigh = tree.query(x, k=k)
     if neigh.ndim == 1:
         neigh = neigh[:, None]
+    neigh = neigh.astype(np.int64, copy=False)
 
+    # 2) Canonicalise each row's stencil by sorting offsets lexicographically
+    #    on (rounded x, y, z).  Identical patterns produce identical sort keys.
     offsets = p[neigh] - x[:, None, :]
-    sort_idx = np.lexsort((
-        np.round(offsets[:, :, 2], round_decimals),
-        np.round(offsets[:, :, 1], round_decimals),
-        np.round(offsets[:, :, 0], round_decimals),
-    ), axis=1)
-    sorted_neigh = np.take_along_axis(neigh, sort_idx, axis=1)
+    rounded = np.round(offsets, round_decimals)
+    sort_idx = np.lexsort(
+        (rounded[:, :, 2], rounded[:, :, 1], rounded[:, :, 0]),
+        axis=1,
+    )
     sorted_offsets = np.take_along_axis(offsets, sort_idx[:, :, None], axis=1)
+    sorted_neigh = np.take_along_axis(neigh, sort_idx, axis=1)
     key_arr = np.round(sorted_offsets, round_decimals)
-    keys = [key_arr[i].tobytes() for i in range(key_arr.shape[0])]
 
-    unique_rows: dict[bytes, int] = {}
+    # 3) Group rows by signature (tobytes on the (k, 3) rounded offset block).
+    keys = [key_arr[i].tobytes() for i in range(N)]
+    rep_for_key: Dict[bytes, int] = {}
     for i, key in enumerate(keys):
-        unique_rows.setdefault(key, i)
+        if key not in rep_for_key:
+            rep_for_key[key] = i
 
-    cached_sorted_w: dict[bytes, Array] = {}
-    for key, i_row in unique_rows.items():
-        center = x[i_row:i_row + 1]
-        neigh_ids_sorted = sorted_neigh[i_row]
-        local_p = p[neigh_ids_sorted]
+    # 4) Solve the local RBF-FD system once per signature.  The local call has
+    #    only k candidate points with n=k, so the entire input set forms the
+    #    stencil and the returned weights map 1:1 onto local_p's row order.
+    cached_w: Dict[bytes, Array] = {}
+    for key, i_rep in rep_for_key.items():
+        center = x[i_rep:i_rep + 1]
+        local_p = p[sorted_neigh[i_rep]]
         local_w_sparse = weight_matrix(
             x=center,
             p=local_p,
@@ -1442,17 +1461,29 @@ def weight_matrix_conv_cell_reuse(
         ).tocsr()
         local_w = np.zeros(k, dtype=np.float64)
         local_w[local_w_sparse.indices] = local_w_sparse.data
-        cached_sorted_w[key] = local_w
+        cached_w[key] = local_w
 
-    inv_perm = np.argsort(sort_idx, axis=1)
-    data = np.empty(x.shape[0] * k, dtype=np.float64)
-    indices = neigh.reshape(-1).astype(np.int64, copy=False)
-    indptr = np.arange(0, (x.shape[0] + 1) * k, k, dtype=np.int64)
+    # 5) Broadcast cached weights to all rows that share the signature.  Both
+    #    `data_per_row` and `cols_per_row` are in stencil-sorted order, so they
+    #    are already aligned (no inverse permutation needed).
+    data_per_row = np.empty((N, k), dtype=np.float64)
     for i, key in enumerate(keys):
-        w_sorted = cached_sorted_w[key]
-        data[i * k:(i + 1) * k] = w_sorted[inv_perm[i]]
+        data_per_row[i] = cached_w[key]
+    cols_per_row = sorted_neigh
 
-    return sp.csr_matrix((data, indices, indptr), shape=(x.shape[0], p.shape[0]))
+    # 6) Sort each row's columns ascending → canonical CSR (matches what
+    #    `rbf.pde.fd.weight_matrix(...).tocsr()` produces after sort_indices()).
+    col_order = np.argsort(cols_per_row, axis=1, kind="stable")
+    indices_2d = np.take_along_axis(cols_per_row, col_order, axis=1)
+    data_2d = np.take_along_axis(data_per_row, col_order, axis=1)
+
+    indices = np.ascontiguousarray(indices_2d.reshape(-1))
+    data = np.ascontiguousarray(data_2d.reshape(-1))
+    indptr = np.arange(0, (N + 1) * k, k, dtype=indices.dtype)
+
+    L = sp.csr_matrix((data, indices, indptr), shape=(N, M))
+    L.has_sorted_indices = True
+    return L
 
 
 # ─── QD problem builder ──────────────────────────────────────────────────────
