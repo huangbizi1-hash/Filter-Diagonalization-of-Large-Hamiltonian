@@ -96,9 +96,17 @@ class CompareConfig:
     conv_cell_adaptive_lambda_grad: float = 0.0
     conv_cell_adaptive_lambda_lap: float = 0.0
     conv_cell_adaptive_candidate_multiplier: float = 8.0
+    # Enhancement 1: finer FCC near atoms (fcc_refined mode)
+    conv_cell_fcc_atom_refine_factor: int = 0       # 0 = disabled; e.g. 16 when base is 8
+    conv_cell_fcc_atom_refine_radius_frac: float = 0.15  # fractional radius around atoms
     include_interior: bool = True
     include_boundary: bool = True
     node_min_dist: float = 0.0
+    # ── 球半径模板选点方式 ─────────────────────────────────────────────────────
+    # rbf_stencil_radius > 0 : 以该半径（Bohr）做球内邻居搜索，并用指纹加速
+    # rbf_stencil_radius <= 0: 退回标准 k 近邻（rbf_stencil_size）
+    rbf_stencil_radius: float = 0.0
+    rbf_stencil_fingerprint_tol: float = 1e-4
 
     # ── 节点质量度量 ───────────────────────────────────────────────────────
     quality_probe_method: str = "uniform"   # 'uniform' 或 'random'
@@ -314,6 +322,53 @@ def _node_summary_for_result(node_storage: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _conv_cell_enhancement_summary(problem: "RBFProblem", cfg: "CompareConfig") -> dict:
+    """Extract conv_cell enhancement statistics from the solved problem's groups dict.
+
+    Returns a dict summarising how many nodes each enhancement step added
+    (per unit cell and in the full tiled domain), and the stencil configuration.
+    When --rbf-node-method is not conv_cell or --load-nodes was used, returns {}.
+    """
+    if cfg.rbf_node_method != "conv_cell":
+        return {}
+    groups = problem.groups
+    n_fcc_base   = int(groups.get("_enh1_fcc_base",  [0])[0]) if "_enh1_fcc_base"  in groups else None
+    n_enh1       = int(groups.get("_enh1_added",     [0])[0]) if "_enh1_added"     in groups else None
+    n_enh2       = int(groups.get("_enh2_added",     [0])[0]) if "_enh2_added"     in groups else None
+    n_fcc_tiled  = int(len(groups.get("fcc",       np.empty(0, dtype=np.int64))))
+    n_fccl_tiled = int(len(groups.get("fcc_local", np.empty(0, dtype=np.int64))))
+    n_rand_tiled = int(len(groups.get("random",    np.empty(0, dtype=np.int64))))
+    return {
+        "template_mode": cfg.conv_cell_template_mode,
+        "fcc_scale_factor": cfg.conv_cell_fcc_scale_factor,
+        # per-cell counts (only populated for fcc_refined mode)
+        "cell_fcc_base_nodes":              n_fcc_base,
+        "cell_enh1_atom_refine_added":      n_enh1,
+        "cell_enh2_adaptive_random_added":  n_enh2,
+        "enh1_config": {
+            "fcc_atom_refine_factor":      cfg.conv_cell_fcc_atom_refine_factor,
+            "fcc_atom_refine_radius_frac": cfg.conv_cell_fcc_atom_refine_radius_frac,
+            "enabled": cfg.conv_cell_fcc_atom_refine_factor > cfg.conv_cell_fcc_scale_factor,
+        },
+        "enh2_config": {
+            "adaptive_random":          cfg.conv_cell_adaptive_random,
+            "adaptive_grid_n":          cfg.conv_cell_adaptive_grid_n,
+            "adaptive_lambda_grad":     cfg.conv_cell_adaptive_lambda_grad,
+            "adaptive_lambda_lap":      cfg.conv_cell_adaptive_lambda_lap,
+            "adaptive_candidate_multiplier": cfg.conv_cell_adaptive_candidate_multiplier,
+        },
+        # tiled-domain group sizes
+        "tiled_fcc_nodes":       n_fcc_tiled,
+        "tiled_fcc_local_nodes": n_fccl_tiled,
+        "tiled_random_nodes":    n_rand_tiled,
+        # stencil config
+        "stencil_mode": "ball_radius" if cfg.rbf_stencil_radius > 0.0 else "k_nearest",
+        "stencil_radius_bohr":   cfg.rbf_stencil_radius,
+        "stencil_size":          cfg.rbf_stencil_size,
+        "stencil_fingerprint_tol": cfg.rbf_stencil_fingerprint_tol,
+    }
+
+
 def _fft_grid_points(pot: PotentialGrid | None, N: int, ho_L: float) -> np.ndarray:
     """返回 FFT 所用均匀格点的 3D 坐标，shape (N³, 3)。
 
@@ -522,9 +577,13 @@ def run(cfg: CompareConfig) -> Path:
         "conv_cell_adaptive_lambda_grad": cfg.conv_cell_adaptive_lambda_grad,
         "conv_cell_adaptive_lambda_lap":  cfg.conv_cell_adaptive_lambda_lap,
         "conv_cell_adaptive_candidate_multiplier": cfg.conv_cell_adaptive_candidate_multiplier,
+        "conv_cell_fcc_atom_refine_factor":      cfg.conv_cell_fcc_atom_refine_factor,
+        "conv_cell_fcc_atom_refine_radius_frac": cfg.conv_cell_fcc_atom_refine_radius_frac,
         "include_interior": cfg.include_interior,
         "include_boundary": cfg.include_boundary,
         "node_min_dist": cfg.node_min_dist,
+        "rbf_stencil_radius": cfg.rbf_stencil_radius,
+        "rbf_stencil_fingerprint_tol": cfg.rbf_stencil_fingerprint_tol,
         "ho_L":            cfg.ho_L,
         "loaded_from":     cfg.load_nodes or None,
     }
@@ -579,6 +638,8 @@ def run(cfg: CompareConfig) -> Path:
             conv_cell_adaptive_lambda_grad=cfg.conv_cell_adaptive_lambda_grad,
             conv_cell_adaptive_lambda_lap=cfg.conv_cell_adaptive_lambda_lap,
             conv_cell_adaptive_candidate_multiplier=cfg.conv_cell_adaptive_candidate_multiplier,
+            conv_cell_fcc_atom_refine_factor=cfg.conv_cell_fcc_atom_refine_factor,
+            conv_cell_fcc_atom_refine_radius_frac=cfg.conv_cell_fcc_atom_refine_radius_frac,
             include_interior=cfg.include_interior,
             include_boundary=cfg.include_boundary,
             node_min_dist=cfg.node_min_dist,
@@ -587,6 +648,8 @@ def run(cfg: CompareConfig) -> Path:
                                   if cfg.rbf_v_source == "gaussian_direct"
                                   else None),
             r_cut=cfg.potential_r_cut,
+            stencil_radius=cfg.rbf_stencil_radius,
+            stencil_fingerprint_tol=cfg.rbf_stencil_fingerprint_tol,
         )
     else:
         rbf_cfg = RBFConfig(
@@ -614,6 +677,22 @@ def run(cfg: CompareConfig) -> Path:
               f"ρ={q_info.get('rho', float('nan')):.3f}  "
               f"(n_probe={q_info.get('n_probe', 0)}, "
               f"method={q_info.get('probe_method', '')})")
+    # Print enhancement summary for conv_cell mode
+    if cfg.rbf_node_method == "conv_cell" and not cfg.load_nodes:
+        enh = _conv_cell_enhancement_summary(problem, cfg)
+        print(f"[conv_cell enhancements]")
+        print(f"  template_mode={enh['template_mode']}, "
+              f"fcc_scale_factor={enh['fcc_scale_factor']}")
+        if enh.get("cell_fcc_base_nodes") is not None:
+            print(f"  per-cell: fcc_base={enh['cell_fcc_base_nodes']}, "
+                  f"enh1_fine={enh['cell_enh1_atom_refine_added']}, "
+                  f"enh2_rand={enh['cell_enh2_adaptive_random_added']}")
+        print(f"  tiled domain: fcc={enh['tiled_fcc_nodes']}, "
+              f"fcc_local={enh['tiled_fcc_local_nodes']}, "
+              f"random={enh['tiled_random_nodes']}")
+        print(f"  stencil_mode={enh['stencil_mode']}, "
+              f"radius={enh['stencil_radius_bohr']} Bohr, "
+              f"k={enh['stencil_size']}")
     timings["build_rbf_operator"] = time.perf_counter() - t3
 
     # 按需单独落盘节点数据（便于后续 --load-nodes 复用，不依赖结果 JSON）
@@ -831,6 +910,7 @@ def run(cfg: CompareConfig) -> Path:
         # 结果 JSON 仅保留节点元数据；完整坐标在独立 .npz 文件中（如有）
         "rbf_nodes": _node_summary_for_result(node_storage),
         "rbf_nodes_file": str(nodes_data_path) if nodes_data_path else None,
+        "conv_cell_enhancement": _conv_cell_enhancement_summary(problem, cfg),
         "filter": {
             "EL": cfg.el,
             "NC_input": cfg.nc,
@@ -973,6 +1053,18 @@ def parse_args() -> CompareConfig:
                    help="conv_cell 自适应采样 λ2（h = h_max/(1+λ1|∇V|+λ2|ΔV|)）")
     p.add_argument("--conv-cell-adaptive-candidate-multiplier", type=float, default=8.0,
                    help="conv_cell 自适应采样候选预算倍数（相对 n_random）")
+    # Enhancement 1: finer FCC near atoms
+    p.add_argument("--conv-cell-fcc-atom-refine-factor", type=int, default=0,
+                   help="fcc_refined 增强1：在原子附近用此 scale_factor 细分 FCC（0=关闭；"
+                        "应大于 --conv-cell-fcc-scale-factor，如 base=8 时设 16）")
+    p.add_argument("--conv-cell-fcc-atom-refine-radius-frac", type=float, default=0.15,
+                   help="fcc_refined 增强1：以分数坐标为单位，原子附近的细化球半径（默认 0.15）")
+    # Ball-radius stencil with fingerprint acceleration
+    p.add_argument("--rbf-stencil-radius", type=float, default=0.0,
+                   help="以球半径（Bohr）搜索邻居并用指纹加速构建矩阵；"
+                        ">0 启用，<=0 退回标准 k 近邻（--rbf-stencil-size）")
+    p.add_argument("--rbf-stencil-fingerprint-tol", type=float, default=1e-4,
+                   help="球半径邻居模式指纹分组的绝对距离容差（Bohr，默认 1e-4）")
     p.add_argument("--exclude-boundary", action="store_true",
                    help="仅保留 interior 节点（去掉 boundary）")
     p.add_argument("--exclude-interior", action="store_true",
@@ -1056,9 +1148,13 @@ def parse_args() -> CompareConfig:
         conv_cell_adaptive_lambda_grad=a.conv_cell_adaptive_lambda_grad,
         conv_cell_adaptive_lambda_lap=a.conv_cell_adaptive_lambda_lap,
         conv_cell_adaptive_candidate_multiplier=a.conv_cell_adaptive_candidate_multiplier,
+        conv_cell_fcc_atom_refine_factor=a.conv_cell_fcc_atom_refine_factor,
+        conv_cell_fcc_atom_refine_radius_frac=a.conv_cell_fcc_atom_refine_radius_frac,
         include_interior=(not a.exclude_interior),
         include_boundary=(not a.exclude_boundary),
         node_min_dist=a.node_min_dist,
+        rbf_stencil_radius=a.rbf_stencil_radius,
+        rbf_stencil_fingerprint_tol=a.rbf_stencil_fingerprint_tol,
         quality_probe_method=a.quality_probe_method,
         quality_probe_n=a.quality_probe_n,
         power_steps=a.power_steps,
