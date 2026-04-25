@@ -960,37 +960,91 @@ def generate_conv_cell_nodes(
         cell_nodes_frac = base_fcc_frac
         cell_role_idx = np.full(len(cell_nodes_frac), 4, dtype=np.int64)  # FCC deterministic role
 
-        # 增强方法一：原子附近细密 FCC（role=5, fcc_local）
-        if int(fcc_atom_refine_factor) > 0 and float(fcc_atom_radius_frac) > 0.0:
+        n_base_fcc = int(len(cell_nodes_frac))
+        n_enh1_added = 0
+        n_enh2_added = 0
+
+        # ── Enhancement 1: finer FCC near atoms (role=5, fcc_local) ──────────
+        if int(fcc_atom_refine_factor) > fcc_scale_factor and float(fcc_atom_radius_frac) > 0.0:
             local_fcc_frac = _generate_shifted_refined_fcc_frac(
                 scale_factor=int(fcc_atom_refine_factor),
                 origin_frac=fcc_origin_frac,
             )
-            # 仅保留“到任意原子的周期距离 < radius_frac”的细密点
+            # Vectorised periodic proximity: keep points near any atom
             rad = float(fcc_atom_radius_frac)
-            if len(local_fcc_frac) and len(atom_frac):
-                d = _periodic_diff(local_fcc_frac[:, None, :], atom_frac[None, :, :])
-                d_norm = np.linalg.norm(d, axis=2)
-                near_atom = np.min(d_norm, axis=1) < rad
+            if len(local_fcc_frac) > 0 and len(atom_frac) > 0:
+                near_atom = np.zeros(len(local_fcc_frac), dtype=bool)
+                for af in atom_frac:
+                    d = np.abs(_periodic_delta_frac(local_fcc_frac, af))  # (N, 3)
+                    near_atom |= np.sqrt(np.sum(d * d, axis=1)) < rad
                 local_fcc_frac = local_fcc_frac[near_atom]
 
-            # 与基础 FCC 重叠的细密点通过 KDTree + d_min 过滤去除
-            if len(local_fcc_frac):
-                tree = cKDTree(base_fcc_frac)
-                d_cart, _ = tree.query(local_fcc_frac, k=1)
-                keep = d_cart >= float(d_min_frac)
-                local_fcc_frac = local_fcc_frac[keep]
+            # Remove fine points that duplicate or are too close to base FCC
+            if len(local_fcc_frac) > 0 and len(base_fcc_frac) > 0:
+                _shifts = np.array(
+                    [[i, j, k] for i in (-1., 0., 1.)
+                     for j in (-1., 0., 1.)
+                     for k in (-1., 0., 1.)], dtype=np.float64)
+                base_aug = np.vstack([base_fcc_frac + s for s in _shifts])
+                dists_fine, _ = cKDTree(base_aug).query(local_fcc_frac, k=1)
+                local_fcc_frac = local_fcc_frac[dists_fine >= d_min_frac]
 
-            if len(local_fcc_frac):
+            n_enh1_added = int(len(local_fcc_frac))
+            if n_enh1_added > 0:
                 cell_nodes_frac = np.vstack([base_fcc_frac, local_fcc_frac])
-                cell_nodes_frac = _unique_rows_mod1(cell_nodes_frac)
-                cell_role_idx = np.full(len(cell_nodes_frac), 4, dtype=np.int64)
-                # base+local 是按堆叠顺序去重，local 部分保持 role=5
-                if len(base_fcc_frac) < len(cell_nodes_frac):
-                    cell_role_idx[len(base_fcc_frac):] = 5
+                cell_role_idx = np.concatenate([
+                    np.full(len(base_fcc_frac), 4, dtype=np.int64),
+                    np.full(n_enh1_added, 5, dtype=np.int64),
+                ])
+            if verbose:
+                print(f"[conv_cell] Enhancement 1 (fine FCC near atoms): "
+                      f"refine_factor={fcc_atom_refine_factor}, "
+                      f"radius_frac={fcc_atom_radius_frac:.3f}, "
+                      f"added {n_enh1_added} nodes")
+
+        # ── Enhancement 2: adaptive random on top of FCC backbone ────────────
+        if adaptive_random:
+            if adaptive_gaussian_builder is None:
+                raise ValueError("adaptive_random=True requires adaptive_gaussian_builder")
+            rng_enh2 = np.random.default_rng(seed)
+            n_grid_enh2 = int(adaptive_grid_n)
+            cand_frac_enh2 = _build_uniform_frac_grid(n_grid_enh2)
+            V_cand_enh2 = np.asarray(
+                adaptive_gaussian_builder.evaluate_at_points(cand_frac_enh2 * a),
+                dtype=np.float64,
+            )
+            gnorm_enh2, lap_enh2 = _estimate_grad_laplacian_uniform(
+                V_cand_enh2, n_grid_enh2, a)
+            denom_enh2 = (1.0
+                          + float(adaptive_lambda_grad) * gnorm_enh2
+                          + float(adaptive_lambda_lap) * lap_enh2)
+            h_w_enh2 = 1.0 / np.maximum(denom_enh2, 1e-12)
+            n_cands_enh2 = int(max(1, round(float(adaptive_candidate_multiplier)
+                                             * n_random_target)))
+            take_enh2 = np.argsort(-h_w_enh2)[:min(n_cands_enh2, len(h_w_enh2))]
+            random_frac_enh2 = _adaptive_accept_and_filter_periodic(
+                candidates_frac=cand_frac_enh2[take_enh2],
+                weights_h=h_w_enh2[take_enh2],
+                d_min_frac=d_min_frac,
+                n_target=n_random_target,
+                rng=rng_enh2,
+                pinned_frac=cell_nodes_frac,
+            )
+            n_enh2_added = int(len(random_frac_enh2))
+            if n_enh2_added > 0:
+                cell_nodes_frac = np.vstack([cell_nodes_frac, random_frac_enh2])
+                cell_role_idx = np.concatenate([
+                    cell_role_idx,
+                    np.full(n_enh2_added, 2, dtype=np.int64),
+                ])
+            if verbose:
+                print(f"[conv_cell] Enhancement 2 (adaptive random): "
+                      f"λ_grad={adaptive_lambda_grad}, λ_lap={adaptive_lambda_lap}, "
+                      f"added {n_enh2_added} nodes")
+
         cell_stats: Dict[str, Any] = {
             "cell_skeleton":         0,
-            "cell_random":           0,
+            "cell_random":           n_enh2_added,
             "cell_accepted_parity":  0,
             "cell_after_filter":     int(len(cell_nodes_frac)),
             "cell_template_nodes_frac": cell_nodes_frac.copy(),
@@ -998,8 +1052,9 @@ def generate_conv_cell_nodes(
             "cell_template_roles":      cell_role_idx.copy(),
             "template_mode": "fcc_refined",
             "fcc_scale_factor": int(fcc_scale_factor),
-            "fcc_atom_refine_factor": int(fcc_atom_refine_factor),
-            "fcc_atom_radius_frac": float(fcc_atom_radius_frac),
+            "fcc_base_nodes": n_base_fcc,
+            "fcc_enh1_atom_refine_added": n_enh1_added,
+            "fcc_enh2_adaptive_random_added": n_enh2_added,
         }
     else:
         # skeleton = atoms + level-3 (these are all pinned)
@@ -1126,7 +1181,8 @@ def generate_conv_cell_nodes(
     if len(cell_nodes_cart) == 0:
         return (np.empty((0, 3), dtype=np.float64),
                 {k: np.empty(0, dtype=np.int64)
-                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity", "fcc")},
+                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity",
+                           "fcc", "fcc_local")},
                 {**cell_stats, "tiled_total": 0})
 
     nmin = np.floor((bbox_min - cell_nodes_cart.max(axis=0)) / a).astype(int) - 1
@@ -1147,7 +1203,8 @@ def generate_conv_cell_nodes(
     if not tiled_nodes:
         return (np.empty((0, 3), dtype=np.float64),
                 {k: np.empty(0, dtype=np.int64)
-                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity", "fcc")},
+                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity",
+                           "fcc", "fcc_local")},
                 {**cell_stats, "tiled_total": 0})
 
     nodes = np.vstack(tiled_nodes)
@@ -1224,17 +1281,18 @@ def generate_conv_cell_nodes(
     t_after_domain = time.perf_counter()
 
     groups: Dict[str, Array] = {
-        "interior": interior_idx,
-        "boundary": boundary_idx,
-        "atoms":    np.where(roles == 0)[0].astype(np.int64),
-        "level3":   np.where(roles == 1)[0].astype(np.int64),
-        "random":   np.where(roles == 2)[0].astype(np.int64),
-        "parity":   np.where(roles == 3)[0].astype(np.int64),
-        "fcc":      np.where(roles == 4)[0].astype(np.int64),
+        "interior":  interior_idx,
+        "boundary":  boundary_idx,
+        "atoms":     np.where(roles == 0)[0].astype(np.int64),
+        "level3":    np.where(roles == 1)[0].astype(np.int64),
+        "random":    np.where(roles == 2)[0].astype(np.int64),
+        "parity":    np.where(roles == 3)[0].astype(np.int64),
+        "fcc":       np.where(roles == 4)[0].astype(np.int64),
+        "fcc_local": np.where(roles == 5)[0].astype(np.int64),  # Enhancement 1 fine nodes
     }
 
     if min_dist_cart > 0.0 and len(nodes) > 1:
-        from scipy.spatial import cKDTree
+        # cKDTree is imported at module level — no local import needed
         # protect boundary and atom-aligned nodes first
         protected = np.zeros(len(nodes), dtype=bool)
         protected[groups["boundary"]] = True
@@ -1303,11 +1361,21 @@ def generate_conv_cell_nodes(
         i_bbox_max = (nodes[interior_idx].max(axis=0)
                       if len(interior_idx) else np.full(3, np.nan))
         print(f"[conv_cell] a={a:.4f}  bbox={bbox_min.tolist()} → {bbox_max.tolist()}")
+        tmpl_extra = ""
+        if cell_stats.get("fcc_base_nodes") is not None:
+            tmpl_extra = (
+                f"  [fcc_base={cell_stats['fcc_base_nodes']}"
+                f"  enh1_fine={cell_stats['fcc_enh1_atom_refine_added']}"
+                f"  enh2_rand={cell_stats['fcc_enh2_adaptive_random_added']}]"
+            )
         print(f"[conv_cell]   cell template: {cell_stats['cell_after_filter']} nodes "
               f"(skeleton={cell_stats['cell_skeleton']}, random={cell_stats['cell_random']}, "
-              f"parity={cell_stats['cell_accepted_parity']})")
+              f"parity={cell_stats['cell_accepted_parity']}){tmpl_extra}")
         print(f"[conv_cell]   tile shifts: {tile_range[0]}×{tile_range[1]}×{tile_range[2]} "
               f"→ {len(nodes)} tiled nodes")
+        n_fcc_local = int(len(groups.get("fcc_local", [])))
+        if n_fcc_local > 0:
+            print(f"[conv_cell]   fcc_local (enh1) tiled: {n_fcc_local} nodes")
         print(f"[conv_cell]   all-node bbox     : {np.round(a_bbox_min, 3).tolist()} → "
               f"{np.round(a_bbox_max, 3).tolist()}")
         if domain_shape == "cube":
@@ -1558,6 +1626,119 @@ def weight_matrix_conv_cell_reuse(
     return L
 
 
+# ─── Ball-radius stencil with fingerprint acceleration ───────────────────────
+
+def weight_matrix_ball_fingerprint(
+    x: Array,
+    p: Array,
+    r: float,
+    diffs,
+    phi: str = "ga",
+    eps: float = 1.0,
+    order: int = 0,
+    fingerprint_tol: float = 1e-4,
+    min_stencil: int = 4,
+    verbose: bool = True,
+) -> object:
+    """
+    Build an RBF-FD weight matrix using ball-radius stencil with fingerprint reuse.
+
+    For each interior node x_i, neighbours are all p_j with ||x_i - p_j|| ≤ r.
+    Rows with identical sorted relative-offset fingerprints (rounded to
+    fingerprint_tol Bohr) are grouped; the RBF system is solved once per unique
+    pattern and weights are reused — giving significant speedup for tiled
+    conv_cell domains where interior nodes share repeated local environments.
+
+    Parameters
+    ----------
+    x, p           : (n_interior, 3) and (n_all, 3) Cartesian node arrays (Bohr)
+    r              : ball search radius (Bohr)
+    diffs          : differential spec, e.g. [[2,0,0],[0,2,0],[0,0,2]] for Laplacian
+    phi, eps, order: RBF kernel, shape parameter, polynomial order
+    fingerprint_tol: absolute rounding tolerance (Bohr) for grouping rows
+    min_stencil    : warn if any row has fewer neighbours
+    verbose        : print grouping statistics
+
+    Returns
+    -------
+    scipy.sparse.csr_matrix of shape (n_interior, n_all)
+    """
+    from rbf.pde.fd import weight_matrix as _rbf_wm
+
+    x = np.asarray(x, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    n_int = x.shape[0]
+
+    tree = cKDTree(p)
+    stencil_lists = tree.query_ball_point(x, r)
+
+    inv_tol = 1.0 / fingerprint_tol
+    groups_fp: Dict[tuple, list] = {}
+    n_too_small = 0
+
+    for i, nbrs in enumerate(stencil_lists):
+        if len(nbrs) < min_stencil:
+            n_too_small += 1
+        offsets = p[nbrs] - x[i]                             # (k, 3)
+        rounded = np.round(offsets * inv_tol).astype(np.int64)
+        lex_order = np.lexsort(rounded.T[::-1])
+        key = tuple(map(tuple, rounded[lex_order]))
+        if key not in groups_fp:
+            groups_fp[key] = []
+        groups_fp[key].append((i, nbrs, lex_order))
+
+    if verbose:
+        stencil_sizes = [len(s) for s in stencil_lists]
+        print(f"[ball_fingerprint] n_interior={n_int}, r={r:.4f} Bohr, "
+              f"stencil min/mean/max="
+              f"{min(stencil_sizes)}/{np.mean(stencil_sizes):.1f}/{max(stencil_sizes)}, "
+              f"unique_patterns={len(groups_fp)} "
+              f"(reuse {n_int/max(len(groups_fp),1):.1f}×)")
+    if n_too_small > 0:
+        import warnings
+        warnings.warn(
+            f"[ball_fingerprint] {n_too_small} rows have <{min_stencil} neighbours "
+            f"within r={r:.4f} Bohr — increase r or check node layout.",
+            RuntimeWarning, stacklevel=2,
+        )
+
+    row_idx: list[int] = []
+    col_idx: list[int] = []
+    wdata:   list[float] = []
+    x_origin = np.zeros((1, 3), dtype=np.float64)
+
+    for key, members in groups_fp.items():
+        i0, nbrs0, lex0 = members[0]
+        k = len(nbrs0)
+        nbrs0_arr = np.asarray(nbrs0)
+        sorted_nbrs0 = nbrs0_arr[lex0]
+        p_local = p[sorted_nbrs0] - x[i0]   # (k, 3) centered at origin, lex-sorted
+
+        try:
+            wmat = _rbf_wm(x=x_origin, p=p_local, n=k,
+                           diffs=diffs, phi=phi, eps=eps, order=order)
+            w_sorted = np.asarray(wmat.toarray()[0], dtype=np.float64)
+        except Exception as exc:
+            import warnings
+            warnings.warn(
+                f"[ball_fingerprint] weight_matrix failed (k={k}): {exc}",
+                RuntimeWarning, stacklevel=2,
+            )
+            w_sorted = np.zeros(k, dtype=np.float64)
+
+        for (i, nbrs, lex_i) in members:
+            sorted_nbrs_i = np.asarray(nbrs)[lex_i]
+            for j, j_global in enumerate(sorted_nbrs_i):
+                row_idx.append(i)
+                col_idx.append(int(j_global))
+                wdata.append(float(w_sorted[j]))
+
+    return sp.csr_matrix(
+        (wdata, (row_idx, col_idx)),
+        shape=(n_int, p.shape[0]),
+    )
+
+
 # ─── QD problem builder ──────────────────────────────────────────────────────
 
 def build_qd_problem(
@@ -1595,6 +1776,8 @@ def build_qd_problem(
     conv_cell_adaptive_lambda_lap: float = 0.0,
     conv_cell_adaptive_candidate_multiplier: float = 8.0,
     conv_cell_reuse_weights: bool = True,
+    stencil_radius: float = 0.0,
+    stencil_fingerprint_tol: float = 1e-4,
     include_interior: bool = True,
     include_boundary: bool = True,
     node_min_dist: float = 0.0,
@@ -1680,6 +1863,10 @@ def build_qd_problem(
                                               before accept+KDTree filtering
     conv_cell_reuse_weights  : when True (default), reuse repeated stencil
                                solves in conv_cell Laplacian assembly
+    stencil_radius           : ball search radius (Bohr) for ball-stencil mode;
+                               0 = disabled (use k-nearest stencil_size instead)
+    stencil_fingerprint_tol  : rounding tolerance (Bohr) for fingerprint grouping
+                               in ball-stencil mode (default 1e-4)
     """
     from scipy.interpolate import RegularGridInterpolator
 
@@ -1800,6 +1987,10 @@ def build_qd_problem(
         groups["conv_cell_step_after_domain_roles"] = _cell_stats.get("step_after_domain_roles")
         groups["conv_cell_step_after_close_filter_nodes_cart"] = _cell_stats.get("step_after_close_filter_nodes_cart")
         groups["conv_cell_step_timings_seconds"] = _cell_stats.get("timings_seconds")
+        # Enhancement stats (exposed for caller / result JSON)
+        groups["_enh1_fcc_base"]  = _cell_stats.get("fcc_base_nodes", 0)
+        groups["_enh1_added"]     = _cell_stats.get("fcc_enh1_atom_refine_added", 0)
+        groups["_enh2_added"]     = _cell_stats.get("fcc_enh2_adaptive_random_added", 0)
         interior_idx = groups["interior"]
         cfg_L = float(np.max(np.abs(nodes))) if len(nodes) else 0.0
 
@@ -1834,12 +2025,25 @@ def build_qd_problem(
     V_nodes = np.clip(V_nodes, None, v_cap)
     _raise_on_nonfinite("V_nodes (after clip)", V_nodes)
 
-    if domain == "conv_cell" and conv_cell_reuse_weights:
+    _lap_diffs = [[2, 0, 0], [0, 2, 0], [0, 0, 2]]
+    if stencil_radius > 0.0:
+        laplacian_matrix = weight_matrix_ball_fingerprint(
+            x=nodes[interior_idx],
+            p=nodes,
+            r=float(stencil_radius),
+            diffs=_lap_diffs,
+            phi=phi,
+            eps=eps,
+            order=order,
+            fingerprint_tol=float(stencil_fingerprint_tol),
+            verbose=True,
+        )
+    elif domain == "conv_cell" and conv_cell_reuse_weights:
         laplacian_matrix = weight_matrix_conv_cell_reuse(
             x=nodes[interior_idx],
             p=nodes,
             n=stencil_size,
-            diffs=[[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+            diffs=_lap_diffs,
             phi=phi,
             eps=eps,
             order=order,
@@ -1849,7 +2053,7 @@ def build_qd_problem(
             x=nodes[interior_idx],
             p=nodes,
             n=stencil_size,
-            diffs=[[2, 0, 0], [0, 2, 0], [0, 0, 2]],
+            diffs=_lap_diffs,
             phi=phi,
             eps=eps,
             order=order,

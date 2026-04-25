@@ -59,6 +59,8 @@ class CompareConfig:
 
     rbf_spacing: float = 0.5
     rbf_stencil_size: int = 80
+    rbf_stencil_radius: float = 0.0
+    rbf_stencil_fingerprint_tol: float = 1e-4
     rbf_phi: str = "phs3"
     rbf_eps: float = 0.5
     rbf_order: int = 2
@@ -610,6 +612,8 @@ def run(cfg: CompareConfig) -> Path:
             "conv_cell_adaptive_lambda_grad": cfg.conv_cell_adaptive_lambda_grad,
             "conv_cell_adaptive_lambda_lap":  cfg.conv_cell_adaptive_lambda_lap,
             "conv_cell_adaptive_candidate_multiplier": cfg.conv_cell_adaptive_candidate_multiplier,
+            "rbf_stencil_radius": cfg.rbf_stencil_radius,
+            "rbf_stencil_fingerprint_tol": cfg.rbf_stencil_fingerprint_tol,
             "include_interior": cfg.include_interior,
             "include_boundary": cfg.include_boundary,
             "node_min_dist": cfg.node_min_dist,
@@ -669,6 +673,8 @@ def run(cfg: CompareConfig) -> Path:
                 conv_cell_adaptive_lambda_grad=cfg.conv_cell_adaptive_lambda_grad,
                 conv_cell_adaptive_lambda_lap=cfg.conv_cell_adaptive_lambda_lap,
                 conv_cell_adaptive_candidate_multiplier=cfg.conv_cell_adaptive_candidate_multiplier,
+                stencil_radius=cfg.rbf_stencil_radius,
+                stencil_fingerprint_tol=cfg.rbf_stencil_fingerprint_tol,
                 include_interior=cfg.include_interior,
                 include_boundary=cfg.include_boundary,
                 node_min_dist=cfg.node_min_dist,
@@ -1018,6 +1024,26 @@ def run(cfg: CompareConfig) -> Path:
     if h_rbf_matrix_stats is not None:
         out["rbf_operator"] = {"matrix_data_stats": h_rbf_matrix_stats}
 
+    if cfg.rbf_node_method == "conv_cell" and not cfg.fft_only and not cfg.load_nodes:
+        grp = problem.groups
+        enh = {
+            "fcc_base_nodes":            int(grp.get("_enh1_fcc_base", 0)),
+            "enh1_atom_refine_added":    int(grp.get("_enh1_added", 0)),
+            "enh2_adaptive_random_added": int(grp.get("_enh2_added", 0)),
+            "fcc_local_tiled":           int(len(grp.get("fcc_local", []))),
+            "stencil_radius_bohr":       cfg.rbf_stencil_radius,
+            "stencil_fingerprint_tol":   cfg.rbf_stencil_fingerprint_tol,
+        }
+        out["conv_cell_enhancement"] = enh
+        if enh["enh1_atom_refine_added"] > 0 or enh["enh2_adaptive_random_added"] > 0:
+            print(
+                f"[conv_cell enhancement] "
+                f"fcc_base={enh['fcc_base_nodes']}  "
+                f"enh1_fine={enh['enh1_atom_refine_added']}  "
+                f"enh2_rand={enh['enh2_adaptive_random_added']}  "
+                f"fcc_local_tiled={enh['fcc_local_tiled']}"
+            )
+
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1044,6 +1070,11 @@ def parse_args() -> CompareConfig:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--rbf-spacing", type=float, default=0.5)
     p.add_argument("--rbf-stencil-size", type=int, default=80)
+    p.add_argument("--rbf-stencil-radius", type=float, default=0.0,
+                   help="ball-stencil 搜索半径（Bohr）；>0 时用 ball 半径搜索邻居+指纹加速，"
+                        "0=禁用（使用 k-nearest stencil_size）")
+    p.add_argument("--rbf-stencil-fingerprint-tol", type=float, default=1e-4,
+                   help="ball-stencil 指纹分组舍入容差（Bohr，默认 1e-4）")
     p.add_argument("--rbf-phi", type=str, default="phs3")
     p.add_argument("--rbf-eps", type=float, default=0.5)
     p.add_argument("--rbf-order", type=int, default=2)
@@ -1170,6 +1201,8 @@ def parse_args() -> CompareConfig:
         seed=a.seed,
         rbf_spacing=a.rbf_spacing,
         rbf_stencil_size=a.rbf_stencil_size,
+        rbf_stencil_radius=a.rbf_stencil_radius,
+        rbf_stencil_fingerprint_tol=a.rbf_stencil_fingerprint_tol,
         rbf_phi=a.rbf_phi,
         rbf_eps=a.rbf_eps,
         rbf_order=a.rbf_order,
