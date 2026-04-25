@@ -162,7 +162,35 @@ def _read_cube_header(cube_path: Path):
 
 def _rayleigh(H_apply, psi: np.ndarray) -> float:
     hpsi = H_apply(psi)
-    return float(np.vdot(psi, hpsi).real / np.vdot(psi, psi).real)
+    denom = float(np.vdot(psi, psi).real)
+    if (not np.isfinite(denom)) or denom <= 0.0:
+        return float("nan")
+    num = float(np.vdot(psi, hpsi).real)
+    return float(num / denom)
+
+
+def _finite_stats(name: str, arr: np.ndarray) -> dict[str, Any]:
+    """Return finite/non-finite diagnostics for a vector or matrix."""
+    a = np.asarray(arr)
+    finite_mask = np.isfinite(a)
+    n_total = int(a.size)
+    n_finite = int(np.count_nonzero(finite_mask))
+    stats: dict[str, Any] = {
+        "name": name,
+        "shape": list(a.shape),
+        "n_total": n_total,
+        "n_finite": n_finite,
+        "n_nonfinite": n_total - n_finite,
+        "all_finite": bool(np.all(finite_mask)),
+    }
+    if n_finite > 0:
+        a_f = a[finite_mask]
+        stats.update({
+            "min": float(np.min(a_f)),
+            "max": float(np.max(a_f)),
+            "mean_abs": float(np.mean(np.abs(a_f))),
+        })
+    return stats
 
 
 def _power_method_energy(H_apply, psi0: np.ndarray, n_steps: int = 30) -> float:
@@ -499,6 +527,7 @@ def run(cfg: CompareConfig) -> Path:
     nodes_data_path: Path | None = None
     n_interior = 0
     H_rbf_op = None
+    h_rbf_matrix_stats: dict[str, Any] | None = None
     interior_idx = np.array([], dtype=np.int64)
     if not cfg.fft_only:
         t3 = time.perf_counter()
@@ -607,6 +636,13 @@ def run(cfg: CompareConfig) -> Path:
             )
             problem = build_problem(config=rbf_cfg, build_interpolation=False)
         H_rbf = build_hamiltonian_matrix(problem, symmetrize=True)
+        h_rbf_matrix_stats = _finite_stats("H_rbf.data", H_rbf.data)
+        if not h_rbf_matrix_stats["all_finite"]:
+            raise RuntimeError(
+                "RBF Hamiltonian contains NaN/Inf values. "
+                "Try adjusting node/stencil parameters (e.g. --rbf-stencil-size, "
+                "--rbf-eps, --conv-cell-d-min-frac) to improve conditioning."
+            )
         H_rbf_op = spla.aslinearoperator(H_rbf)
         interior_idx = problem.interior_idx
         n_interior = int(len(interior_idx))
@@ -663,6 +699,7 @@ def run(cfg: CompareConfig) -> Path:
     per_state = []
     fft_basis = []
     rbf_basis = []
+    rbf_invalid_states: list[dict[str, Any]] = []
 
     t4 = time.perf_counter()
     for i in range(cfg.n_random):
@@ -682,10 +719,28 @@ def run(cfg: CompareConfig) -> Path:
             psi_int /= np.linalg.norm(psi_int)
             rbf_filt = apply_filter_H_all_op(H_rbf_op.matvec, psi_int, samp, an, phys)[0]
             norm_rbf = float(np.linalg.norm(rbf_filt))
-            if norm_rbf > 0:
+            is_valid_rbf = np.isfinite(norm_rbf) and (norm_rbf > 0.0) and np.all(np.isfinite(rbf_filt))
+            if is_valid_rbf:
                 rbf_filt = rbf_filt / norm_rbf
-            E_rbf = _rayleigh(H_rbf_op.matvec, rbf_filt)
-            rbf_basis.append(rbf_filt)
+                E_rbf = _rayleigh(H_rbf_op.matvec, rbf_filt)
+                if np.isfinite(E_rbf):
+                    rbf_basis.append(rbf_filt)
+                else:
+                    rbf_invalid_states.append({
+                        "state_index": i,
+                        "reason": "rayleigh_nonfinite",
+                        "filter_norm_rbf": norm_rbf,
+                        "filter_stats": _finite_stats("rbf_filt", rbf_filt),
+                    })
+                    E_rbf = None
+            else:
+                rbf_invalid_states.append({
+                    "state_index": i,
+                    "reason": "filter_output_nonfinite_or_zero_norm",
+                    "filter_norm_rbf": norm_rbf,
+                    "filter_stats": _finite_stats("rbf_filt", rbf_filt),
+                })
+                E_rbf = None
 
         per_state.append(
             {
@@ -716,7 +771,7 @@ def run(cfg: CompareConfig) -> Path:
 
     evals_rbf: np.ndarray = np.array([], dtype=np.float64)
     rank_rbf = 0
-    if not cfg.fft_only and H_rbf_op is not None:
+    if not cfg.fft_only and H_rbf_op is not None and len(rbf_basis) > 0:
         rbf_basis_mat = np.column_stack(rbf_basis)
         t6 = time.perf_counter()
         evals_rbf, _, rank_rbf = svd_rayleigh_ritz_op(
@@ -727,6 +782,8 @@ def run(cfg: CompareConfig) -> Path:
             hermitian=True,
         )
         timings["rr_rbf"] = time.perf_counter() - t6
+    elif not cfg.fft_only and H_rbf_op is not None:
+        timings["rr_rbf"] = 0.0
 
     # ── 可选：带插值的对照 Ritz ─────────────────────────────────────────────
     # 把 RBF 滤波基从 n_interior 非均匀节点插到 FFT 均匀格点 (n_grid)，
@@ -877,8 +934,11 @@ def run(cfg: CompareConfig) -> Path:
             "paired_level_diffs_rbf_interp_vs_fft":   paired_interp_vs_fft,
             "avg_abs_error_eigenvalues": avg_eval_err,
             "avg_abs_error_interp_effect": avg_interp_eff,   # ← 插值的净影响
+            "n_valid_rbf_basis": int(len(rbf_basis)),
+            "n_invalid_rbf_basis": int(len(rbf_invalid_states)),
         },
         "per_state_filtered_energy": per_state,
+        "rbf_invalid_states": rbf_invalid_states,
         "per_state_filtered_energy_interp": per_state_interp,
         "summary": {
             "avg_abs_error_per_state_filtered_energy": avg_state_err,
@@ -892,6 +952,8 @@ def run(cfg: CompareConfig) -> Path:
         },
         "timings_sec": timings,
     }
+    if h_rbf_matrix_stats is not None:
+        out["rbf_operator"] = {"matrix_data_stats": h_rbf_matrix_stats}
 
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

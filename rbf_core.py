@@ -967,7 +967,13 @@ def generate_conv_cell_nodes(
             denom = 1.0 + float(adaptive_lambda_grad) * gnorm + float(adaptive_lambda_lap) * lap_abs
             h_w = 1.0 / np.maximum(denom, 1e-12)
             n_candidates = int(max(1, round(float(adaptive_candidate_multiplier) * n_random_target)))
-            take = np.argsort(-h_w)[: min(n_candidates, len(h_w))]
+            n_take = min(n_candidates, len(h_w))
+            # 当 λ_grad=λ_lap=0（或权重近乎常数）时，不应由 argsort 的索引顺序
+            # 决定候选点（那会偏向网格前缀区域）；应在全域均匀抽样。
+            if np.allclose(h_w, h_w[0], rtol=0.0, atol=1e-14):
+                take = rng.choice(len(h_w), size=n_take, replace=False)
+            else:
+                take = np.argsort(-h_w)[:n_take]
             random_frac = _adaptive_accept_and_filter_periodic(
                 candidates_frac=cand_frac[take],
                 weights_h=h_w[take],
