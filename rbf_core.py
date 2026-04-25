@@ -852,6 +852,8 @@ def generate_conv_cell_nodes(
     template_mode: str = "hybrid",
     fcc_scale_factor: int = 8,
     fcc_origin_frac: Optional[Array] = None,
+    fcc_atom_refine_factor: int = 0,
+    fcc_atom_radius_frac: float = 0.0,
     atom_frac: Optional[Array] = None,
     level3_base_frac: Optional[Array] = None,
     use_rbf_poisson: bool = True,
@@ -922,7 +924,7 @@ def generate_conv_cell_nodes(
               arrays for saving/inspection:
                   cell_template_nodes_frac : (N_cell, 3), [0,1)^3
                   cell_template_nodes_cart : (N_cell, 3), Bohr
-                  cell_template_roles      : (N_cell,), 0/1/2/3
+                  cell_template_roles      : (N_cell,), 0/1/2/3/4/5
     """
     import time
 
@@ -953,9 +955,39 @@ def generate_conv_cell_nodes(
         raise ValueError(f"template_mode must be 'hybrid' or 'fcc_refined', got {template_mode!r}")
 
     if template_mode == "fcc_refined":
-        cell_nodes_frac = _generate_shifted_refined_fcc_frac(
+        base_fcc_frac = _generate_shifted_refined_fcc_frac(
             scale_factor=fcc_scale_factor, origin_frac=fcc_origin_frac)
+        cell_nodes_frac = base_fcc_frac
         cell_role_idx = np.full(len(cell_nodes_frac), 4, dtype=np.int64)  # FCC deterministic role
+
+        # 增强方法一：原子附近细密 FCC（role=5, fcc_local）
+        if int(fcc_atom_refine_factor) > 0 and float(fcc_atom_radius_frac) > 0.0:
+            local_fcc_frac = _generate_shifted_refined_fcc_frac(
+                scale_factor=int(fcc_atom_refine_factor),
+                origin_frac=fcc_origin_frac,
+            )
+            # 仅保留“到任意原子的周期距离 < radius_frac”的细密点
+            rad = float(fcc_atom_radius_frac)
+            if len(local_fcc_frac) and len(atom_frac):
+                d = _periodic_diff(local_fcc_frac[:, None, :], atom_frac[None, :, :])
+                d_norm = np.linalg.norm(d, axis=2)
+                near_atom = np.min(d_norm, axis=1) < rad
+                local_fcc_frac = local_fcc_frac[near_atom]
+
+            # 与基础 FCC 重叠的细密点通过 KDTree + d_min 过滤去除
+            if len(local_fcc_frac):
+                tree = cKDTree(base_fcc_frac)
+                d_cart, _ = tree.query(local_fcc_frac, k=1)
+                keep = d_cart >= float(d_min_frac)
+                local_fcc_frac = local_fcc_frac[keep]
+
+            if len(local_fcc_frac):
+                cell_nodes_frac = np.vstack([base_fcc_frac, local_fcc_frac])
+                cell_nodes_frac = _unique_rows_mod1(cell_nodes_frac)
+                cell_role_idx = np.full(len(cell_nodes_frac), 4, dtype=np.int64)
+                # base+local 是按堆叠顺序去重，local 部分保持 role=5
+                if len(base_fcc_frac) < len(cell_nodes_frac):
+                    cell_role_idx[len(base_fcc_frac):] = 5
         cell_stats: Dict[str, Any] = {
             "cell_skeleton":         0,
             "cell_random":           0,
@@ -966,6 +998,8 @@ def generate_conv_cell_nodes(
             "cell_template_roles":      cell_role_idx.copy(),
             "template_mode": "fcc_refined",
             "fcc_scale_factor": int(fcc_scale_factor),
+            "fcc_atom_refine_factor": int(fcc_atom_refine_factor),
+            "fcc_atom_radius_frac": float(fcc_atom_radius_frac),
         }
     else:
         # skeleton = atoms + level-3 (these are all pinned)
@@ -1548,6 +1582,8 @@ def build_qd_problem(
     conv_cell_template_mode: str = "hybrid",
     conv_cell_fcc_scale_factor: int = 8,
     conv_cell_fcc_origin_frac: Optional[Array] = None,
+    conv_cell_fcc_atom_refine_factor: int = 0,
+    conv_cell_fcc_atom_radius_frac: float = 0.0,
     conv_cell_boundary_margin_frac: float = 0.06,
     conv_cell_use_rbf_poisson: bool = True,
     conv_cell_domain_shape: str = "cube",
@@ -1630,6 +1666,11 @@ def build_qd_problem(
     conv_cell_sphere_radius  : sphere radius (Bohr) when conv_cell_domain_shape='sphere';
                                None means 0.5*min(bbox side lengths)
     conv_cell_sphere_subdivide : icosphere subdivision for spherical boundary
+    conv_cell_fcc_atom_refine_factor : local FCC refinement scale around atoms
+                                       (0 disables this enhancement)
+    conv_cell_fcc_atom_radius_frac : keep local refined FCC points whose
+                                     periodic distance to any atom is < this
+                                     fractional radius (0 disables)
     conv_cell_adaptive_random : if True, random template points are sampled by
                                 dense-grid potential-adaptive accept/reject
     conv_cell_adaptive_grid_n : one-cell dense uniform grid resolution per axis
@@ -1732,6 +1773,8 @@ def build_qd_problem(
             template_mode=conv_cell_template_mode,
             fcc_scale_factor=conv_cell_fcc_scale_factor,
             fcc_origin_frac=conv_cell_fcc_origin_frac,
+            fcc_atom_refine_factor=conv_cell_fcc_atom_refine_factor,
+            fcc_atom_radius_frac=conv_cell_fcc_atom_radius_frac,
             boundary_margin_frac=conv_cell_boundary_margin_frac,
             use_rbf_poisson=conv_cell_use_rbf_poisson,
             domain_shape=conv_cell_domain_shape,
