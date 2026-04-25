@@ -193,6 +193,53 @@ def _finite_stats(name: str, arr: np.ndarray) -> dict[str, Any]:
     return stats
 
 
+def _first_nonfinite_detail(arr: np.ndarray) -> dict[str, Any] | None:
+    a = np.asarray(arr)
+    bad = np.argwhere(~np.isfinite(a))
+    if bad.size == 0:
+        return None
+    idx = tuple(int(i) for i in bad[0])
+    return {"index": list(idx), "value": float(np.real(a[idx]))}
+
+
+def _trace_matvec_nonfinite(
+    H_apply,
+    psi0: np.ndarray,
+    n_steps: int,
+    stage_name: str,
+) -> dict[str, Any]:
+    """
+    Probe repeated H-apply stability to localize where NaN/Inf first appears.
+    """
+    psi = np.asarray(psi0, dtype=float).copy()
+    trace: dict[str, Any] = {
+        "stage": stage_name,
+        "input_stats": _finite_stats(f"{stage_name}_psi0", psi),
+        "first_nonfinite_step": None,
+        "first_nonfinite_component": None,
+    }
+    if not trace["input_stats"]["all_finite"]:
+        trace["first_nonfinite_step"] = 0
+        trace["first_nonfinite_component"] = _first_nonfinite_detail(psi)
+        return trace
+
+    for k in range(1, max(1, int(n_steps)) + 1):
+        psi = H_apply(psi)
+        if not np.all(np.isfinite(psi)):
+            trace["first_nonfinite_step"] = k
+            trace["first_nonfinite_component"] = _first_nonfinite_detail(psi)
+            trace["step_stats"] = _finite_stats(f"{stage_name}_after_{k}_matvec", psi)
+            break
+        nrm = np.linalg.norm(psi)
+        if (not np.isfinite(nrm)) or nrm == 0.0:
+            trace["first_nonfinite_step"] = k
+            trace["first_nonfinite_component"] = {"norm": float(nrm)}
+            break
+        psi /= nrm
+
+    return trace
+
+
 def _power_method_energy(H_apply, psi0: np.ndarray, n_steps: int = 30) -> float:
     psi = np.asarray(psi0, dtype=float).copy()
     nrm = np.linalg.norm(psi)
@@ -638,8 +685,10 @@ def run(cfg: CompareConfig) -> Path:
         H_rbf = build_hamiltonian_matrix(problem, symmetrize=True)
         h_rbf_matrix_stats = _finite_stats("H_rbf.data", H_rbf.data)
         if not h_rbf_matrix_stats["all_finite"]:
+            bad_detail = _first_nonfinite_detail(H_rbf.data)
             raise RuntimeError(
                 "RBF Hamiltonian contains NaN/Inf values. "
+                f"first_bad={bad_detail}. "
                 "Try adjusting node/stencil parameters (e.g. --rbf-stencil-size, "
                 "--rbf-eps, --conv-cell-d-min-frac) to improve conditioning."
             )
@@ -731,6 +780,10 @@ def run(cfg: CompareConfig) -> Path:
                         "reason": "rayleigh_nonfinite",
                         "filter_norm_rbf": norm_rbf,
                         "filter_stats": _finite_stats("rbf_filt", rbf_filt),
+                        "nonfinite_detail": _first_nonfinite_detail(rbf_filt),
+                        "matvec_trace": _trace_matvec_nonfinite(
+                            H_rbf_op.matvec, psi_int, n_steps=min(8, cfg.nc), stage_name="rbf_filter_input"
+                        ),
                     })
                     E_rbf = None
             else:
@@ -739,6 +792,10 @@ def run(cfg: CompareConfig) -> Path:
                     "reason": "filter_output_nonfinite_or_zero_norm",
                     "filter_norm_rbf": norm_rbf,
                     "filter_stats": _finite_stats("rbf_filt", rbf_filt),
+                    "nonfinite_detail": _first_nonfinite_detail(rbf_filt),
+                    "matvec_trace": _trace_matvec_nonfinite(
+                        H_rbf_op.matvec, psi_int, n_steps=min(8, cfg.nc), stage_name="rbf_filter_input"
+                    ),
                 })
                 E_rbf = None
 
