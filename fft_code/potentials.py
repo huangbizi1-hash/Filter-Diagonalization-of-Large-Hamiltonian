@@ -40,24 +40,31 @@ def build_potential_from_config(cfg: Dict[str, Any], N: int) -> Tuple:
 
     gaussian_files 类型调用 GaussianPotentialBuilder（根目录模块）。
 
-    返回 x, y, z, X, Y, Z, x_grid, V
+    返回 x, y, z, X, Y, Z, x_grid, V, potential_meta
     """
     pot   = cfg["potential"]
     ptype = pot["type"]
 
+    potential_meta: Dict[str, Any] = {"type": ptype}
+
     if ptype == "ho3d":
         x, y, z, X, Y, Z, x_grid = build_grid(N, pot["d"])
         V = build_ho3d(X, Y, Z, omega=pot["omega"])
+        potential_meta["omega"] = pot["omega"]
 
     elif ptype == "harmonic_well":
         x, y, z, X, Y, Z, x_grid = build_grid(N, pot["d"])
         V = build_harmonic_well(X, Y, Z,
                                 center_locations=pot["center_locations"],
                                 width=pot["width"])
+        potential_meta["width"] = pot["width"]
+        potential_meta["n_centers"] = len(pot["center_locations"])
 
     elif ptype == "gaussian_blob":
         x, y, z, X, Y, Z, x_grid = build_grid(N, pot["d"])
         V = build_gaussian_blob(X, Y, Z, h=pot["h"], mu=pot["mu"])
+        potential_meta["h"] = pot["h"]
+        potential_meta["mu"] = pot["mu"]
 
     elif ptype == "gaussian_files":
         from gaussian_potential_builder import GaussianPotentialBuilder
@@ -69,8 +76,15 @@ def build_potential_from_config(cfg: Dict[str, Any], N: int) -> Tuple:
         x, y, z, V = builder.build_potential(N)
         X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
         x_grid  = [x, y, z]
+        potential_meta.update({
+            "cube_file": pot["cube_file"],
+            "params_file": pot["params_file"],
+            "r_cut": pot["r_cut"],
+            "n_atoms": len(builder.atoms),
+            "atom_types": sorted(set(builder.atom_types)),
+        })
 
     else:
         raise ValueError(f"Unknown potential type: '{ptype}'")
 
-    return x, y, z, X, Y, Z, x_grid, V
+    return x, y, z, X, Y, Z, x_grid, V, potential_meta
