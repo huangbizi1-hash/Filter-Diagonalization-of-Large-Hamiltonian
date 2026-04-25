@@ -1155,7 +1155,13 @@ def parse_args() -> CompareConfig:
     p.add_argument("--el", type=float, default=-0.18)
     p.add_argument("--nc", type=int, default=500)
     p.add_argument("--dE", type=float, default=50.0)
-    p.add_argument("--Vmin", type=float, default=-5.0)
+    p.add_argument(
+        "--emin", "--V-min", "--Vmin", "--V_min",
+        dest="emin",
+        type=float,
+        default=-5.0,
+        help="filter 能量窗口下界 E_min（兼容旧参数 --Vmin/--V_min）",
+    )
     p.add_argument("--n-random", type=int, default=16)
     p.add_argument("--svd-tol", type=float, default=1e-3)
     p.add_argument("--max-energies", type=int, default=30)
@@ -1286,7 +1292,7 @@ def parse_args() -> CompareConfig:
         el=a.el,
         nc=a.nc,
         dE=a.dE,
-        Vmin=a.Vmin,
+        Vmin=a.emin,
         n_random=a.n_random,
         svd_tol=a.svd_tol,
         max_energies=a.max_energies,
