@@ -60,6 +60,9 @@ class CompareConfig:
     rbf_stencil_size: int = 80
     rbf_stencil_radius: float = 0.0
     rbf_stencil_fingerprint_tol: float = 1e-4
+    rbf_stencil_inner_radius: float = 0.0
+    rbf_stencil_max_neighbors: int = 0
+    rbf_stencil_select_near_first: bool = True
     rbf_phi: str = "phs3"
     rbf_eps: float = 0.5
     rbf_order: int = 2
@@ -679,6 +682,9 @@ def run(cfg: CompareConfig) -> Path:
             "conv_cell_adaptive_candidate_multiplier": cfg.conv_cell_adaptive_candidate_multiplier,
             "rbf_stencil_radius": cfg.rbf_stencil_radius,
             "rbf_stencil_fingerprint_tol": cfg.rbf_stencil_fingerprint_tol,
+            "rbf_stencil_inner_radius": cfg.rbf_stencil_inner_radius,
+            "rbf_stencil_max_neighbors": cfg.rbf_stencil_max_neighbors,
+            "rbf_stencil_select_near_first": cfg.rbf_stencil_select_near_first,
             "include_interior": cfg.include_interior,
             "include_boundary": cfg.include_boundary,
             "node_min_dist": cfg.node_min_dist,
@@ -740,6 +746,9 @@ def run(cfg: CompareConfig) -> Path:
                 conv_cell_adaptive_candidate_multiplier=cfg.conv_cell_adaptive_candidate_multiplier,
                 stencil_radius=cfg.rbf_stencil_radius,
                 stencil_fingerprint_tol=cfg.rbf_stencil_fingerprint_tol,
+                stencil_inner_radius=cfg.rbf_stencil_inner_radius,
+                stencil_max_neighbors=cfg.rbf_stencil_max_neighbors,
+                stencil_select_near_first=cfg.rbf_stencil_select_near_first,
                 include_interior=cfg.include_interior,
                 include_boundary=cfg.include_boundary,
                 node_min_dist=cfg.node_min_dist,
@@ -1156,8 +1165,6 @@ def run(cfg: CompareConfig) -> Path:
             "enh1_atom_refine_added":    int(grp.get("_enh1_added", 0)),
             "enh2_adaptive_random_added": int(grp.get("_enh2_added", 0)),
             "fcc_local_tiled":           int(len(grp.get("fcc_local", []))),
-            "stencil_radius_bohr":       cfg.rbf_stencil_radius,
-            "stencil_fingerprint_tol":   cfg.rbf_stencil_fingerprint_tol,
         }
         out["conv_cell_enhancement"] = enh
         if enh["enh1_atom_refine_added"] > 0 or enh["enh2_adaptive_random_added"] > 0:
@@ -1168,6 +1175,32 @@ def run(cfg: CompareConfig) -> Path:
                 f"enh2_rand={enh['enh2_adaptive_random_added']}  "
                 f"fcc_local_tiled={enh['fcc_local_tiled']}"
             )
+
+    if cfg.rbf_stencil_radius > 0.0 and not cfg.fft_only and not cfg.load_nodes:
+        _ball_stats = problem.groups.get("_ball_stencil_stats")
+        if _ball_stats is not None:
+            out["stencil_neighbor_stats"] = _ball_stats
+            # Pretty console summary
+            bc = _ball_stats["neighbor_bins"]
+            bp = _ball_stats["neighbor_bins_pct"]
+            print(
+                f"[stencil] outer={_ball_stats['outer_radius_bohr']:.3f} Bohr"
+                + (f"  inner={_ball_stats['inner_radius_bohr']:.3f}" if _ball_stats["inner_radius_bohr"] > 0 else "")
+                + (f"  max_cap={_ball_stats['max_neighbors_cap']}({'near' if _ball_stats['select_near_first'] else 'far'})"
+                   if _ball_stats["max_neighbors_cap"] > 0 else "")
+            )
+            print(
+                f"  min/mean/max neighbours: "
+                f"{_ball_stats['min_neighbors']} / "
+                f"{_ball_stats['mean_neighbors']:.1f} / "
+                f"{_ball_stats['max_neighbors_actual']}"
+            )
+            print("  distribution (count / %):")
+            for lbl in ["<8", "8-15", "16-31", "32-63", "64-127", "128-255", ">=256"]:
+                cnt = bc.get(lbl, 0)
+                pct = bp.get(lbl, 0.0)
+                if cnt > 0:
+                    print(f"    {lbl:>8} neighbours: {cnt:>8}  ({pct:.1f}%)")
 
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1206,6 +1239,14 @@ def parse_args() -> CompareConfig:
                         "0=禁用（使用 k-nearest stencil_size）")
     p.add_argument("--rbf-stencil-fingerprint-tol", type=float, default=1e-4,
                    help="ball-stencil 指纹分组舍入容差（Bohr，默认 1e-4）")
+    p.add_argument("--rbf-stencil-inner-radius", type=float, default=0.0,
+                   help="ball-stencil 内半径（Bohr）；在 [inner, outer] 球壳内选邻居，"
+                        "中心节点自身（距离0）始终保留；0=禁用")
+    p.add_argument("--rbf-stencil-max-neighbors", type=int, default=0,
+                   help="ball-stencil 最大邻居数上限（0=不限）；超出时按"
+                        " --rbf-stencil-select-near/far 策略裁剪")
+    p.add_argument("--rbf-stencil-select-far-first", action="store_true",
+                   help="超过最大邻居数时优先保留远处节点（默认保留近处节点）")
     p.add_argument("--rbf-phi", type=str, default="phs3")
     p.add_argument("--rbf-eps", type=float, default=0.5)
     p.add_argument("--rbf-order", type=int, default=2)
@@ -1334,6 +1375,9 @@ def parse_args() -> CompareConfig:
         rbf_stencil_size=a.rbf_stencil_size,
         rbf_stencil_radius=a.rbf_stencil_radius,
         rbf_stencil_fingerprint_tol=a.rbf_stencil_fingerprint_tol,
+        rbf_stencil_inner_radius=a.rbf_stencil_inner_radius,
+        rbf_stencil_max_neighbors=a.rbf_stencil_max_neighbors,
+        rbf_stencil_select_near_first=(not a.rbf_stencil_select_far_first),
         rbf_phi=a.rbf_phi,
         rbf_eps=a.rbf_eps,
         rbf_order=a.rbf_order,

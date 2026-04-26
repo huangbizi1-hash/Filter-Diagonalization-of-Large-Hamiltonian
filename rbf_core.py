@@ -1639,29 +1639,40 @@ def weight_matrix_ball_fingerprint(
     fingerprint_tol: float = 1e-4,
     min_stencil: int = 4,
     verbose: bool = True,
-) -> object:
+    inner_radius: float = 0.0,
+    max_neighbors: int = 0,
+    select_near_first: bool = True,
+) -> tuple:
     """
     Build an RBF-FD weight matrix using ball-radius stencil with fingerprint reuse.
 
-    For each interior node x_i, neighbours are all p_j with ||x_i - p_j|| ≤ r.
+    For each interior node x_i, neighbours are all p_j with
+    inner_radius <= ||x_i - p_j|| <= r  (the center point itself, dist=0, is
+    always kept).  If max_neighbors > 0 and the shell still has more points,
+    keep the nearest (select_near_first=True) or farthest (False) max_neighbors.
+
     Rows with identical sorted relative-offset fingerprints (rounded to
     fingerprint_tol Bohr) are grouped; the RBF system is solved once per unique
-    pattern and weights are reused — giving significant speedup for tiled
-    conv_cell domains where interior nodes share repeated local environments.
+    pattern and weights reused — exploiting translational symmetry in tiled
+    conv_cell domains.
 
     Parameters
     ----------
-    x, p           : (n_interior, 3) and (n_all, 3) Cartesian node arrays (Bohr)
-    r              : ball search radius (Bohr)
-    diffs          : differential spec, e.g. [[2,0,0],[0,2,0],[0,0,2]] for Laplacian
-    phi, eps, order: RBF kernel, shape parameter, polynomial order
-    fingerprint_tol: absolute rounding tolerance (Bohr) for grouping rows
-    min_stencil    : warn if any row has fewer neighbours
-    verbose        : print grouping statistics
+    x, p              : (n_interior, 3) and (n_all, 3) Cartesian node arrays (Bohr)
+    r                 : outer ball search radius (Bohr)
+    diffs             : differential spec, e.g. [[2,0,0],[0,2,0],[0,0,2]] for Laplacian
+    phi, eps, order   : RBF kernel, shape parameter, polynomial order
+    fingerprint_tol   : absolute rounding tolerance (Bohr) for grouping rows
+    min_stencil       : warn if any row has fewer neighbours
+    verbose           : print grouping statistics
+    inner_radius      : exclude neighbours closer than this (Bohr); the center
+                        point (dist==0) is always kept regardless
+    max_neighbors     : cap stencil to at most this many points (0 = no cap)
+    select_near_first : when capping, True = keep nearest, False = keep farthest
 
     Returns
     -------
-    scipy.sparse.csr_matrix of shape (n_interior, n_all)
+    (scipy.sparse.csr_matrix of shape (n_interior, n_all), stencil_stats dict)
     """
     from rbf.pde.fd import weight_matrix as _rbf_wm
 
@@ -1670,35 +1681,101 @@ def weight_matrix_ball_fingerprint(
     n_int = x.shape[0]
 
     tree = cKDTree(p)
-    stencil_lists = tree.query_ball_point(x, r)
+    # Query outer ball; we'll apply inner_radius / max_neighbors per row below
+    raw_lists = tree.query_ball_point(x, r)
 
     inv_tol = 1.0 / fingerprint_tol
     groups_fp: Dict[tuple, list] = {}
+    stencil_sizes: list[int] = []
     n_too_small = 0
 
-    for i, nbrs in enumerate(stencil_lists):
-        if len(nbrs) < min_stencil:
+    for i, raw_nbrs in enumerate(raw_lists):
+        nbrs_arr = np.asarray(raw_nbrs, dtype=np.int64)
+        offsets = p[nbrs_arr] - x[i]                         # (k_raw, 3)
+        dists   = np.linalg.norm(offsets, axis=1)            # (k_raw,)
+
+        # Inner-radius exclusion: keep the center (dist≈0) + shell [inner_radius, r]
+        if inner_radius > 0.0:
+            keep = (dists < 1e-14) | (dists >= inner_radius)
+            nbrs_arr = nbrs_arr[keep]
+            offsets  = offsets[keep]
+            dists    = dists[keep]
+
+        # Max-neighbours cap (center always preserved at index 0 after argsort)
+        if max_neighbors > 0 and len(nbrs_arr) > max_neighbors:
+            sort_idx = np.argsort(dists)                      # ascending
+            if select_near_first:
+                sel = sort_idx[:max_neighbors]
+            else:
+                # always keep center (the only dist==0 point), then farthest
+                center_mask = dists[sort_idx] < 1e-14
+                center_idx  = sort_idx[center_mask]
+                far_idx     = sort_idx[~center_mask][-(max_neighbors - len(center_idx)):]
+                sel = np.concatenate([center_idx, far_idx])
+            nbrs_arr = nbrs_arr[sel]
+            offsets  = offsets[sel]
+
+        k = len(nbrs_arr)
+        stencil_sizes.append(k)
+        if k < min_stencil:
             n_too_small += 1
-        offsets = p[nbrs] - x[i]                             # (k, 3)
-        rounded = np.round(offsets * inv_tol).astype(np.int64)
+
+        rounded   = np.round(offsets * inv_tol).astype(np.int64)
         lex_order = np.lexsort(rounded.T[::-1])
         key = tuple(map(tuple, rounded[lex_order]))
         if key not in groups_fp:
             groups_fp[key] = []
-        groups_fp[key].append((i, nbrs, lex_order))
+        groups_fp[key].append((i, nbrs_arr.tolist(), lex_order))
+
+    # ── Stencil-size distribution (power-of-2 bins) ──────────────────────────
+    _bin_edges  = [0, 8, 16, 32, 64, 128, 256]
+    _bin_labels = ["<8", "8-15", "16-31", "32-63", "64-127", "128-255", ">=256"]
+    sizes_arr   = np.array(stencil_sizes, dtype=np.int64)
+    bin_counts: Dict[str, int] = {}
+    for label, lo, hi in zip(_bin_labels,
+                              _bin_edges,
+                              _bin_edges[1:] + [2**31]):
+        bin_counts[label] = int(np.sum((sizes_arr >= lo) & (sizes_arr < hi)))
+    bin_pcts: Dict[str, float] = {
+        k: round(100.0 * v / max(n_int, 1), 2)
+        for k, v in bin_counts.items()
+    }
+
+    stencil_stats: Dict[str, Any] = {
+        "n_interior":       n_int,
+        "outer_radius_bohr": float(r),
+        "inner_radius_bohr": float(inner_radius),
+        "max_neighbors_cap": int(max_neighbors),
+        "select_near_first": bool(select_near_first),
+        "min_neighbors":    int(sizes_arr.min()) if n_int else 0,
+        "max_neighbors_actual": int(sizes_arr.max()) if n_int else 0,
+        "mean_neighbors":   float(sizes_arr.mean()) if n_int else 0.0,
+        "unique_patterns":  len(groups_fp),
+        "neighbor_bins":    bin_counts,
+        "neighbor_bins_pct": bin_pcts,
+    }
 
     if verbose:
-        stencil_sizes = [len(s) for s in stencil_lists]
-        print(f"[ball_fingerprint] n_interior={n_int}, r={r:.4f} Bohr, "
-              f"stencil min/mean/max="
-              f"{min(stencil_sizes)}/{np.mean(stencil_sizes):.1f}/{max(stencil_sizes)}, "
+        print(
+            f"[ball_fingerprint] n_interior={n_int}, r={r:.4f} Bohr"
+            + (f", r_inner={inner_radius:.4f}" if inner_radius > 0 else "")
+            + (f", max_nbrs={max_neighbors}({'near' if select_near_first else 'far'})"
+               if max_neighbors > 0 else "")
+            + f"\n  stencil min/mean/max="
+              f"{stencil_stats['min_neighbors']}/"
+              f"{stencil_stats['mean_neighbors']:.1f}/"
+              f"{stencil_stats['max_neighbors_actual']}, "
               f"unique_patterns={len(groups_fp)} "
-              f"(reuse {n_int/max(len(groups_fp),1):.1f}×)")
+              f"(reuse {n_int/max(len(groups_fp),1):.1f}×)"
+        )
+        parts = [f"{lbl}:{cnt}" for lbl, cnt in bin_counts.items() if cnt > 0]
+        print(f"  neighbor distribution: {', '.join(parts)}")
+
     if n_too_small > 0:
         import warnings
         warnings.warn(
             f"[ball_fingerprint] {n_too_small} rows have <{min_stencil} neighbours "
-            f"within r={r:.4f} Bohr — increase r or check node layout.",
+            f"(r={r:.4f}, r_inner={inner_radius:.4f}) — check node layout.",
             RuntimeWarning, stacklevel=2,
         )
 
@@ -1733,9 +1810,12 @@ def weight_matrix_ball_fingerprint(
                 col_idx.append(int(j_global))
                 wdata.append(float(w_sorted[j]))
 
-    return sp.csr_matrix(
-        (wdata, (row_idx, col_idx)),
-        shape=(n_int, p.shape[0]),
+    return (
+        sp.csr_matrix(
+            (wdata, (row_idx, col_idx)),
+            shape=(n_int, p.shape[0]),
+        ),
+        stencil_stats,
     )
 
 
@@ -1778,6 +1858,9 @@ def build_qd_problem(
     conv_cell_reuse_weights: bool = True,
     stencil_radius: float = 0.0,
     stencil_fingerprint_tol: float = 1e-4,
+    stencil_inner_radius: float = 0.0,
+    stencil_max_neighbors: int = 0,
+    stencil_select_near_first: bool = True,
     include_interior: bool = True,
     include_boundary: bool = True,
     node_min_dist: float = 0.0,
@@ -1863,10 +1946,13 @@ def build_qd_problem(
                                               before accept+KDTree filtering
     conv_cell_reuse_weights  : when True (default), reuse repeated stencil
                                solves in conv_cell Laplacian assembly
-    stencil_radius           : ball search radius (Bohr) for ball-stencil mode;
-                               0 = disabled (use k-nearest stencil_size instead)
-    stencil_fingerprint_tol  : rounding tolerance (Bohr) for fingerprint grouping
-                               in ball-stencil mode (default 1e-4)
+    stencil_radius           : outer ball search radius (Bohr); 0 = use k-nearest
+    stencil_fingerprint_tol  : fingerprint rounding tolerance (Bohr, default 1e-4)
+    stencil_inner_radius     : exclude neighbours closer than this (Bohr, 0=off);
+                               forms a spherical-shell stencil [inner, outer]
+    stencil_max_neighbors    : cap stencil size (0 = no cap)
+    stencil_select_near_first: True = keep nearest when capping (default),
+                               False = keep farthest (shell-biased)
     """
     from scipy.interpolate import RegularGridInterpolator
 
@@ -2027,7 +2113,7 @@ def build_qd_problem(
 
     _lap_diffs = [[2, 0, 0], [0, 2, 0], [0, 0, 2]]
     if stencil_radius > 0.0:
-        laplacian_matrix = weight_matrix_ball_fingerprint(
+        laplacian_matrix, _ball_stats = weight_matrix_ball_fingerprint(
             x=nodes[interior_idx],
             p=nodes,
             r=float(stencil_radius),
@@ -2036,8 +2122,13 @@ def build_qd_problem(
             eps=eps,
             order=order,
             fingerprint_tol=float(stencil_fingerprint_tol),
+            inner_radius=float(stencil_inner_radius),
+            max_neighbors=int(stencil_max_neighbors),
+            select_near_first=bool(stencil_select_near_first),
             verbose=True,
         )
+        if domain == "conv_cell":
+            groups["_ball_stencil_stats"] = _ball_stats
     elif domain == "conv_cell" and conv_cell_reuse_weights:
         laplacian_matrix = weight_matrix_conv_cell_reuse(
             x=nodes[interior_idx],
