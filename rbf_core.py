@@ -1243,10 +1243,11 @@ def generate_conv_cell_nodes(
         sphere_center = None
         sphere_radius_eff = None
     else:
-        # Sphere mode: keep tiled template points inside the sphere and derive
-        # boundary nodes directly from the existing tiled template (radial shell
-        # near the target sphere radius). This avoids extra Poisson sampling on
-        # the sphere surface and guarantees boundary group existence.
+        # Sphere mode: keep tiled template points strictly INSIDE the sphere as
+        # interior nodes, then append a proper icosphere shell as boundary nodes.
+        # Using tiled-template nodes near the sphere surface as "boundary" gave
+        # poor results because the FCC lattice only sparsely and irregularly
+        # approximates a sphere surface, leaving gaps and uneven Dirichlet BC.
         sphere_center = 0.5 * (bbox_min + bbox_max)
         if sphere_radius is None:
             sphere_radius_eff = 0.5 * float(np.min(bbox_max - bbox_min))
@@ -1257,29 +1258,27 @@ def generate_conv_cell_nodes(
                 f"sphere_radius must be > 0, got {sphere_radius_eff}")
 
         r = np.linalg.norm(nodes - sphere_center[None, :], axis=1)
-        # keep points on/inside sphere; small tolerance guards roundoff
+        # Keep only points strictly inside the sphere (with a small inward margin
+        # so the last interior shell doesn't crowd the icosphere boundary nodes).
+        # Points within d_min of the surface become boundary via icosphere below.
         rad_tol = max(1e-8, 1e-6 * a)
-        inside = r <= (sphere_radius_eff + rad_tol)
+        interior_margin = max(d_min_frac * a, boundary_margin_frac * a)
+        inside = r <= (sphere_radius_eff - interior_margin + rad_tol)
         nodes = nodes[inside]
         roles = roles[inside]
-        r_in = r[inside]
 
-        if len(nodes) == 0:
-            boundary_idx = np.empty(0, dtype=np.int64)
-            interior_idx = np.empty(0, dtype=np.int64)
-        else:
-            # radial shell used to mark boundary points from existing nodes
-            shell_tol = max(boundary_margin_frac * a, 0.5 * d_min_frac * a, rad_tol)
-            radial_delta = np.abs(r_in - sphere_radius_eff)
-            is_boundary = radial_delta <= shell_tol
+        # Build a proper icosphere boundary on the sphere surface.
+        ico_verts_raw, _ = _make_icosphere(sphere_radius_eff, sphere_subdivide)
+        ico_verts = ico_verts_raw + sphere_center[None, :]
+        n_interior = len(nodes)
+        n_ico = len(ico_verts)
 
-            # Fallback: ensure at least one boundary node exists.
-            if not np.any(is_boundary):
-                imin = int(np.argmin(radial_delta))
-                is_boundary[imin] = True
+        nodes = np.vstack([nodes, ico_verts])
+        # role=6 reserved for icosphere boundary nodes
+        roles = np.concatenate([roles, np.full(n_ico, 6, dtype=np.int64)])
 
-            boundary_idx = np.where(is_boundary)[0].astype(np.int64)
-            interior_idx = np.where(~is_boundary)[0].astype(np.int64)
+        interior_idx = np.arange(n_interior, dtype=np.int64)
+        boundary_idx = np.arange(n_interior, n_interior + n_ico, dtype=np.int64)
         margin = 0.0
 
     nodes_after_domain = nodes.copy()
@@ -1294,7 +1293,8 @@ def generate_conv_cell_nodes(
         "random":    np.where(roles == 2)[0].astype(np.int64),
         "parity":    np.where(roles == 3)[0].astype(np.int64),
         "fcc":       np.where(roles == 4)[0].astype(np.int64),
-        "fcc_local": np.where(roles == 5)[0].astype(np.int64),  # Enhancement 1 fine nodes
+        "fcc_local":  np.where(roles == 5)[0].astype(np.int64),  # Enhancement 1 fine nodes
+        "icosphere":  np.where(roles == 6)[0].astype(np.int64),  # sphere-mode boundary shell
     }
 
     if min_dist_cart > 0.0 and len(nodes) > 1:
@@ -1387,9 +1387,11 @@ def generate_conv_cell_nodes(
         if domain_shape == "cube":
             print(f"[conv_cell]   margin={margin:.3f} Bohr  (frac={boundary_margin_frac})")
         else:
+            n_ico = int(len(groups.get("icosphere", [])))
             print(f"[conv_cell]   sphere center      : {np.round(sphere_center, 3).tolist()}")
             print(f"[conv_cell]   sphere radius      : {sphere_radius_eff:.3f} Bohr")
-            print(f"[conv_cell]   sphere subdivide   : {sphere_subdivide}")
+            print(f"[conv_cell]   sphere subdivide   : {sphere_subdivide}  "
+                  f"(icosphere boundary nodes: {n_ico})")
         print(f"[conv_cell]   interior / boundary = "
               f"{len(interior_idx)} / {len(boundary_idx)}")
         if len(interior_idx):
