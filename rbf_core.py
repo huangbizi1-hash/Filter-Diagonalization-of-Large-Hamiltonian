@@ -1021,7 +1021,12 @@ def generate_conv_cell_nodes(
             h_w_enh2 = 1.0 / np.maximum(denom_enh2, 1e-12)
             n_cands_enh2 = int(max(1, round(float(adaptive_candidate_multiplier)
                                              * n_random_target)))
-            take_enh2 = np.argsort(-h_w_enh2)[:min(n_cands_enh2, len(h_w_enh2))]
+            n_take_enh2 = min(n_cands_enh2, len(h_w_enh2))
+            # Uniform random preselection ensures full-domain coverage.
+            # Density variation is handled by accept-reject (p ∝ h_w) inside
+            # _adaptive_accept_and_filter_periodic.  Top-k would cluster all
+            # candidates near high-gradient corners, leaving the rest empty.
+            take_enh2 = rng_enh2.choice(len(h_w_enh2), size=n_take_enh2, replace=False)
             random_frac_enh2 = _adaptive_accept_and_filter_periodic(
                 candidates_frac=cand_frac_enh2[take_enh2],
                 weights_h=h_w_enh2[take_enh2],
@@ -1088,12 +1093,13 @@ def generate_conv_cell_nodes(
             _raise_on_nonfinite("conv_cell adaptive h_w", h_w)
             n_candidates = int(max(1, round(float(adaptive_candidate_multiplier) * n_random_target)))
             n_take = min(n_candidates, len(h_w))
-            # 当 λ_grad=λ_lap=0（或权重近乎常数）时，不应由 argsort 的索引顺序
-            # 决定候选点（那会偏向网格前缀区域）；应在全域均匀抽样。
-            if np.allclose(h_w, h_w[0], rtol=0.0, atol=1e-14):
-                take = rng.choice(len(h_w), size=n_take, replace=False)
-            else:
-                take = np.argsort(-h_w)[:n_take]
+            # Uniform random preselection ensures full-domain coverage regardless
+            # of lambda.  Top-k by h_w concentrates ALL candidates near atoms
+            # (high-gradient corners), leaving no candidates for the rest of the
+            # domain — both for λ=0 (grid prefix bias) and λ>0 (corner atom bias).
+            # Density variation is produced by the accept-reject step inside
+            # _adaptive_accept_and_filter_periodic (p_accept = h_w / h_max).
+            take = rng.choice(len(h_w), size=n_take, replace=False)
             random_frac = _adaptive_accept_and_filter_periodic(
                 candidates_frac=cand_frac[take],
                 weights_h=h_w[take],
