@@ -1631,6 +1631,13 @@ def weight_matrix_conv_cell_reuse(
 
     L = sp.csr_matrix((data, indices, indptr), shape=(N, M))
     L.has_sorted_indices = True
+
+    n_unique = len(rep_for_key)
+    print(
+        f"[conv_cell_reuse] n_interior={N}, stencil_size={k}, "
+        f"unique_patterns={n_unique}  (reuse {N / max(n_unique, 1):.1f}×, "
+        f"solve_ratio={n_unique / max(N, 1):.3f})"
+    )
     return L
 
 
