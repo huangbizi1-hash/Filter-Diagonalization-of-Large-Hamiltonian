@@ -56,6 +56,8 @@ class CompareConfig:
     svd_tol: float = 1e-3
     max_energies: int = 30
     seed: int = 42
+    psi_init_type: str = "sine"      # sine | gaussian
+    psi_kmax: float = 3.0            # |k| 上界（仅 sine 模式）
 
     rbf_spacing: float = 0.5
     rbf_stencil_size: int = 80
@@ -481,6 +483,21 @@ def _fft_grid_points(pot: PotentialGrid | None, N: int, ho_L: float) -> np.ndarr
     return np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
 
 
+def _sine_psi_on_pts(coords: np.ndarray, K_max: float, rng: np.random.Generator) -> np.ndarray:
+    """Normalized random sine wave on an arbitrary 3-D point cloud.
+
+    Draws (kx, ky, kz) ~ Uniform[-K_max, K_max]^3 and phase b ~ Uniform[-π, π],
+    then evaluates psi[i] = sin(kx*x[i] + ky*y[i] + kz*z[i] + b) and normalises.
+    Returns a real flat array of shape (N,).
+    """
+    kx, ky, kz = rng.uniform(-K_max, K_max, 3)
+    b = rng.uniform(-np.pi, np.pi)
+    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+    psi = np.sin(kx * x + ky * y + kz * z + b)
+    nrm = np.linalg.norm(psi)
+    return psi / nrm if nrm > 0 else psi
+
+
 def _build_problem_from_nodes_file(path: Path, cfg: "CompareConfig",
                                     cube_path: Path) -> tuple[RBFProblem, dict[str, Any]]:
     """Reconstruct a RBFProblem from a saved nodes file (.npz/.json).
@@ -648,6 +665,7 @@ def run(cfg: CompareConfig) -> Path:
     timings["build_fft_operator"] = time.perf_counter() - t2
 
     provenance: dict[str, Any] = {}
+    problem: RBFProblem | None = None
     node_storage: dict[str, Any] = {}
     nodes_data_path: Path | None = None
     n_interior = 0
@@ -861,6 +879,18 @@ def run(cfg: CompareConfig) -> Path:
     rng_fft = np.random.default_rng(cfg.seed)
     rng_rbf = np.random.default_rng(cfg.seed + 1) if not cfg.fft_only else None
 
+    # 正弦初态所需的 3D 坐标（sine 模式下提前计算，避免循环内重复）
+    _use_sine = (cfg.psi_init_type == "sine")
+    fft_pts_sine: np.ndarray | None = None
+    rbf_pts_sine: np.ndarray | None = None
+    if _use_sine:
+        fft_pts_sine = _fft_grid_points(pot, N, cfg.ho_L)   # (N³, 3)
+        if not cfg.fft_only and H_rbf_op is not None and problem is not None:
+            rbf_pts_sine = problem.nodes[interior_idx]       # (n_interior, 3)
+        print(f"[psi init] type=sine  K_max={cfg.psi_kmax}")
+    else:
+        print(f"[psi init] type=gaussian")
+
     t_power = time.perf_counter()
     psi_power_fft = rng_fft.standard_normal(n_grid)
     Emax_fft = _power_method_energy(H_fft.matvec, psi_power_fft, n_steps=cfg.power_steps)
@@ -877,8 +907,11 @@ def run(cfg: CompareConfig) -> Path:
 
     t4 = time.perf_counter()
     for i in range(cfg.n_random):
-        psi_full = rng_fft.standard_normal(n_grid)
-        psi_full /= np.linalg.norm(psi_full)
+        if _use_sine:
+            psi_full = _sine_psi_on_pts(fft_pts_sine, cfg.psi_kmax, rng_fft)
+        else:
+            psi_full = rng_fft.standard_normal(n_grid)
+            psi_full /= np.linalg.norm(psi_full)
         fft_filt_all, fft_filter_diag = _apply_filter_with_blowup_guard(
             H_apply=H_fft.matvec,
             psi=psi_full,
@@ -893,8 +926,11 @@ def run(cfg: CompareConfig) -> Path:
         rbf_filt_all = None
         rbf_filter_diag = None
         if not cfg.fft_only and rng_rbf is not None and H_rbf_op is not None:
-            psi_int = rng_rbf.standard_normal(n_interior)
-            psi_int /= np.linalg.norm(psi_int)
+            if _use_sine and rbf_pts_sine is not None:
+                psi_int = _sine_psi_on_pts(rbf_pts_sine, cfg.psi_kmax, rng_rbf)
+            else:
+                psi_int = rng_rbf.standard_normal(n_interior)
+                psi_int /= np.linalg.norm(psi_int)
             rbf_filt_all, rbf_filter_diag = _apply_filter_with_blowup_guard(
                 H_apply=H_rbf_op.matvec,
                 psi=psi_int,
@@ -1135,6 +1171,8 @@ def run(cfg: CompareConfig) -> Path:
             "Vmin": cfg.Vmin,
             "dt": dt,
             "sigma": float(1.0 / np.sqrt(2.0 * dt)),
+            "psi_init_type": cfg.psi_init_type,
+            "psi_kmax": cfg.psi_kmax,
         },
         "power_method": {
             "steps": int(cfg.power_steps),
@@ -1260,6 +1298,11 @@ def parse_args() -> CompareConfig:
     p.add_argument("--svd-tol", type=float, default=1e-3)
     p.add_argument("--max-energies", type=int, default=30)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--psi-init-type", type=str, choices=["sine", "gaussian"],
+                   default="sine",
+                   help="初始波函数类型：sine（随机正弦叠加，默认）或 gaussian（高斯白噪声）")
+    p.add_argument("--psi-kmax", type=float, default=3.0,
+                   help="正弦初态波矢上界 |k_{x,y,z}| ≤ K_max（仅 sine 模式，默认 3.0）")
     p.add_argument("--rbf-spacing", type=float, default=0.5)
     p.add_argument("--rbf-stencil-size", type=int, default=80)
     p.add_argument("--rbf-stencil-radius", type=float, default=0.0,
@@ -1402,6 +1445,8 @@ def parse_args() -> CompareConfig:
         svd_tol=a.svd_tol,
         max_energies=a.max_energies,
         seed=a.seed,
+        psi_init_type=a.psi_init_type,
+        psi_kmax=a.psi_kmax,
         rbf_spacing=a.rbf_spacing,
         rbf_stencil_size=a.rbf_stencil_size,
         rbf_stencil_radius=a.rbf_stencil_radius,
