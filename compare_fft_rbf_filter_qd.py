@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -48,6 +48,7 @@ class CompareConfig:
     ho_N: int = 16
     ho_L: float = 5.0
     el: float = -0.18
+    el_list: list = field(default_factory=list)   # 多滤波中心；非空时覆盖 el
     nc: int = 500
     dE: float = 50.0
     Vmin: float = -5.0
@@ -621,10 +622,15 @@ def run(cfg: CompareConfig) -> Path:
     dt = (cfg.nc / (cfg.dE * 2.5)) ** 2
     phys = PhysParams(dE=cfg.dE, Vmin=cfg.Vmin, dt=dt)
 
+    El_array = np.array(cfg.el_list, dtype=float) if cfg.el_list else np.array([cfg.el], dtype=float)
+    ms = len(El_array)
+    if ms > 1:
+        print(f"[filter] El_list ({ms} centers): {El_array.tolist()}")
+
     t1 = time.perf_counter()
     filt_func = make_filter_func("gaussian", dt=dt)
     an, samp = build_filter_coefficients(
-        np.array([cfg.el]),
+        El_array,
         phys,
         cfg.nc,
         filter_func=filt_func,
@@ -873,7 +879,7 @@ def run(cfg: CompareConfig) -> Path:
     for i in range(cfg.n_random):
         psi_full = rng_fft.standard_normal(n_grid)
         psi_full /= np.linalg.norm(psi_full)
-        fft_filt, fft_filter_diag = _apply_filter_with_blowup_guard(
+        fft_filt_all, fft_filter_diag = _apply_filter_with_blowup_guard(
             H_apply=H_fft.matvec,
             psi=psi_full,
             nodes=samp,
@@ -881,15 +887,11 @@ def run(cfg: CompareConfig) -> Path:
             par=phys,
             norm_blowup_threshold=cfg.filter_norm_blowup_threshold,
         )
-        fft_filt = fft_filt[0]
-        norm_fft = float(np.linalg.norm(fft_filt))
-        if norm_fft > 0:
-            fft_filt = fft_filt / norm_fft
+        # fft_filt_all: (ms, n_grid)
 
-        E_fft = _rayleigh(H_fft.matvec, fft_filt)
-
-        norm_rbf = None
-        E_rbf = None
+        psi_int = None
+        rbf_filt_all = None
+        rbf_filter_diag = None
         if not cfg.fft_only and rng_rbf is not None and H_rbf_op is not None:
             psi_int = rng_rbf.standard_normal(n_interior)
             psi_int /= np.linalg.norm(psi_int)
@@ -901,8 +903,7 @@ def run(cfg: CompareConfig) -> Path:
                 par=phys,
                 norm_blowup_threshold=cfg.filter_norm_blowup_threshold,
             )
-            rbf_filt = rbf_filt_all[0]
-            norm_rbf = float(np.linalg.norm(rbf_filt))
+            # rbf_filt_all: (ms, n_interior)
             if rbf_filter_diag["blowup_step"] is not None:
                 print(
                     "[RBF filter blowup] "
@@ -911,16 +912,49 @@ def run(cfg: CompareConfig) -> Path:
                     f"psi_curr_norm={rbf_filter_diag['psi_curr_norm']}, "
                     f"result_norm={rbf_filter_diag['result_norm']}"
                 )
-            is_valid_rbf = np.isfinite(norm_rbf) and (norm_rbf > 0.0) and np.all(np.isfinite(rbf_filt))
-            if is_valid_rbf:
-                rbf_filt = rbf_filt / norm_rbf
-                E_rbf = _rayleigh(H_rbf_op.matvec, rbf_filt)
-                if np.isfinite(E_rbf):
-                    rbf_basis.append(rbf_filt)
+
+        for ie in range(ms):
+            el_ctr = float(El_array[ie])
+
+            fft_filt = fft_filt_all[ie].copy()
+            norm_fft = float(np.linalg.norm(fft_filt))
+            if norm_fft > 0:
+                fft_filt = fft_filt / norm_fft
+            E_fft = _rayleigh(H_fft.matvec, fft_filt)
+            fft_basis.append(fft_filt)
+
+            norm_rbf = None
+            E_rbf = None
+            if rbf_filt_all is not None:
+                rbf_filt = rbf_filt_all[ie].copy()
+                norm_rbf = float(np.linalg.norm(rbf_filt))
+                is_valid_rbf = np.isfinite(norm_rbf) and (norm_rbf > 0.0) and np.all(np.isfinite(rbf_filt))
+                if is_valid_rbf:
+                    rbf_filt = rbf_filt / norm_rbf
+                    E_rbf = _rayleigh(H_rbf_op.matvec, rbf_filt)
+                    if np.isfinite(E_rbf):
+                        rbf_basis.append(rbf_filt)
+                    else:
+                        rbf_invalid_states.append({
+                            "state_index": i,
+                            "el_idx": ie,
+                            "el_center": el_ctr,
+                            "reason": "rayleigh_nonfinite",
+                            "filter_norm_rbf": norm_rbf,
+                            "filter_stats": _finite_stats("rbf_filt", rbf_filt),
+                            "nonfinite_detail": _first_nonfinite_detail(rbf_filt),
+                            "filter_diag": rbf_filter_diag,
+                            "matvec_trace": _trace_matvec_nonfinite(
+                                H_rbf_op.matvec, psi_int, n_steps=min(8, cfg.nc), stage_name="rbf_filter_input"
+                            ),
+                        })
+                        E_rbf = None
                 else:
                     rbf_invalid_states.append({
                         "state_index": i,
-                        "reason": "rayleigh_nonfinite",
+                        "el_idx": ie,
+                        "el_center": el_ctr,
+                        "reason": "filter_output_nonfinite_or_zero_norm",
                         "filter_norm_rbf": norm_rbf,
                         "filter_stats": _finite_stats("rbf_filt", rbf_filt),
                         "nonfinite_detail": _first_nonfinite_detail(rbf_filt),
@@ -930,35 +964,20 @@ def run(cfg: CompareConfig) -> Path:
                         ),
                     })
                     E_rbf = None
-            else:
-                rbf_invalid_states.append({
-                    "state_index": i,
-                    "reason": "filter_output_nonfinite_or_zero_norm",
-                    "filter_norm_rbf": norm_rbf,
-                    "filter_stats": _finite_stats("rbf_filt", rbf_filt),
-                    "nonfinite_detail": _first_nonfinite_detail(rbf_filt),
-                    "filter_diag": rbf_filter_diag,
-                    "matvec_trace": _trace_matvec_nonfinite(
-                        H_rbf_op.matvec, psi_int, n_steps=min(8, cfg.nc), stage_name="rbf_filter_input"
-                    ),
-                })
-                E_rbf = None
 
-        per_state.append(
-            {
+            per_state.append({
                 "state_index": i,
+                "el_idx": ie,
+                "el_center": el_ctr,
                 "filter_norm_fft": norm_fft,
                 "filter_norm_rbf": norm_rbf,
                 "filter_diag_fft": fft_filter_diag,
-                "filter_diag_rbf": (rbf_filter_diag if (not cfg.fft_only and H_rbf_op is not None) else None),
+                "filter_diag_rbf": rbf_filter_diag,
                 "energy_fft": E_fft,
                 "energy_rbf": E_rbf,
                 "abs_diff": abs(E_fft - E_rbf) if E_rbf is not None else None,
                 "signed_diff": (E_rbf - E_fft) if E_rbf is not None else None,
-            }
-        )
-
-        fft_basis.append(fft_filt)
+            })
 
     timings["filter_states"] = time.perf_counter() - t4
 
@@ -1108,6 +1127,8 @@ def run(cfg: CompareConfig) -> Path:
         "rbf_nodes_file": str(nodes_data_path) if nodes_data_path else None,
         "filter": {
             "EL": cfg.el,
+            "El_list": El_array.tolist(),
+            "n_el_centers": ms,
             "NC_input": cfg.nc,
             "NC_true": int(len(samp)),
             "dE": cfg.dE,
@@ -1222,6 +1243,10 @@ def parse_args() -> CompareConfig:
     p.add_argument("--ho-N", type=int, default=16)
     p.add_argument("--ho-L", type=float, default=5.0)
     p.add_argument("--el", type=float, default=-0.18)
+    p.add_argument("--el-list", type=float, nargs="+", default=[],
+                   metavar="E",
+                   help="多个滤波中心能量（Hartree），非空时覆盖 --el；"
+                        "例：--el-list -0.20 -0.19 -0.18 -0.17 -0.16")
     p.add_argument("--nc", type=int, default=500)
     p.add_argument("--dE", type=float, default=50.0)
     p.add_argument(
@@ -1369,6 +1394,7 @@ def parse_args() -> CompareConfig:
         ho_N=a.ho_N,
         ho_L=a.ho_L,
         el=a.el,
+        el_list=a.el_list,
         nc=a.nc,
         dE=a.dE,
         Vmin=a.emin,
