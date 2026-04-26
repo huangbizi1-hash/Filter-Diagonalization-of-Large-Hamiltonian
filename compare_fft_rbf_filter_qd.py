@@ -102,6 +102,7 @@ class CompareConfig:
     conv_cell_adaptive_lambda_grad: float = 0.0
     conv_cell_adaptive_lambda_lap: float = 0.0
     conv_cell_adaptive_candidate_multiplier: float = 8.0
+    conv_cell_include_skeleton: bool = True
     include_interior: bool = True
     include_boundary: bool = True
     node_min_dist: float = 0.0
@@ -680,6 +681,7 @@ def run(cfg: CompareConfig) -> Path:
             "conv_cell_adaptive_lambda_grad": cfg.conv_cell_adaptive_lambda_grad,
             "conv_cell_adaptive_lambda_lap":  cfg.conv_cell_adaptive_lambda_lap,
             "conv_cell_adaptive_candidate_multiplier": cfg.conv_cell_adaptive_candidate_multiplier,
+            "conv_cell_include_skeleton": cfg.conv_cell_include_skeleton,
             "rbf_stencil_radius": cfg.rbf_stencil_radius,
             "rbf_stencil_fingerprint_tol": cfg.rbf_stencil_fingerprint_tol,
             "rbf_stencil_inner_radius": cfg.rbf_stencil_inner_radius,
@@ -744,6 +746,7 @@ def run(cfg: CompareConfig) -> Path:
                 conv_cell_adaptive_lambda_grad=cfg.conv_cell_adaptive_lambda_grad,
                 conv_cell_adaptive_lambda_lap=cfg.conv_cell_adaptive_lambda_lap,
                 conv_cell_adaptive_candidate_multiplier=cfg.conv_cell_adaptive_candidate_multiplier,
+                conv_cell_include_skeleton=cfg.conv_cell_include_skeleton,
                 stencil_radius=cfg.rbf_stencil_radius,
                 stencil_fingerprint_tol=cfg.rbf_stencil_fingerprint_tol,
                 stencil_inner_radius=cfg.rbf_stencil_inner_radius,
@@ -1319,6 +1322,8 @@ def parse_args() -> CompareConfig:
                    help="conv_cell 自适应采样 λ2（h = h_max/(1+λ1|∇V|+λ2|ΔV|)）")
     p.add_argument("--conv-cell-adaptive-candidate-multiplier", type=float, default=8.0,
                    help="conv_cell 自适应采样候选预算倍数（相对 n_random）")
+    p.add_argument("--conv-cell-no-skeleton", action="store_true",
+                   help="conv_cell hybrid 模式：去掉原子+level3骨架，仅保留自适应泊松采样节点")
     p.add_argument("--exclude-boundary", action="store_true",
                    help="仅保留 interior 节点（去掉 boundary）")
     p.add_argument("--exclude-interior", action="store_true",
@@ -1411,6 +1416,7 @@ def parse_args() -> CompareConfig:
         conv_cell_adaptive_lambda_grad=a.conv_cell_adaptive_lambda_grad,
         conv_cell_adaptive_lambda_lap=a.conv_cell_adaptive_lambda_lap,
         conv_cell_adaptive_candidate_multiplier=a.conv_cell_adaptive_candidate_multiplier,
+        conv_cell_include_skeleton=(not a.conv_cell_no_skeleton),
         include_interior=(not a.exclude_interior),
         include_boundary=(not a.exclude_boundary),
         node_min_dist=a.node_min_dist,

@@ -868,6 +868,7 @@ def generate_conv_cell_nodes(
     adaptive_lambda_lap: float = 0.0,
     adaptive_candidate_multiplier: float = 8.0,
     adaptive_gaussian_builder: Optional[Any] = None,
+    include_skeleton: bool = True,
     include_interior: bool = True,
     include_boundary: bool = True,
     min_dist_cart: float = 0.0,
@@ -934,22 +935,29 @@ def generate_conv_cell_nodes(
     bbox_min = np.asarray(bbox_min, dtype=np.float64).reshape(3)
     bbox_max = np.asarray(bbox_max, dtype=np.float64).reshape(3)
 
-    if atom_frac is None:
-        atom_frac = np.vstack([_CONV_CELL_IN_FRAC_DEFAULT,
-                                _CONV_CELL_AS_FRAC_DEFAULT])
+    if not include_skeleton:
+        atom_frac = np.empty((0, 3), dtype=np.float64)
+        level3_base_frac = np.empty((0, 3), dtype=np.float64)
     else:
-        atom_frac = np.asarray(atom_frac, dtype=np.float64).reshape(-1, 3)
+        if atom_frac is None:
+            atom_frac = np.vstack([_CONV_CELL_IN_FRAC_DEFAULT,
+                                    _CONV_CELL_AS_FRAC_DEFAULT])
+        else:
+            atom_frac = np.asarray(atom_frac, dtype=np.float64).reshape(-1, 3)
 
-    if level3_base_frac is None:
-        level3_base_frac = _LEVEL3_BASE_FRAC_DEFAULT
-    else:
-        level3_base_frac = np.asarray(level3_base_frac, dtype=np.float64).reshape(-1, 3)
+        if level3_base_frac is None:
+            level3_base_frac = _LEVEL3_BASE_FRAC_DEFAULT
+        else:
+            level3_base_frac = np.asarray(level3_base_frac, dtype=np.float64).reshape(-1, 3)
 
     # level-3: expand each base by the 4 FCC cosets and reduce mod 1
-    level3_frac = np.vstack([
-        _wrap_frac(r0 + _FCC_OFFSETS_FRAC) for r0 in level3_base_frac
-    ])
-    level3_frac = _unique_rows_mod1(level3_frac)
+    if len(level3_base_frac):
+        level3_frac = np.vstack([
+            _wrap_frac(r0 + _FCC_OFFSETS_FRAC) for r0 in level3_base_frac
+        ])
+        level3_frac = _unique_rows_mod1(level3_frac)
+    else:
+        level3_frac = np.empty((0, 3), dtype=np.float64)
 
     if template_mode not in ("hybrid", "fcc_refined"):
         raise ValueError(f"template_mode must be 'hybrid' or 'fcc_refined', got {template_mode!r}")
@@ -1870,6 +1878,7 @@ def build_qd_problem(
     conv_cell_adaptive_lambda_grad: float = 0.0,
     conv_cell_adaptive_lambda_lap: float = 0.0,
     conv_cell_adaptive_candidate_multiplier: float = 8.0,
+    conv_cell_include_skeleton: bool = True,
     conv_cell_reuse_weights: bool = True,
     stencil_radius: float = 0.0,
     stencil_fingerprint_tol: float = 1e-4,
@@ -2074,6 +2083,7 @@ def build_qd_problem(
             adaptive_lambda_lap=conv_cell_adaptive_lambda_lap,
             adaptive_candidate_multiplier=conv_cell_adaptive_candidate_multiplier,
             adaptive_gaussian_builder=adaptive_builder,
+            include_skeleton=conv_cell_include_skeleton,
             include_interior=include_interior,
             include_boundary=include_boundary,
             min_dist_cart=node_min_dist,
