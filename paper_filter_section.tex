@@ -118,3 +118,73 @@ Algorithm~\ref{alg:shared_filter} requires only $n-1$ calls to
 $\mathrm{ApplyH}$ for all windows together; additional windows only increase
 cheap axpy-style vector combinations.
 
+\subsection{Ritz extraction after filtering: SVD and projected diagonalization}
+
+Let $\{\psi^{(i)}_{\mathrm{filt}}\}_{i=1}^{N_b}$ denote all filtered states
+(from all random seeds and all windows), reshaped as columns of
+\begin{equation}
+B = [\psi^{(1)}_{\mathrm{filt}},\ldots,\psi^{(N_b)}_{\mathrm{filt}}]
+\in \mathbb{C}^{N_g\times N_b},
+\end{equation}
+where $N_g$ is the full grid/basis dimension.
+
+Because filtered vectors are often nearly linearly dependent, we first build a
+numerically stable orthonormal subspace by QR+SVD:
+\begin{align}
+B &= QR,\\
+R &= U_1 \Sigma V^\ast,\\
+U_r &= (Q U_1)_{(:,1:r)},
+\end{align}
+where $r$ is the effective rank selected by a singular-value threshold
+$\sigma_i>\tau_{\mathrm{svd}}$. The columns of $U_r\in\mathbb{C}^{N_g\times r}$
+form the reduced Ritz subspace.
+
+We then construct the projected (Rayleigh--Ritz) matrix
+\begin{equation}
+\widetilde{H}_{ij}
+= \langle u_i, H u_j\rangle,
+\qquad i,j=1,\ldots,r,
+\label{eq:Htilde}
+\end{equation}
+or in matrix form
+\begin{equation}
+\widetilde{H}=U_r^\ast H U_r\in\mathbb{C}^{r\times r}.
+\end{equation}
+For Hermitian problems, we optionally enforce numerical symmetry by
+\begin{equation}
+\widetilde{H}\leftarrow \frac{\widetilde{H}+\widetilde{H}^\ast}{2}.
+\end{equation}
+
+Finally, solve the reduced eigenproblem
+\begin{equation}
+\widetilde{H} y_k = \theta_k y_k,
+\qquad k=1,\ldots,r.
+\end{equation}
+The scalars $\theta_k$ are Ritz values (approximations to eigenvalues of $H$),
+and the Ritz vectors in the full space are
+\begin{equation}
+x_k = U_r y_k.
+\end{equation}
+Sorting $\theta_k$ in ascending order gives the final energy estimates in the
+target window; the corresponding $x_k$ are the approximate eigenstates.
+
+\begin{algorithm}[t]
+\caption{SVD-accelerated Rayleigh--Ritz from filtered basis}
+\label{alg:ritz}
+\begin{algorithmic}[1]
+\Require Filtered basis matrix $B\in\mathbb{C}^{N_g\times N_b}$, operator apply $\mathrm{ApplyH}(\cdot)$, SVD cutoff $\tau_{\mathrm{svd}}$
+\Ensure Ritz pairs $(\theta_k, x_k)$
+\State Remove zero/invalid columns of $B$ and normalize remaining columns
+\State Compute reduced QR: $B=QR$
+\State SVD of $R$: $R=U_1\Sigma V^\ast$
+\State $r \gets \#\{i:\Sigma_{ii}>\tau_{\mathrm{svd}}\}$, then $r\gets \max(1,r)$
+\State $U_r \gets (Q U_1)_{(:,1:r)}$
+\State Build $\widetilde{H}\in\mathbb{C}^{r\times r}$ by
+      $\widetilde{H}_{ij}=\langle U_r[:,i], \mathrm{ApplyH}(U_r[:,j])\rangle$
+\State (Optional Hermitian cleanup) $\widetilde{H}\gets (\widetilde{H}+\widetilde{H}^\ast)/2$
+\State Diagonalize: $\widetilde{H}Y=Y\Theta$
+\State Ritz values: $\theta_k=\Theta_{kk}$; Ritz vectors: $x_k=U_rY[:,k]$
+\State Sort $(\theta_k,x_k)$ by ascending $\theta_k$
+\State \Return $\{(\theta_k,x_k)\}$
+\end{algorithmic}
+\end{algorithm}
