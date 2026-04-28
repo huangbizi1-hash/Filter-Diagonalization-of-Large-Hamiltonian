@@ -1,0 +1,100 @@
+\section{RBF--FD Node Generation on a Conventional Cell}
+\label{sec:rbffd-node-generation}
+
+Our RBF--FD node set is generated in two stages:
+\begin{enumerate}
+  \item build a high-quality \emph{one-cell template} in the conventional cubic cell,
+  \item tile (translate) this template by integer lattice shifts to cover the whole computational domain.
+\end{enumerate}
+
+Let the conventional-cell lattice constant be $a$ (for InAs in this work, $a=11.4523$ Bohr),
+and let fractional coordinates be
+\begin{equation}
+\mathbf{r}_{\mathrm{frac}}\in[0,1)^3,\qquad
+\mathbf{r}_{\mathrm{cart}} = a\,\mathbf{r}_{\mathrm{frac}}.
+\end{equation}
+After obtaining one-cell nodes $\{\mathbf{r}_m^{(\mathrm{cell})}\}$, we replicate them by
+\begin{equation}
+\mathbf{r}_{m,\mathbf{n}} = \mathbf{r}_m^{(\mathrm{cell})} + a\,\mathbf{n},
+\qquad \mathbf{n}\in\mathbb{Z}^3,
+\end{equation}
+and keep only points inside the target box/sphere.
+In code, this is implemented by generating a one-cell template first, then applying integer shifts and domain filtering.
+
+\subsection{Method 1: FCC deterministic nodes (including atom-pinned points)}
+
+A deterministic FCC template is produced inside one conventional cell using a scale factor $s$ (named
+\verb|fcc_scale_factor| in code). The code default uses $s=8$, i.e. effective spacing $a/8$ in fractional blocks.
+For each subcell index $(i,j,k)$ with $i,j,k\in\{0,\dots,s-1\}$ and FCC coset offsets
+\begin{equation}
+\mathcal{O}_{\mathrm{FCC}}=\left\{
+(0,0,0),\left(0,\tfrac12,\tfrac12\right),\left(\tfrac12,0,\tfrac12\right),\left(\tfrac12,\tfrac12,0\right)
+\right\},
+\end{equation}
+we place
+\begin{equation}
+\mathbf{r}_{\mathrm{frac}} = \mathbf{r}_0 + \frac{1}{s}(i,j,k)+\frac{1}{s}\mathbf{o},\qquad \mathbf{o}\in\mathcal{O}_{\mathrm{FCC}},
+\end{equation}
+then wrap modulo $1$.
+
+This design guarantees that atomic sites are represented explicitly in the hybrid pipeline:
+for zincblende InAs, the template includes the conventional-cell In and As atomic fractional coordinates,
+so atom positions are always present as nodes. In the \verb|fcc_refined| mode, the deterministic FCC backbone is further
+optionally refined around atoms by a finer local FCC scale.
+
+\subsection{Method 2: Poisson-disc-like sampling with cell symmetries (including parity)}
+
+To improve isotropy and avoid over-regularity, we add quasi-uniform random nodes in one cell.
+The implementation supports two equivalent strategies:
+\begin{itemize}
+  \item Poisson-disc generation in the physical cell with minimum distance $d_{\min}=d_{\min}^{\mathrm{frac}}a$,
+  while using skeleton points (atoms + level-3 FCC symmetry points) as pinned nodes;
+  \item fallback periodic rejection sampling in fractional space.
+\end{itemize}
+
+Then inversion symmetry (parity) is enforced by adding, for each accepted random point $\mathbf{r}$,
+its partner
+\begin{equation}
+\mathbf{r}' = \mathrm{wrap}(\mathbf{1}-\mathbf{r}),
+\end{equation}
+which corresponds to inversion about the cell center.
+This balances node distribution and reduces symmetry bias.
+
+Finally, all one-cell candidates (atoms, symmetry points, random, parity) are merged and passed through a periodic
+minimum-image greedy filter with threshold $d_{\min}^{\mathrm{frac}}$:
+\begin{equation}
+\|\Delta\mathbf{r}\|_{\mathrm{MIC}} =
+\left\| (\mathbf{r}_i-\mathbf{r}_j)-\mathrm{round}(\mathbf{r}_i-\mathbf{r}_j)\right\|_2
+\ge d_{\min}^{\mathrm{frac}}.
+\end{equation}
+This preserves order priority (atoms $\rightarrow$ symmetry $\rightarrow$ random $\rightarrow$ parity),
+so physically important nodes are kept first.
+
+\subsection{Method 3: Potential-adaptive density control}
+
+Beyond near-uniform sampling, the code supports adaptive random-node density guided by local potential variation.
+Inside one conventional cell, we evaluate $V$ on a dense uniform grid and estimate
+$|\nabla V|$ and $|\Delta V|$ (periodic finite differences). A local sampling scale is defined as
+\begin{equation}
+ h(\mathbf{r}) = \frac{1}{1+\lambda_{\nabla}|\nabla V(\mathbf{r})|+\lambda_{\Delta}|\Delta V(\mathbf{r})|},
+\end{equation}
+implemented by \verb|conv_cell_adaptive_lambda_grad| and
+\verb|conv_cell_adaptive_lambda_lap|.
+Candidates are uniformly preselected, then accepted with probability
+\begin{equation}
+ p_{\mathrm{acc}}(\mathbf{r}) = \frac{h(\mathbf{r})}{\max h},
+\end{equation}
+and filtered by periodic $d_{\min}$ against already pinned template nodes.
+Therefore, the local node density is explicitly modulated by the potential-variation indicators through $(\lambda_{\nabla},\lambda_{\Delta})$, and can be tuned for different physical systems.
+
+\subsection{Hybrid mixing strategy used in practice}
+
+The three mechanisms are designed to be mixed:
+\begin{itemize}
+  \item deterministic FCC backbone for robustness and reproducibility,
+  \item Poisson/parity enrichment for quasi-uniformity and symmetry completion,
+  \item potential-adaptive enrichment for physics-aware local refinement.
+\end{itemize}
+In implementation, this corresponds to the \verb|hybrid| and \verb|fcc_refined| template modes,
+with optional adaptive random enhancement layered on top.
+The mixed strategy significantly improves node quality for RBF--FD stencils in large InAs Hamiltonian calculations.
