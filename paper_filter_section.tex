@@ -1,0 +1,120 @@
+% ------------------------------------------------------------------
+% Filter-diagonalization section (ready to include in a paper)
+% ------------------------------------------------------------------
+\section{Polynomial Filter Construction and Application}
+\label{sec:filter}
+
+We seek eigenpairs of a Hamiltonian operator $H$ in a target energy region.
+The filtering stage is designed to (i) isolate selected energy windows and
+(ii) do so with a fixed number of Hamiltonian applications independent of the
+number of windows.
+
+\subsection{Step 1: Energy interval selection and spectral scaling}
+
+Let the physical spectral interval of interest be
+\begin{equation}
+E \in [E_{\min},E_{\max}], \qquad
+V_{\min}=E_{\min}, \qquad dE = E_{\max}-E_{\min}.
+\end{equation}
+We define the scaled operator
+\begin{equation}
+\widetilde{H} = \frac{4}{dE}(H - V_{\min}I) - 2I,
+\label{eq:Hscale}
+\end{equation}
+so that the spectrum is mapped to (approximately) $[-2,2]$.
+
+This scaling is numerically important: after repeated polynomial recursions
+(e.g., $\sim 500$ iterations), intermediate vectors remain in a safe dynamic
+range for double precision because the effective argument of the polynomial is
+confined near $[-2,2]$.
+
+\subsection{Step 2: Gaussian filter width from interpolation order}
+
+For a window centered at $E_\ell$, the Gaussian filter is
+\begin{equation}
+f_\ell(E)=\sqrt{\frac{dt}{\pi}}\exp\!\left[-dt\,(E-E_\ell)^2\right],
+\end{equation}
+with bandwidth
+\begin{equation}
+\sigma = \frac{1}{\sqrt{2dt}}.
+\end{equation}
+In our implementation, $dt$ is chosen from the interpolation order $n$ (named
+\texttt{nc} in code) and global energy span $dE$ via
+\begin{equation}
+dt = \left(\frac{n}{2.5\,dE}\right)^2,
+\qquad
+\sigma = \frac{1}{\sqrt{2dt}}.
+\label{eq:dt_sigma}
+\end{equation}
+Hence increasing $n$ yields narrower Gaussian windows (smaller $\sigma$), while
+also improving interpolation accuracy.
+
+\subsection{Step 3: Newton interpolation of each filter}
+
+Choose interpolation nodes $\{s_j\}_{j=0}^{n-1}\subset[-2,2]$ in scaled
+coordinates and map them back to physical energies by
+\begin{equation}
+E(s)=\frac{(s+2)dE}{4}+V_{\min}.
+\end{equation}
+For each window center $E_\ell$, compute Newton divided-difference
+coefficients $a_{\ell,j}$ such that
+\begin{equation}
+P_\ell(s)=\sum_{j=0}^{n-1} a_{\ell,j}
+\prod_{k=0}^{j-1}(s-s_k)
+\approx f_\ell(E(s)).
+\label{eq:newton_poly}
+\end{equation}
+Then $P_\ell(\widetilde{H})$ approximates $f_\ell(H)$.
+
+\subsection{Step 4: Shared recursion for $N_{\mathrm{windows}}$ filters}
+
+A direct strategy would apply each filter independently, costing
+$\mathcal{O}(N_{\mathrm{windows}}\,n)$ Hamiltonian applications.
+Instead, we share one Newton basis recursion among all windows.
+
+Define basis vectors for an input state $\psi$:
+\begin{align}
+\phi_0 &= \psi,\\
+\phi_j &= (\widetilde{H}-s_{j-1}I)\phi_{j-1}, \qquad j=1,\dots,n-1.
+\label{eq:basis_rec}
+\end{align}
+Each filtered state is a linear combination
+\begin{equation}
+\psi^{(\ell)}_{\mathrm{filt}} = \sum_{j=0}^{n-1} a_{\ell,j}\,\phi_j.
+\label{eq:combine}
+\end{equation}
+Therefore, all $N_{\mathrm{windows}}$ outputs are produced with only
+$n-1$ applications of $H$ total (equivalently $n$ Newton levels), not
+$N_{\mathrm{windows}}\times n$.
+
+\subsection{Operator application with Horner/Newton recursion}
+
+The implementation evaluates the Newton polynomial action via nested
+recurrence (Horner form for Newton basis), while accumulating all windows in
+parallel through different coefficient rows $\{a_{\ell,j}\}_{\ell}$.
+
+\begin{algorithm}[t]
+\caption{Shared Newton--Horner Filter Application for Multiple Windows}
+\label{alg:shared_filter}
+\begin{algorithmic}[1]
+\Require Hamiltonian apply routine $\mathrm{ApplyH}(\cdot)$, initial state $\psi$,
+         nodes $s[0{:}n-1]$, coefficients $a[0{:}N_w-1,0{:}n-1]$, parameters $(V_{\min},dE)$
+\Ensure Filtered states $\Psi_{\mathrm{out}}[\ell] \approx f_\ell(H)\psi$, $\ell=0,\dots,N_w-1$
+\State $\phi \gets \psi$
+\State $\Psi_{\mathrm{out}}[\ell] \gets a[\ell,0]\,\psi$ for all $\ell$
+\For{$j=1$ to $n-1$}
+    \State $u \gets \mathrm{ApplyH}(\phi)$
+    \State $\phi \gets \dfrac{4}{dE}(u - V_{\min}\phi) - 2\phi - s[j-1]\phi$
+    \For{$\ell=0$ to $N_w-1$}
+        \State $\Psi_{\mathrm{out}}[\ell] \gets \Psi_{\mathrm{out}}[\ell] + a[\ell,j]\,\phi$
+    \EndFor
+\EndFor
+\State \Return $\Psi_{\mathrm{out}}$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Complexity note.}
+Algorithm~\ref{alg:shared_filter} requires only $n-1$ calls to
+$\mathrm{ApplyH}$ for all windows together; additional windows only increase
+cheap axpy-style vector combinations.
+
