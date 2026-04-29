@@ -806,6 +806,9 @@ def generate_conv_cell_nodes(
     adaptive_lambda_lap: float = 0.0,
     adaptive_candidate_multiplier: float = 8.0,
     adaptive_gaussian_builder: Optional[Any] = None,
+    use_fcc_refined: bool = False,
+    fcc_scale_factor: int = 4,
+    fcc_r0_frac: Optional[Array] = None,
     verbose: bool = True,
 ) -> Tuple[Array, Dict[str, Array], Dict[str, Any]]:
     """
@@ -875,89 +878,94 @@ def generate_conv_cell_nodes(
     else:
         level3_base_frac = np.asarray(level3_base_frac, dtype=np.float64).reshape(-1, 3)
 
-    # level-3: expand each base by the 4 FCC cosets and reduce mod 1
-    level3_frac = np.vstack([
-        _wrap_frac(r0 + _FCC_OFFSETS_FRAC) for r0 in level3_base_frac
-    ])
-    level3_frac = _unique_rows_mod1(level3_frac)
-
-    # skeleton = atoms + level-3 (these are all pinned)
-    skeleton_frac = _unique_rows_mod1(np.vstack([atom_frac, level3_frac]))
-
-    # ── Poisson-like / adaptive random points in [0,1)^3 ─────────────────────
     rng = np.random.default_rng(seed)
-    if adaptive_random:
-        if adaptive_gaussian_builder is None:
-            raise ValueError("adaptive_random=True requires adaptive_gaussian_builder")
-        n_grid = int(adaptive_grid_n)
-        cand_frac = _build_uniform_frac_grid(n_grid)
-        cand_cart = cand_frac * a
-        V_cand = np.asarray(adaptive_gaussian_builder.evaluate_at_points(cand_cart),
-                            dtype=np.float64)
-        gnorm, lap_abs = _estimate_grad_laplacian_uniform(V_cand, n_grid, a)
-        denom = 1.0 + float(adaptive_lambda_grad) * gnorm + float(adaptive_lambda_lap) * lap_abs
-        h_w = 1.0 / np.maximum(denom, 1e-12)
-        n_candidates = int(max(1, round(float(adaptive_candidate_multiplier) * n_random_target)))
-        # draw top-weight-biased subset first to reduce KDTree insert loops
-        take = np.argsort(-h_w)[: min(n_candidates, len(h_w))]
-        random_frac = _adaptive_accept_and_filter_periodic(
-            candidates_frac=cand_frac[take],
-            weights_h=h_w[take],
-            d_min_frac=d_min_frac,
-            n_target=n_random_target,
-            rng=rng,
-            pinned_frac=skeleton_frac,
-        )
-    elif use_rbf_poisson:
-        # Use the repo's Poisson-disc sampler on the unit cube [0,a]^3 with
-        # the skeleton pinned.  radius = d_min_frac*a (Cartesian).
-        vert, smp = _make_unit_cube_surface(a)
-        pinned_cart = skeleton_frac * a
-        try:
-            rbf_nodes_cart, _rbf_groups, _ = poisson_disc_nodes(
-                d_min_frac * a, (vert, smp), pinned_nodes=pinned_cart,
-            )
-            # Drop the pinned copies — we already have them in skeleton_frac
-            # (rbf places pinned first in the interior group)
-            n_pin = len(pinned_cart)
-            extra_cart = rbf_nodes_cart[n_pin:]
-            # Drop boundary nodes from the Poisson output — the cube faces'
-            # boundary nodes aren't the user's "random" points
-            # (filter anything within 1e-6*a of a face)
-            face_tol = 1e-6 * a
-            in_interior = np.all(
-                (extra_cart > face_tol) & (extra_cart < a - face_tol), axis=1)
-            extra_cart = extra_cart[in_interior]
-            random_frac = extra_cart / a
-
-            # Optionally truncate / seed-permute to match n_random_target
-            if len(random_frac) > n_random_target:
-                perm = rng.permutation(len(random_frac))[:n_random_target]
-                random_frac = random_frac[perm]
-        except TypeError:
-            # Old rbf without pinned_nodes support — fall back to rejection
-            use_rbf_poisson = False
-
-    if not use_rbf_poisson:
-        # Periodic rejection sampler (user's original algorithm)
-        random_frac, _trials = _poisson_like_periodic(
-            skeleton_frac, n_random_target, d_min_frac,
-            max_trials=max(200_000, 2000 * n_random_target), rng=rng,
-        )
-
-    # ── parity counterparts ──────────────────────────────────────────────────
-    if include_parity and len(random_frac) > 0:
-        parity_frac = _wrap_frac(1.0 - random_frac)
-    else:
+    if use_fcc_refined:
+        if (not isinstance(fcc_scale_factor, int)) or fcc_scale_factor < 1:
+            raise ValueError("fcc_scale_factor must be a positive integer")
+        r0 = np.zeros(3, dtype=np.float64) if fcc_r0_frac is None else np.asarray(
+            fcc_r0_frac, dtype=np.float64).reshape(3)
+        fcc_nodes_frac = []
+        for i in range(fcc_scale_factor):
+            for j in range(fcc_scale_factor):
+                for k in range(fcc_scale_factor):
+                    cell_origin = np.array([i, j, k], dtype=np.float64) / float(fcc_scale_factor)
+                    for offset in _FCC_OFFSETS_FRAC:
+                        fcc_nodes_frac.append(r0 + cell_origin + offset / float(fcc_scale_factor))
+        fcc_nodes_frac = _unique_rows_mod1(np.asarray(fcc_nodes_frac, dtype=np.float64))
+        level3_frac = np.empty((0, 3), dtype=np.float64)
+        random_frac = np.empty((0, 3), dtype=np.float64)
         parity_frac = np.empty((0, 3), dtype=np.float64)
+        parts = [("fcc", fcc_nodes_frac)]
+        skeleton_frac = fcc_nodes_frac.copy()
+    else:
+        # level-3: expand each base by the 4 FCC cosets and reduce mod 1
+        level3_frac = np.vstack([
+            _wrap_frac(r0 + _FCC_OFFSETS_FRAC) for r0 in level3_base_frac
+        ])
+        level3_frac = _unique_rows_mod1(level3_frac)
 
-    # ── assemble template with role labels, then greedy d_min filter ─────────
-    parts = [
-        ("atoms",  atom_frac),
-        ("level3", level3_frac),
-        ("random", random_frac),
-        ("parity", parity_frac),
-    ]
+        # skeleton = atoms + level-3 (these are all pinned)
+        skeleton_frac = _unique_rows_mod1(np.vstack([atom_frac, level3_frac]))
+
+        # ── Poisson-like / adaptive random points in [0,1)^3 ─────────────────
+        if adaptive_random:
+            if adaptive_gaussian_builder is None:
+                raise ValueError("adaptive_random=True requires adaptive_gaussian_builder")
+            n_grid = int(adaptive_grid_n)
+            cand_frac = _build_uniform_frac_grid(n_grid)
+            cand_cart = cand_frac * a
+            V_cand = np.asarray(adaptive_gaussian_builder.evaluate_at_points(cand_cart),
+                                dtype=np.float64)
+            gnorm, lap_abs = _estimate_grad_laplacian_uniform(V_cand, n_grid, a)
+            denom = 1.0 + float(adaptive_lambda_grad) * gnorm + float(adaptive_lambda_lap) * lap_abs
+            h_w = 1.0 / np.maximum(denom, 1e-12)
+            n_candidates = int(max(1, round(float(adaptive_candidate_multiplier) * n_random_target)))
+            take = np.argsort(-h_w)[: min(n_candidates, len(h_w))]
+            random_frac = _adaptive_accept_and_filter_periodic(
+                candidates_frac=cand_frac[take],
+                weights_h=h_w[take],
+                d_min_frac=d_min_frac,
+                n_target=n_random_target,
+                rng=rng,
+                pinned_frac=skeleton_frac,
+            )
+        elif use_rbf_poisson:
+            vert, smp = _make_unit_cube_surface(a)
+            pinned_cart = skeleton_frac * a
+            try:
+                rbf_nodes_cart, _rbf_groups, _ = poisson_disc_nodes(
+                    d_min_frac * a, (vert, smp), pinned_nodes=pinned_cart,
+                )
+                n_pin = len(pinned_cart)
+                extra_cart = rbf_nodes_cart[n_pin:]
+                face_tol = 1e-6 * a
+                in_interior = np.all(
+                    (extra_cart > face_tol) & (extra_cart < a - face_tol), axis=1)
+                extra_cart = extra_cart[in_interior]
+                random_frac = extra_cart / a
+                if len(random_frac) > n_random_target:
+                    perm = rng.permutation(len(random_frac))[:n_random_target]
+                    random_frac = random_frac[perm]
+            except TypeError:
+                use_rbf_poisson = False
+
+        if not use_rbf_poisson:
+            random_frac, _trials = _poisson_like_periodic(
+                skeleton_frac, n_random_target, d_min_frac,
+                max_trials=max(200_000, 2000 * n_random_target), rng=rng,
+            )
+
+        if include_parity and len(random_frac) > 0:
+            parity_frac = _wrap_frac(1.0 - random_frac)
+        else:
+            parity_frac = np.empty((0, 3), dtype=np.float64)
+
+        parts = [
+            ("atoms",  atom_frac),
+            ("level3", level3_frac),
+            ("random", random_frac),
+            ("parity", parity_frac),
+        ]
     ordered_frac = np.vstack([p[1] for p in parts if len(p[1])])
     ordered_frac = _unique_rows_mod1(ordered_frac)
     # Track roles (by fractional coordinate lookup, using rounding)
@@ -968,12 +976,11 @@ def generate_conv_cell_nodes(
     cell_nodes_frac = _greedy_filter_by_dmin_periodic(ordered_frac, d_min_frac)
     cell_nodes_frac = _unique_rows_mod1(cell_nodes_frac)
 
-    # For each surviving cell node, record which role set it came from
-    # (first match in priority order atoms > level3 > random > parity)
+    # For each surviving cell node, record which role set it came from.
     cell_role_idx: list[int] = []
-    role_priority = ["atoms", "level3", "random", "parity"]
+    role_priority = ["atoms", "level3", "random", "parity", "fcc"]
     for node in cell_nodes_frac:
-        assigned = 3  # fallback = parity
+        assigned = 4 if use_fcc_refined else 3
         for ri, rname in enumerate(role_priority):
             src = role_map[rname]
             if len(src) == 0:
@@ -999,7 +1006,7 @@ def generate_conv_cell_nodes(
     if len(cell_nodes_cart) == 0:
         return (np.empty((0, 3), dtype=np.float64),
                 {k: np.empty(0, dtype=np.int64)
-                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity")},
+                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity", "fcc")},
                 {**cell_stats, "tiled_total": 0})
 
     nmin = np.floor((bbox_min - cell_nodes_cart.max(axis=0)) / a).astype(int) - 1
@@ -1020,7 +1027,7 @@ def generate_conv_cell_nodes(
     if not tiled_nodes:
         return (np.empty((0, 3), dtype=np.float64),
                 {k: np.empty(0, dtype=np.int64)
-                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity")},
+                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity", "fcc")},
                 {**cell_stats, "tiled_total": 0})
 
     nodes = np.vstack(tiled_nodes)
@@ -1092,6 +1099,34 @@ def generate_conv_cell_nodes(
         interior_idx = np.where(~is_surf)[0].astype(np.int64)
         margin = 0.0
 
+    # Safety pass: remove too-close nodes globally after tiling/domain clipping.
+    # This also catches rare close pairs introduced when explicit sphere-boundary
+    # nodes are merged with interior template nodes.
+    min_sep = max(0.0, float(d_min_frac) * float(a))
+    if min_sep > 0.0 and len(nodes) > 1:
+        keep = np.ones(len(nodes), dtype=bool)
+        # keep boundary first to preserve Dirichlet boundary geometry
+        priority = np.concatenate([boundary_idx, interior_idx])
+        kept_idx: list[int] = []
+        for ii in priority:
+            if not keep[ii]:
+                continue
+            if kept_idx:
+                d = np.linalg.norm(nodes[kept_idx] - nodes[ii], axis=1)
+                if np.any(d < min_sep - 1e-12):
+                    keep[ii] = False
+                    continue
+            kept_idx.append(int(ii))
+        old_to_new = -np.ones(len(nodes), dtype=np.int64)
+        new_ids = np.where(keep)[0].astype(np.int64)
+        old_to_new[new_ids] = np.arange(len(new_ids), dtype=np.int64)
+        nodes = nodes[keep]
+        roles = roles[keep]
+        boundary_idx = old_to_new[boundary_idx]
+        boundary_idx = boundary_idx[boundary_idx >= 0]
+        interior_idx = old_to_new[interior_idx]
+        interior_idx = interior_idx[interior_idx >= 0]
+
     groups: Dict[str, Array] = {
         "interior": interior_idx,
         "boundary": boundary_idx,
@@ -1099,6 +1134,7 @@ def generate_conv_cell_nodes(
         "level3":   np.where(roles == 1)[0].astype(np.int64),
         "random":   np.where(roles == 2)[0].astype(np.int64),
         "parity":   np.where(roles == 3)[0].astype(np.int64),
+        "fcc":      np.where(roles == 4)[0].astype(np.int64),
     }
     stats = {
         **cell_stats,
@@ -1294,6 +1330,9 @@ def build_qd_problem(
     conv_cell_adaptive_lambda_grad: float = 0.0,
     conv_cell_adaptive_lambda_lap: float = 0.0,
     conv_cell_adaptive_candidate_multiplier: float = 8.0,
+    conv_cell_use_fcc_refined: bool = False,
+    conv_cell_fcc_scale_factor: int = 4,
+    conv_cell_fcc_r0_frac: Optional[Array] = None,
     # ── V_nodes source ──
     # "grid_interp"     : linear-interpolate V from the cube-file grid to the
     #                     node positions (legacy, has interp error)
@@ -1369,6 +1408,10 @@ def build_qd_problem(
     conv_cell_adaptive_lambda_lap  : λ2 in h = h_max/(1+λ1|∇V|+λ2|ΔV|)
     conv_cell_adaptive_candidate_multiplier : preselection budget multiplier
                                               before accept+KDTree filtering
+    conv_cell_use_fcc_refined : use deterministic refined FCC grid in one cell
+                                (non-random), then tile to domain
+    conv_cell_fcc_scale_factor: FCC refinement factor (points/cell = 4*s^3)
+    conv_cell_fcc_r0_frac     : FCC origin shift in fractional coords
     """
     from scipy.interpolate import RegularGridInterpolator
 
@@ -1452,6 +1495,9 @@ def build_qd_problem(
             adaptive_lambda_lap=conv_cell_adaptive_lambda_lap,
             adaptive_candidate_multiplier=conv_cell_adaptive_candidate_multiplier,
             adaptive_gaussian_builder=adaptive_builder,
+            use_fcc_refined=conv_cell_use_fcc_refined,
+            fcc_scale_factor=conv_cell_fcc_scale_factor,
+            fcc_r0_frac=conv_cell_fcc_r0_frac,
         )
         groups["conv_cell_template_nodes_frac"] = _cell_stats["cell_template_nodes_frac"]
         groups["conv_cell_template_nodes_cart"] = _cell_stats["cell_template_nodes_cart"]
