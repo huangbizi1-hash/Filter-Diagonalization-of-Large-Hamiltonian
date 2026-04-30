@@ -69,6 +69,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import scipy.sparse.linalg as spla
+import primme
 
 
 # ============================================================
@@ -184,6 +186,18 @@ CONFIG: Dict[str, Any] = {
     "max_energies": 200,
     # RBF-FD 的 L 一般非对称，默认用 eig（取实部）；symmetrize=True 则用 eigh
     "hermitian_RR": True,
+
+    # ---------- 求解器路径 ----------
+    "solver": "filter",   # "filter" | "jdqmr"
+    "jdqmr": {
+        "n_levels": 20,
+        "target": None,      # None -> 使用 which；否则用 shift-invert target
+        "which": "SA",
+        "tol": 1e-6,
+        "maxBlockSize": 1,
+        "maxMatvecs": 30000,
+        "ncv": 80,
+    },
 
     # ---------- 杂项 ----------
     "print_every_filter": 1,
@@ -497,6 +511,88 @@ def run(cfg: Dict[str, Any]) -> None:
     # wrap 成 filter_core 需要的 callable
     H_apply = problem.apply_H_flat
 
+    solver_mode = str(cfg.get("solver", "filter")).lower()
+    if solver_mode == "jdqmr":
+        print("\n2. JDQMR diagonalisation (no FFT / no filter) ...")
+        t0 = time.perf_counter()
+        jd_cfg = cfg.get("jdqmr", {})
+        n_levels = int(jd_cfg.get("n_levels", 20))
+        target = jd_cfg.get("target", None)
+        which = str(jd_cfg.get("which", "SA"))
+        tol = float(jd_cfg.get("tol", 1e-6))
+        max_block = int(jd_cfg.get("maxBlockSize", 1))
+        max_matvecs = int(jd_cfg.get("maxMatvecs", 30000))
+        ncv = int(jd_cfg.get("ncv", max(80, 2 * n_levels)))
+
+        H_op = spla.LinearOperator(
+            shape=(n_interior, n_interior),
+            matvec=H_apply,
+            dtype=np.float64,
+        )
+        which_arg = target if target is not None else which
+        evals, _evecs, stats = primme.eigs(
+            H_op,
+            k=n_levels,
+            which=which_arg,
+            method="PRIMME_JDQMR",
+            tol=tol,
+            maxBlockSize=max_block,
+            maxMatvecs=max_matvecs,
+            ncv=ncv,
+            return_stats=True,
+            return_history=False,
+        )
+        timings["jdqmr"] = time.perf_counter() - t0
+        timings["total"] = time.perf_counter() - t_total_start
+        energies = np.array(evals, dtype=float)
+
+        print(f"   converged={len(energies)}  matvecs={int(stats.get('numMatvecs', -1))}")
+        print(f"   First 10 energies: {np.round(energies[:10], 6).tolist()}")
+        print(f"   Time: {timings['jdqmr']:.3f} s")
+        print(f"\n   Total wall time: {timings['total']:.3f} s")
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(np.arange(len(energies)), energies, "o-", ms=4)
+        ax.set_xlabel("Index")
+        ax.set_ylabel("Eigenvalue (Hartree)")
+        ax.set_title(f"RBF-FD JDQMR — domain={cfg['domain']}, n_interior={n_interior}")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(out_dir / "energies.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        results = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "config": cfg,
+            "timings_seconds": timings,
+            "problem": {
+                "domain": cfg["domain"],
+                "n_total": n_total,
+                "n_interior": n_interior,
+                "n_atoms": int(len(atom_idx)),
+                "V_min": float(problem.V_nodes.min()),
+                "V_max": float(problem.V_nodes.max()),
+                "V_mean": float(problem.V_nodes.mean()),
+                "quality": quality,
+            },
+            "solver": {
+                "mode": "jdqmr",
+                "n_levels": n_levels,
+                "target": target,
+                "which": which,
+                "tol": tol,
+                "maxBlockSize": max_block,
+                "maxMatvecs": max_matvecs,
+                "ncv": ncv,
+                "numMatvecs": int(stats.get("numMatvecs", -1)),
+                "energies": energies.tolist(),
+            },
+        }
+        save_json(results, out_dir / "res.json")
+        print(f"   Saved: {out_dir / 'res.json'}")
+        print(f"\nAll outputs in: {out_dir}")
+        return
+
     # ================================================================
     # 3. 构建滤波系数
     # ================================================================
@@ -735,7 +831,7 @@ def _parse_val(s: str) -> Any:
 # ============================================================
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="RBF-FD filter-diagonalisation solver",
+        description="RBF-FD solver (filter-diagonalisation or JDQMR)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例（与 main.py 完全一致的覆盖/扫描风格）：
