@@ -144,6 +144,8 @@ class CompareConfig:
     fft_kinetic_cut: float = 30.0
     fft_only: bool = False
     filter_norm_blowup_threshold: float = 1e200
+    matvec_bench_n: int = 20
+    matvec_bench_warmup: int = 2
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -265,6 +267,48 @@ def _power_method_energy(H_apply, psi0: np.ndarray, n_steps: int = 30) -> float:
             raise RuntimeError("power method 迭代中向量范数变为 0")
         psi /= nrm
     return _rayleigh(H_apply, psi)
+
+
+def _benchmark_single_hamiltonian_apply(
+    H_apply,
+    dim: int,
+    n_repeat: int,
+    n_warmup: int,
+    seed: int,
+    name: str,
+) -> dict[str, Any]:
+    rng = np.random.default_rng(seed)
+    repeats = max(1, int(n_repeat))
+    warmups = max(0, int(n_warmup))
+
+    # warmup
+    for _ in range(warmups):
+        psi_w = rng.standard_normal(dim)
+        out_w = H_apply(psi_w)
+        if not np.all(np.isfinite(out_w)):
+            raise RuntimeError(f"{name} matvec warmup produced NaN/Inf.")
+
+    times_sec: list[float] = []
+    for _ in range(repeats):
+        psi = rng.standard_normal(dim)
+        t0 = time.perf_counter()
+        out = H_apply(psi)
+        dt = time.perf_counter() - t0
+        if not np.all(np.isfinite(out)):
+            raise RuntimeError(f"{name} matvec benchmark produced NaN/Inf.")
+        times_sec.append(float(dt))
+
+    arr = np.asarray(times_sec, dtype=float)
+    return {
+        "name": name,
+        "n_repeat": repeats,
+        "n_warmup": warmups,
+        "mean_sec": float(np.mean(arr)),
+        "median_sec": float(np.median(arr)),
+        "min_sec": float(np.min(arr)),
+        "max_sec": float(np.max(arr)),
+        "std_sec": float(np.std(arr)),
+    }
 
 
 def _apply_filter_with_blowup_guard(
@@ -900,6 +944,28 @@ def run(cfg: CompareConfig) -> Path:
         Emax_rbf = _power_method_energy(H_rbf_op.matvec, psi_power_rbf, n_steps=cfg.power_steps)
     timings["power_method"] = time.perf_counter() - t_power
 
+    t_bench = time.perf_counter()
+    matvec_benchmark: dict[str, Any] = {
+        "n_repeat": int(cfg.matvec_bench_n),
+        "n_warmup": int(cfg.matvec_bench_warmup),
+        "fft": _benchmark_single_hamiltonian_apply(
+            H_fft.matvec, n_grid, cfg.matvec_bench_n, cfg.matvec_bench_warmup, cfg.seed + 123, "fft"
+        ),
+        "rbf": None,
+        "speedup_rbf_over_fft": None,
+        "speedup_fft_over_rbf": None,
+    }
+    if not cfg.fft_only and H_rbf_op is not None:
+        matvec_benchmark["rbf"] = _benchmark_single_hamiltonian_apply(
+            H_rbf_op.matvec, n_interior, cfg.matvec_bench_n, cfg.matvec_bench_warmup, cfg.seed + 456, "rbf"
+        )
+        fft_t = float(matvec_benchmark["fft"]["mean_sec"])
+        rbf_t = float(matvec_benchmark["rbf"]["mean_sec"])
+        if fft_t > 0.0 and rbf_t > 0.0:
+            matvec_benchmark["speedup_rbf_over_fft"] = float(fft_t / rbf_t)
+            matvec_benchmark["speedup_fft_over_rbf"] = float(rbf_t / fft_t)
+    timings["matvec_benchmark"] = time.perf_counter() - t_bench
+
     per_state = []
     fft_basis = []
     rbf_basis = []
@@ -1214,9 +1280,15 @@ def run(cfg: CompareConfig) -> Path:
                 if paired_rbf_interp_vs_nodes else None),
         },
         "timings_sec": timings,
+        "matvec_benchmark": matvec_benchmark,
     }
     if h_rbf_matrix_stats is not None:
         out["rbf_operator"] = {"matrix_data_stats": h_rbf_matrix_stats}
+        if H_rbf is not None and n_interior > 0:
+            nnz = int(H_rbf.nnz)
+            out["rbf_operator"]["nnz"] = nnz
+            out["rbf_operator"]["n_interior"] = int(n_interior)
+            out["rbf_operator"]["avg_stencil_size_from_nnz"] = float(nnz / n_interior)
         if rbf_min_eig_info is not None:
             out["rbf_operator"]["min_eigenvalue_complex"] = rbf_min_eig_info
 
@@ -1423,6 +1495,10 @@ def parse_args() -> CompareConfig:
         help="从已存节点文件加载（.npz/.json；跳过节点生成，Laplacian/V 仍按当前 CLI 重新算）")
 
     p.add_argument("--power-steps", type=int, default=30)
+    p.add_argument("--matvec-bench-n", type=int, default=20,
+                   help="比较单次哈密顿乘法时间时的重复次数（取平均）")
+    p.add_argument("--matvec-bench-warmup", type=int, default=2,
+                   help="单次哈密顿乘法计时前的 warmup 次数")
     p.add_argument("--fft-kinetic-cut", type=float, default=30.0)
     p.add_argument("--fft-only", action="store_true",
                    help="只运行 FFT filter + Ritz，跳过 RBF 建点/哈密顿量/对比项")
@@ -1494,6 +1570,8 @@ def parse_args() -> CompareConfig:
         quality_probe_method=a.quality_probe_method,
         quality_probe_n=a.quality_probe_n,
         power_steps=a.power_steps,
+        matvec_bench_n=a.matvec_bench_n,
+        matvec_bench_warmup=a.matvec_bench_warmup,
         fft_kinetic_cut=a.fft_kinetic_cut,
         fft_only=a.fft_only,
         out_dir=a.out_dir,
