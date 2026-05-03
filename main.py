@@ -28,7 +28,7 @@ FFT 滤波对角化（Filter Diagonalization Method）入口脚本。
 
   3. 计算 Newton 多项式滤波器系数（fft_code.filter_coeff）
 
-  4. 滤波随机态生成子空间基（fft_code.hamiltonian）
+  4. 滤波随机态生成子空间基（filter_core — 算符无关通用函数）
 
   5. Rayleigh-Ritz 对角化（fft_code.rayleigh_ritz）
 
@@ -40,11 +40,12 @@ FFT 滤波对角化（Filter Diagonalization Method）入口脚本。
     params.py        — IstParams / PhysParams 数据类
     grid.py          — 网格构建 / k 空间动能对角元
     wavefunction.py  — 波函数归一化 / 随机初态
-    hamiltonian.py   — FFT 动能 / 哈密顿量 / 滤波器作用
+    hamiltonian.py   — FFT 动能 / 哈密顿量作用
     filter_coeff.py  — Newton 插值滤波系数
     rayleigh_ritz.py — SVD + Rayleigh-Ritz 对角化
     potentials.py    — 测试势能 + build_potential_from_config 分派器
     plotting.py      — 所有绘图函数
+  filter_core.py     — 算符无关的 Newton 滤波 / Rayleigh-Ritz（通用）
 
 关键参数说明
 -----------
@@ -91,7 +92,7 @@ matplotlib.use("Agg")
 from fft_code.params       import IstParams, PhysParams
 from fft_code.grid         import build_k_diagonal
 from fft_code.wavefunction import random_sine_psi, random_pm1_psi, normalize_psi
-from fft_code.hamiltonian  import apply_H, apply_filter_H, apply_filter_H_all
+from fft_code.hamiltonian  import apply_H
 from fft_code.filter_coeff import build_filter_coefficients, make_filter_func
 from fft_code.rayleigh_ritz import svd_rayleigh_ritz
 from fft_code.potentials   import build_potential_from_config
@@ -102,6 +103,14 @@ from fft_code.plotting     import (
     plot_energy_levels,
     plot_energy_errors,
     plot_potential_slice,
+)
+
+# ============================================================
+# filter_core — 算符无关的 Newton 滤波（Step 1 迁移）
+# ============================================================
+from filter_core import (
+    apply_filter_H_op,
+    apply_filter_H_all_op,
 )
 
 
@@ -316,6 +325,9 @@ def run(cfg: Dict[str, Any]) -> None:
     kinetic_cut  = cfg.get("kinetic_cut", 30.0)
     T_k_diagonal = build_k_diagonal(x_grid, kinetic_cut=kinetic_cut)
 
+    # H_apply 闭包：将 FFT 路径的 apply_H 包装为 filter_core 兼容的算符接口
+    H_apply_fft = lambda psi: apply_H(psi, V, T_k_diagonal)
+
     # ================================================================
     # 3. 构建滤波系数
     # ================================================================
@@ -476,8 +488,8 @@ def run(cfg: Dict[str, Any]) -> None:
     # ================================================================
     # 4. 滤波随机态
     # ================================================================
-    # 使用 apply_filter_H_all：所有 El 共享 Newton 基底向量，
-    # H 作用次数从 ms*nc 降至 nc。
+    # apply_filter_H_all_op（filter_core）：所有 El 共享 Newton 基底向量，
+    # H 作用次数从 ms*nc 降至 nc。H_apply_fft 闭包在第 2 步已定义。
     print("\n3. Filtering random states ...")
     t0 = time.perf_counter()
 
@@ -499,15 +511,15 @@ def run(cfg: Dict[str, Any]) -> None:
 
         if filter_type == "split_bandpass":
             # 两步：先高通（批量共享基底），再低通（每个 El 单独作用）
-            psi_hi_all = apply_filter_H_all(
-                psi_rand, V, samp, an_hi, par, T_k_diagonal)   # (ms, Nx, Ny, Nz)
+            psi_hi_all = apply_filter_H_all_op(
+                H_apply_fft, psi_rand, samp, an_hi, par)        # (ms, Nx, Ny, Nz)
             psi_filt_all = np.zeros_like(psi_hi_all)
             for ie in range(ist.ms):
-                psi_filt_all[ie] = apply_filter_H(
-                    psi_hi_all[ie], V, samp, an_lo[ie], par, T_k_diagonal)
+                psi_filt_all[ie] = apply_filter_H_op(
+                    H_apply_fft, psi_hi_all[ie], samp, an_lo[ie], par)
         else:
-            psi_filt_all = apply_filter_H_all(
-                psi_rand, V, samp, an, par, T_k_diagonal)       # (ms, Nx, Ny, Nz)
+            psi_filt_all = apply_filter_H_all_op(
+                H_apply_fft, psi_rand, samp, an, par)           # (ms, Nx, Ny, Nz)
 
         for ie in range(ist.ms):
             psi_filt = normalize_psi(psi_filt_all[ie])
@@ -587,9 +599,9 @@ def run(cfg: Dict[str, Any]) -> None:
             "nc_true": nc_true,
             "dt":     dt,
             "sigma_gaussian": float(1 / np.sqrt(2 * dt)),
-            **({"alpha_f": alpha_f, "k_f": k_f, "n0": n0}
+            **(({"alpha_f": alpha_f, "k_f": k_f, "n0": n0})
                if filter_type == "gabor" else {}),
-            **({"beta": beta, "E1": E1}
+            **(({"beta": beta, "E1": E1})
                if filter_type == "bandpass" else {}),
             "El_list": El_list.tolist(),
             "E_mean": E_mean,
