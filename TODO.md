@@ -1,50 +1,91 @@
-# TODO：统一 fft_code 与 rbf_core 中重合的 filter / SVD 模块
+# TODO：将 rbf_core.py 模块化为 rbf_code/ 包
 
 ## 进度
 
-- [x] Step 0 — 写入本 TODO.md（追踪文件）
-- [x] Step 1 — `main.py`：滤波调用迁移到 `filter_core`
-- [x] Step 2 — `main.py`：SVD/RR 调用迁移到 `filter_core`
-- [x] Step 3 — `fft_code/hamiltonian.py`：`apply_filter_H` / `apply_filter_H_all` 改为 thin wrapper
-- [x] Step 4 — `fft_code/rayleigh_ritz.py`：`svd_rayleigh_ritz` 改为 thin wrapper
-- [x] Step 5 — `compare_fft_rbf_filter_qd.py`：已正确使用 `filter_core`，无需修改
-
-✅ **全部任务完成**
-
----
-
-## 最终状态总结
-
-### 改动文件
-
-| 文件 | 改动内容 |
-|------|------|
-| `main.py` | 移除 `apply_filter_H_all`/`apply_filter_H`/`svd_rayleigh_ritz` 直接调用；改用 `filter_core` 的三个通用函数 |
-| `fft_code/hamiltonian.py` | `apply_filter_H` 和 `apply_filter_H_all` 改为 thin wrapper 委托到 `filter_core` |
-| `fft_code/rayleigh_ritz.py` | `svd_rayleigh_ritz` 改为 thin wrapper 委托到 `filter_core` |
-
-### 未改动文件
-
-| 文件 | 原因 |
-|------|------|
-| `filter_core.py` | 目标模块，不改接口 |
-| `run_rbf_filter.py` | 已正确使用 `filter_core` |
-| `compare_fft_rbf_filter_qd.py` | 已从 `filter_core` 导入 `svd_rayleigh_ritz_op`；`_apply_filter_with_blowup_guard` 是带裂变诊断的**特化扩展**，不是重复代码 |
-| `fft_code/filter_coeff.py` | 公开接口不改 |
+- [x] Step 0 — 写入本 TODO.md
+- [ ] Step 1 — 创建 `rbf_code/config.py` （数据类 + 常量 + 工具函数）
+- [ ] Step 2 — 创建 `rbf_code/periodic.py` （周期性 / 对称性工具）
+- [ ] Step 3 — 创建 `rbf_code/nodes.py` （所有节点生成函数）
+- [ ] Step 4 — 创建 `rbf_code/laplacian.py` （拉普拉斯算子 + 权重矩阵 + 节点质量）
+- [ ] Step 5 — 创建 `rbf_code/io_qd.py` （cube I/O + 量子点问题构建）
+- [ ] Step 6 — 创建 `rbf_code/eigensolve.py` （特征値求解 + 扫描 + 迭代）
+- [ ] Step 7 — 创建 `rbf_code/__init__.py` （重导出公开 API）
+- [ ] Step 8 — 将 `rbf_core.py` 改为 thin wrapper （从 rbf_code 重导出）
 
 ---
 
-## 验证命令
+## 目标结构
+
+```
+rbf_code/
+  __init__.py      — 重导出全部公开 API，保持向后兼容
+  config.py        — RBFConfig, RBFProblem, IterationRecord, 常量, _raise_on_nonfinite
+  periodic.py      — _wrap_frac, _periodic_diff/dist, _unique_*, _periodic_delta_frac
+  nodes.py         — generate_nodes, generate_sphere_nodes, generate_atom_augmented_nodes,
+                     generate_conv_cell_nodes, _make_icosphere, _filter_close_points,
+                     _make_unit_cube_surface, _poisson_like_periodic, 等节点工具
+  laplacian.py     — build_hamiltonian_matrix, weight_matrix_conv_cell_reuse,
+                     weight_matrix_ball_fingerprint, relative_laplacian_error,
+                     compute_node_quality
+  io_qd.py         — read_cube_file, read_cube_atoms, build_qd_problem
+  eigensolve.py    — solve_lowest_eigenvalues, sweep_rbf_kernels,
+                     sweep_stencil_eps, iterate_hamiltonian, build_problem
+rbf_core.py        — thin wrapper: from rbf_code import *
+```
+
+## 模块依赖关系
+
+```
+config      ← 无内部依赖
+  ↑
+periodic    ← config
+  ↑
+nodes       ← config, periodic
+  ↑
+laplacian   ← config
+  ↑
+io_qd       ← config, nodes, laplacian
+  ↑
+eigensolve  ← config, laplacian
+```
+
+## 公开 API 列表（故 rbf_core.py 的全部公开名称）
+
+```python
+# config
+RBFConfig, RBFProblem, IterationRecord
+KERNELS_ALL, KERNEL_GROUPS
+
+# nodes
+generate_nodes, make_grid_points
+generate_sphere_nodes, generate_atom_augmented_nodes
+generate_conv_cell_nodes
+compute_node_quality
+
+# laplacian
+build_hamiltonian_matrix, relative_laplacian_error
+weight_matrix_conv_cell_reuse, weight_matrix_ball_fingerprint
+
+# io_qd
+read_cube_file, read_cube_atoms, build_qd_problem
+
+# eigensolve
+solve_lowest_eigenvalues, build_problem
+sweep_rbf_kernels, sweep_stencil_eps, iterate_hamiltonian
+```
+
+## 不变约束
+
+- `rbf_core.py` 的公开名称全部保留（其他脚本不需改动）
+- `run_rbf_filter.py`、`compare_fft_rbf_filter_qd.py` 等调用方无需修改
+
+## 运行方式（不变）
 
 ```bash
-# 确认无文件直接调用旧 filter 函数（wrapper 内部除外）
-grep -rn "apply_filter_H_all\|apply_filter_H\b" . --include="*.py" \
-  | grep -v "fft_code/hamiltonian.py" | grep -v "filter_core.py"
+# 旧方式（继续有效）
+from rbf_core import build_qd_problem, RBFConfig
 
-# 确认 svd_rayleigh_ritz 调用已迁移
-grep -rn "svd_rayleigh_ritz\b" . --include="*.py" \
-  | grep -v "fft_code/rayleigh_ritz.py" | grep -v "filter_core.py"
-
-# 回归测试
-python main.py --set nc=50 --set n_random=1 --set tag=after_refactor
+# 新方式（全量导入子模块）
+from rbf_code.io_qd import build_qd_problem
+from rbf_code.config import RBFConfig
 ```
