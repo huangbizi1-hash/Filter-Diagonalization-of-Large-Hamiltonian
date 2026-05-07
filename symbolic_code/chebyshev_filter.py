@@ -1,18 +1,26 @@
 """Chebyshev filter f(H)*psi assembly from symbolic H^n*psi expressions.
 
+Two assembly paths
+------------------
+apply_f_of_H_from_raw_powers  (recommended)
+    Loads raw H^n files (from generate_H_powers) and combines them with
+    the polynomial coefficients of T_m(aH+b).  Energy window a,b is applied
+    only at assembly time, so H^n files can be reused for any filter.
+
+apply_f_of_H_on_psi  (legacy)
+    Loads (aH+b)^n files (from generate_scaled_H_powers) and combines them
+    with the Chebyshev polynomial coefficients.  Energy window is baked into
+    the files.
+
 Workflow
 --------
-1. ``load_H_powers``             – read (aH+b)^n files produced by h_powers.py
-2. ``chebyshev_coeffs_transformed`` – coefficients of T_n(aH+b)
-3. ``apply_f_of_H_on_psi``       – assemble f(H)*psi = Σ c_n (aH+b)^n * psi
-4. ``extract_cos_sin_coeffs``    – split into cos-phase / sin-phase envelopes
-5. ``group_by_exp_combined``     – group terms by their Gaussian factor
-6. ``apply_horner``              – Horner form for polynomial parts
-7. ``svd_H``                     – filter-diagonalisation via QR+SVD (numerical)
-
-Note: ``fH_func.py`` and ``fH_func_AsIn.py`` have been merged here;
-      the only difference was the default folder path, which is now a
-      parameter of ``apply_f_of_H_on_psi``.
+1. ``load_H_powers`` / ``load_H_raw_powers`` - read power files from disk
+2. ``chebyshev_coeffs_transformed``           - coefficients of T_m(aH+b)
+3. assembly function (one of the two above)   - assemble f(H)*psi
+4. ``extract_cos_sin_coeffs``                 - split into cos/sin envelopes
+5. ``group_by_exp_combined``                  - group by Gaussian factor
+6. ``apply_horner``                           - Horner form for polynomials
+7. ``svd_H``                                  - filter-diag (numerical)
 """
 
 import gzip
@@ -39,14 +47,17 @@ def load_expr_srepr(path):
     return sp.sympify(s, evaluate=False)
 
 
-def load_H_powers(folder, n_max, file_type='sym.gz'):
-    """Load H^n*psi dicts from a cube subdirectory.
+def load_H_powers(folder, n_max, file_type='sym.gz', prefix='H_scaled_power'):
+    """Load H^n*psi dicts from a directory.
 
     Parameters
     ----------
     folder : str or Path
     n_max  : int   maximum order to load
     file_type : 'sym.gz' | 'pkl'
+    prefix : str
+        Filename prefix.  Use 'H_scaled_power' (default) for files from
+        generate_scaled_H_powers, or 'H_power' for files from generate_H_powers.
 
     Returns
     -------
@@ -54,15 +65,14 @@ def load_H_powers(folder, n_max, file_type='sym.gz'):
     """
     folder = Path(folder)
     if file_type == 'pkl':
-        pattern = 'H_scaled_power_*.pkl'
+        pattern = f'{prefix}_*.pkl'
     elif file_type == 'sym.gz':
-        pattern = 'H_scaled_power_*.sym.gz'
+        pattern = f'{prefix}_*.sym.gz'
     else:
         raise ValueError(f"Unsupported file_type: {file_type!r}")
 
     results = {}
     for fpath in sorted(folder.glob(pattern)):
-        # parse n from filenames like H_scaled_power_3.sym.gz
         stem = fpath.name.replace('.sym.gz', '').replace('.pkl', '')
         n = int(stem.split('_')[-1])
         if file_type == 'pkl':
@@ -74,6 +84,14 @@ def load_H_powers(folder, n_max, file_type='sym.gz'):
         if n >= n_max:
             break
     return results
+
+
+def load_H_raw_powers(folder, n_max, file_type='pkl'):
+    """Load raw H^n*psi files (``H_power_*.pkl``) from generate_H_powers.
+
+    Convenience wrapper around load_H_powers with prefix='H_power'.
+    """
+    return load_H_powers(folder, n_max, file_type=file_type, prefix='H_power')
 
 
 # ---------------------------------------------------------------------------
@@ -97,20 +115,74 @@ def chebyshev_coeffs_transformed(n, a=1.0, b=0.0):
 
 
 # ---------------------------------------------------------------------------
-# f(H)*psi assembly
+# f(H)*psi assembly – Path A: raw H^n files  (recommended)
+# ---------------------------------------------------------------------------
+
+def apply_f_of_H_from_raw_powers(folder, m, a, b, file_type='pkl'):
+    """Assemble f(H)*psi from raw H^n files (energy-window independent).
+
+    Expands T_m(aH+b) in the monomial basis via chebyshev_coeffs_transformed,
+    then assembles
+
+        f(H)*psi = sum_{n=0}^{m} c_n * H^n * psi
+
+    Because a and b are applied here (not baked into the H^n files), the same
+    H^n directory can be reused for any energy window or filter order.
+
+    Parameters
+    ----------
+    folder : str or Path   directory with ``H_power_n.*`` files
+    m : int                Chebyshev order
+    a, b : float           Chebyshev rescaling (from E_lo, E_hi)
+    file_type : str
+
+    Returns
+    -------
+    psi_fH : sympy expression in x, y, z, kx, ky, kz, b
+    """
+    coeffs  = chebyshev_coeffs_transformed(m, a=a, b=b)
+    results = load_H_raw_powers(folder, m, file_type=file_type)
+
+    kx, ky, kz, bsym = sp.symbols('kx ky kz b')
+    x, y, z = sp.symbols('x y z')
+    theta = kx * x + ky * y + kz * z + bsym
+
+    Ps_total = sp.Integer(0)
+    Pc_total = sp.Integer(0)
+    for n, c in enumerate(coeffs):
+        if c == 0:
+            continue
+        if n == 0:
+            # H^0 * psi = psi = sin(theta), Ps=1, Pc=0
+            Ps_total += c
+        else:
+            entry = results.get(n)
+            if entry is None:
+                raise KeyError(
+                    f"H^{n} not found in {folder!r}; "
+                    "run generate_H_powers with N >= m first"
+                )
+            Ps_total += c * entry['Ps']
+            Pc_total += c * entry['Pc']
+
+    psi_fH = Ps_total * sp.sin(theta) + Pc_total * sp.cos(theta)
+    return psi_fH
+
+
+# ---------------------------------------------------------------------------
+# f(H)*psi assembly – Path B: scaled (aH+b)^n files  (legacy)
 # ---------------------------------------------------------------------------
 
 def apply_f_of_H_on_psi(folder, f_coeffs, n_max, file_type='sym.gz'):
-    """Assemble  f(H)*sin(θ)  symbolically via Chebyshev expansion.
+    """Assemble f(H)*sin(θ) from (aH+b)^n files.
 
-    f is expanded as  f(H) = c_0 + c_1*H + … + c_N*H^N  where the H^n*psi
-    files are loaded from *folder*.  The result is
-        psi_fH = A_sin(x,y,z,...)*sin(θ) + A_cos(x,y,z,...)*cos(θ)
+    Loads files produced by generate_scaled_H_powers and combines them with
+    the Chebyshev polynomial coefficients supplied by the caller.
 
     Parameters
     ----------
     folder     : str or Path  directory with ``H_scaled_power_n`` files
-    f_coeffs   : list         [c_0, c_1, …, c_N] (from chebyshev_coeffs_transformed)
+    f_coeffs   : list         [c_0, c_1, …, c_N] from chebyshev_coeffs_transformed
     n_max      : int          must equal len(f_coeffs) - 1
     file_type  : str
 
@@ -118,7 +190,8 @@ def apply_f_of_H_on_psi(folder, f_coeffs, n_max, file_type='sym.gz'):
     -------
     psi_fH : sympy expression in x, y, z, kx, ky, kz, b
     """
-    results = load_H_powers(folder, n_max, file_type=file_type)
+    results = load_H_powers(folder, n_max, file_type=file_type,
+                            prefix='H_scaled_power')
     x, y, z, kx, ky, kz, b = sp.symbols('x y z kx ky kz b')
     theta = kx * x + ky * y + kz * z + b
 
@@ -128,7 +201,7 @@ def apply_f_of_H_on_psi(folder, f_coeffs, n_max, file_type='sym.gz'):
         Ps_total += c * results[n]['Ps']
         Pc_total += c * results[n]['Pc']
 
-    # c_0 term: H^0 * psi = psi = 1*sin(θ), so Ps=1, Pc=0
+    # c_0 term: H^0 * psi = psi = sin(θ)
     psi_fH = (
         Ps_total * sp.sin(theta)
         + Pc_total * sp.cos(theta)
@@ -159,14 +232,9 @@ def extract_cos_sin_coeffs(psi_fH):
 def group_by_exp_combined(expr):
     """Group terms by shared exponential (Gaussian) factor.
 
-    After grouping, each Gaussian envelope is evaluated only once during
-    numerical computation.
-
     Returns
     -------
     list of (exp_part, poly_part) tuples
-        ``exp_part`` is a product of ``exp(…)`` factors (or sp.Integer(1));
-        ``poly_part`` is the remaining polynomial coefficient.
     """
     if expr == 0:
         return []
@@ -187,23 +255,12 @@ def group_by_exp_combined(expr):
 
 
 def apply_horner(terms):
-    """Apply Horner's method to the polynomial part of each term.
-
-    Reduces multiplications when evaluating the expression numerically.
-
-    Parameters
-    ----------
-    terms : list of (exp_part, poly_part)
-
-    Returns
-    -------
-    list of (exp_part, horner_poly_part)
-    """
+    """Apply Horner's method to the polynomial part of each term."""
     return [(ep, sp.horner(pp)) for ep, pp in terms]
 
 
 # ---------------------------------------------------------------------------
-# Numerical diagonalisation (requires FFT_func / fft_code)
+# Numerical diagonalisation
 # ---------------------------------------------------------------------------
 
 def svd_H(
@@ -213,9 +270,6 @@ def svd_H(
 ):
     """Filter diagonalisation: QR + SVD on a filtered basis.
 
-    Takes a stack of f(H)*psi states, orthogonalises them via QR+SVD,
-    builds a small projected Hamiltonian H_tilde, and diagonalises it.
-
     Parameters
     ----------
     filtered_psi_matrix : ndarray, shape (n_filters, Nx, Ny, Nz)
@@ -224,12 +278,8 @@ def svd_H(
     V_on_grid : ndarray
     apply_H_func : callable
         ``apply_H_func(psi_3d, x_grid, V_on_grid)`` → H*psi_3d.
-        Typically ``fft_code.hamiltonian.apply_H`` or
-        ``FFT_func.scaled_fft_eval_H_psi``.
-    rank_threshold : float
-        Singular-value cutoff for effective-rank determination.
-    n_eigs : int
-        Maximum number of eigenvalues to return.
+    rank_threshold : float  singular-value cutoff
+    n_eigs : int            maximum eigenvalues to return
 
     Returns
     -------

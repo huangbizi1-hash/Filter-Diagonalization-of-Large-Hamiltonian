@@ -13,13 +13,23 @@ Tests
    symbolic vs numerical comparison is meaningful (expected error < 1e-8).
 2. Filter diag   : full Chebyshev pipeline, recover lowest eigenvalues
 
+H-power strategies
+------------------
+--method H_powers  (default)
+    Build pure H^n files; assemble f(H)*psi via
+    apply_f_of_H_from_raw_powers.  H^n has rational coefficients so sympy
+    works faster, and the same files can be reused for any energy window.
+--method scaled
+    Build (aH+b)^n files with energy-window baked in (legacy behaviour).
+
 Usage
 -----
-    python test_symbolic_ho3d.py                          # both tests
-    python test_symbolic_ho3d.py --quick                  # Test 1 only
-    python test_symbolic_ho3d.py --N 6                    # higher Chebyshev order
-    python test_symbolic_ho3d.py --E_lo 0.5 --E_hi 6.5   # custom energy window
-    python test_symbolic_ho3d.py --N 3 --n_waves 40      # fast smoke test
+    python test_symbolic_ho3d.py                             # both tests, H^n method
+    python test_symbolic_ho3d.py --quick                     # Test 1 only
+    python test_symbolic_ho3d.py --N 6                       # higher order
+    python test_symbolic_ho3d.py --E_lo 0.5 --E_hi 6.5      # custom energy window
+    python test_symbolic_ho3d.py --method scaled             # legacy (aH+b)^n path
+    python test_symbolic_ho3d.py --N 3 --n_waves 40          # fast smoke test
 """
 
 import argparse
@@ -31,9 +41,14 @@ import time
 import numpy as np
 import sympy as sp
 
-from symbolic_code.h_powers import apply_H_on_pair, generate_scaled_H_powers
+from symbolic_code.h_powers import (
+    apply_H_on_pair,
+    generate_H_powers,
+    generate_scaled_H_powers,
+)
 from symbolic_code.chebyshev_filter import (
     chebyshev_coeffs_transformed,
+    apply_f_of_H_from_raw_powers,
     apply_f_of_H_on_psi,
     extract_cos_sin_coeffs,
     svd_H,
@@ -52,7 +67,7 @@ def make_grid(L=5.5, N=22):
 
 
 def grid_kvecs(x1):
-    """Return the 1-D array of FFT-exact wave-vectors for coordinate grid x1."""
+    """Return the FFT-exact wave-vector array for coordinate grid x1."""
     N  = len(x1)
     dx = x1[1] - x1[0]
     return 2 * np.pi * np.fft.fftfreq(N, d=dx)
@@ -81,30 +96,44 @@ def ho_potential_sympy():
     return V, x, y, z
 
 
-def build_fH_psi_sympy(N_cheby, E_lo, E_hi):
+def build_fH_psi_sympy(N_cheby, E_lo, E_hi, method='H_powers'):
     """
     Compute f(H)*sin(θ) symbolically via Chebyshev expansion of order N_cheby.
 
-    Returns psi_fH as a sympy expression in x,y,z,kx,ky,kz,b.
-    Also returns the tempdir path (caller is responsible for cleanup).
+    method='H_powers' (default)
+        Builds H^n with sp.expand() (rational coefficients, compact).
+        Assembles via apply_f_of_H_from_raw_powers; a,b applied at assembly.
+    method='scaled'
+        Builds (aH+b)^n with a,b baked in (legacy).
+        Assembles via apply_f_of_H_on_psi.
     """
     V_sym, x, y, z = ho_potential_sympy()
     kx, ky, kz, b  = sp.symbols('kx ky kz b')
     kvec = (kx, ky, kz)
     k2   = kx**2 + ky**2 + kz**2
 
-    a      =  2.0 / (E_hi - E_lo)
-    b_sc   = -(E_hi + E_lo) / (E_hi - E_lo)
-    coeffs = chebyshev_coeffs_transformed(N_cheby, a=a, b=b_sc)
+    a    =  2.0 / (E_hi - E_lo)
+    b_sc = -(E_hi + E_lo) / (E_hi - E_lo)
 
     tmpdir = tempfile.mkdtemp(prefix='ho_hpow_')
-    generate_scaled_H_powers(
-        N_cheby, a, b_sc, outdir=tmpdir, file_format='pkl',
-        V=V_sym, kvec=kvec, k2=k2, pref=0.5,
-        x=x, y=y, z=z,
-    )
-    psi_fH = apply_f_of_H_on_psi(tmpdir, coeffs, N_cheby, file_type='pkl')
-    shutil.rmtree(tmpdir)
+    try:
+        if method == 'H_powers':
+            generate_H_powers(
+                N_cheby, tmpdir, file_format='pkl',
+                V=V_sym, kvec=kvec, k2=k2, pref=0.5,
+                x=x, y=y, z=z,
+            )
+            psi_fH = apply_f_of_H_from_raw_powers(tmpdir, N_cheby, a=a, b=b_sc)
+        else:
+            coeffs = chebyshev_coeffs_transformed(N_cheby, a=a, b=b_sc)
+            generate_scaled_H_powers(
+                N_cheby, a, b_sc, outdir=tmpdir, file_format='pkl',
+                V=V_sym, kvec=kvec, k2=k2, pref=0.5,
+                x=x, y=y, z=z,
+            )
+            psi_fH = apply_f_of_H_on_psi(tmpdir, coeffs, N_cheby, file_type='pkl')
+    finally:
+        shutil.rmtree(tmpdir)
     return psi_fH
 
 
@@ -118,7 +147,7 @@ def test_single_H_step():
 
     IMPORTANT: k must be grid-aligned (k in 2π/L * Z) so that the FFT
     kinetic energy is numerically exact (no aliasing).  For arbitrary k
-    the FFT result is only approximate and the comparison is meaningless.
+    the FFT gives only an approximation and the comparison is meaningless.
 
     Expected max error < 1e-8 (floating-point only).
     """
@@ -131,8 +160,7 @@ def test_single_H_step():
     V3d = 0.5 * (X**2 + Y**2 + Z**2)
 
     # Grid-aligned wave-vectors: only these give exact FFT kinetic energy.
-    k_grid = grid_kvecs(x1)          # shape (N,), includes 0 and negative
-    # Pick a handful of small positive grid k values (avoid 0 and Nyquist).
+    k_grid = grid_kvecs(x1)           # shape (N,), includes 0 and negatives
     small_k = k_grid[k_grid > 0][:4]  # e.g. ~[0.628, 1.257, 1.885, 2.513]
 
     V_sym, xs, ys, zs = ho_potential_sympy()
@@ -140,7 +168,7 @@ def test_single_H_step():
     kvec = (kx_s, ky_s, kz_s)
     k2   = kx_s**2 + ky_s**2 + kz_s**2
 
-    # Pre-compute symbolic H*psi once (result is Ps=0.5*k²+0.5*r², Pc=0).
+    # Pre-compute symbolic H*psi once: H*sin(θ) = (0.5k² + 0.5r²)*sin(θ).
     Ps_new, Pc_new = apply_H_on_pair(
         sp.Integer(1), sp.Integer(0),
         V_sym, kvec, k2, 0.5, xs, ys, zs,
@@ -151,25 +179,22 @@ def test_single_H_step():
         [xs, ys, zs, kx_s, ky_s, kz_s, b_s], Hpsi_expr, 'numpy'
     )
 
-    rng    = np.random.default_rng(0)
-    b_vals = rng.uniform(0, np.pi, 6)
-    # Build 6 grid-aligned (kx, ky, kz) triples from small_k.
+    rng      = np.random.default_rng(0)
+    b_vals   = rng.uniform(0, np.pi, 6)
     k_triples = [
-        (small_k[0],  small_k[1],  small_k[2]),
-        (small_k[1],  small_k[0],  small_k[3]),
-        (small_k[2],  small_k[3],  small_k[0]),
-        (small_k[0],  small_k[3],  small_k[1]),
-        (small_k[1],  small_k[2],  small_k[0]),
-        (small_k[3],  small_k[0],  small_k[2]),
+        (small_k[0], small_k[1], small_k[2]),
+        (small_k[1], small_k[0], small_k[3]),
+        (small_k[2], small_k[3], small_k[0]),
+        (small_k[0], small_k[3], small_k[1]),
+        (small_k[1], small_k[2], small_k[0]),
+        (small_k[3], small_k[0], small_k[2]),
     ]
 
     errors = []
     for (kx_v, ky_v, kz_v), b_v in zip(k_triples, b_vals):
         psi = np.sin(kx_v*X + ky_v*Y + kz_v*Z + b_v)
-
         Hpsi_num = fft_apply_H(psi, x1, V3d)
         Hpsi_sym = f_Hpsi(X, Y, Z, kx_v, ky_v, kz_v, b_v)
-
         err = float(np.max(np.abs(Hpsi_sym - Hpsi_num)))
         errors.append(err)
         print(f"  k=({kx_v:+.3f},{ky_v:+.3f},{kz_v:+.3f})  "
@@ -185,7 +210,7 @@ def test_single_H_step():
 # Test 2 – filter diagonalisation
 # ---------------------------------------------------------------------------
 
-def test_filter_diag(N_cheby=4, E_lo=0.5, E_hi=6.5, n_waves=60):
+def test_filter_diag(N_cheby=4, E_lo=0.5, E_hi=6.5, n_waves=60, method='H_powers'):
     """
     Full pipeline test:
       1. Build f(H)*psi symbolically (Chebyshev of order N_cheby).
@@ -193,24 +218,20 @@ def test_filter_diag(N_cheby=4, E_lo=0.5, E_hi=6.5, n_waves=60):
       3. Run SVD-based filter diagonalisation.
       4. Check recovered eigenvalues match HO spectrum E_n = n+1.5.
 
-    Energy window [E_lo, E_hi] should bracket the lowest HO levels.
-    Default: E_lo=0.5, E_hi=6.5 covers n=0,1,2 shells (E=1.5,2.5,3.5).
+    Default energy window [0.5, 6.5] covers n=0,1,2 shells (E=1.5,2.5,3.5).
     Higher N_cheby gives sharper filter; N>=6 recommended for accuracy.
-
-    Expected spectrum (lowest states):
-      E = 1.5, 2.5, 2.5, 2.5, 3.5, 3.5, 3.5, 3.5, 3.5, 3.5, ...
     """
     print("\n" + "="*60)
     print(f"Test 2: filter diagonalisation on 3D HO")
-    print(f"        N_cheby={N_cheby}  E=[{E_lo}, {E_hi}]")
+    print(f"        N_cheby={N_cheby}  E=[{E_lo}, {E_hi}]  method={method}")
     print("="*60)
 
-    L,    Ng   = 5.5, 22
+    L, Ng = 5.5, 22
 
     # ---- Step A: build symbolic f(H)*psi ----
-    print("  Building symbolic f(H)*psi ... (may take a few minutes for N>=4)")
+    print(f"  Building symbolic f(H)*psi (method={method}) ...")
     t0 = time.time()
-    psi_fH = build_fH_psi_sympy(N_cheby, E_lo, E_hi)
+    psi_fH = build_fH_psi_sympy(N_cheby, E_lo, E_hi, method=method)
     print(f"  Done in {time.time()-t0:.1f} s")
 
     # ---- Step B: extract sin/cos envelopes and lambdify ----
@@ -256,11 +277,9 @@ def test_filter_diag(N_cheby=4, E_lo=0.5, E_hi=6.5, n_waves=60):
     print(f"\n  Recovered eigenvalues : {np.round(energies[:n_show], 4)}")
     print(f"  Exact HO eigenvalues  : {exact_lo[:n_show]}")
 
-    # Ground state must be within 2% of 1.5
     e0_err = abs(energies[0] - 1.5)
     ok_e0  = e0_err < 0.03
 
-    # At least 4 eigenvalues must be within 0.1 of their HO counterpart
     n_compare = min(len(energies), len(exact_lo))
     errs = np.abs(np.sort(energies[:n_compare]) - exact_lo[:n_compare])
     ok_spectrum = np.sum(errs < 0.1) >= 4
@@ -303,6 +322,10 @@ def main():
         '--n_waves', type=int, default=60,
         help='Number of random plane waves (default 60)'
     )
+    parser.add_argument(
+        '--method', default='H_powers', choices=['H_powers', 'scaled'],
+        help='H-power strategy: H_powers=pure H^n (default), scaled=(aH+b)^n'
+    )
     args = parser.parse_args()
 
     results = {}
@@ -314,6 +337,7 @@ def main():
             E_lo=args.E_lo,
             E_hi=args.E_hi,
             n_waves=args.n_waves,
+            method=args.method,
         )
 
     print("\n" + "="*60)

@@ -1,4 +1,4 @@
-"""Symbolic generation of (aH+b)^n * psi for plane-wave basis states.
+"""Symbolic generation of H^n or (aH+b)^n * psi for plane-wave basis states.
 
 H = -pref * laplacian + V(x,y,z)   (pref = 0.5 in atomic units)
 
@@ -8,9 +8,18 @@ and recursively apply H to update (Ps, Pc), keeping only the
 envelopes (no trig factors). Each application expands the polynomial
 degree in x,y,z by 2.
 
+Two generation strategies
+--------------------------
+generate_H_powers        – computes pure H^n (recommended).  Files are
+                           reusable for any energy window; sp.expand() keeps
+                           expressions compact with rational coefficients.
+generate_scaled_H_powers – computes (aH+b)^n with a/b baked in (legacy).
+                           Use only if you need a single fixed energy window.
+
 Public API
 ----------
 laplacian, directional_derivative, apply_H_on_pair
+generate_H_powers
 generate_scaled_H_powers
 process_all_cubes, process_specific_cubes
 """
@@ -27,7 +36,7 @@ import sympy as sp
 # ---------------------------------------------------------------------------
 
 def laplacian(f, x, y, z):
-    """Return ∂²f/∂x² + ∂²f/∂y² + ∂²f/∂z²."""
+    """返回 ∂²f/∂x² + ∂²f/∂y² + ∂²f/∂z²."""
     return sp.diff(f, x, 2) + sp.diff(f, y, 2) + sp.diff(f, z, 2)
 
 
@@ -75,7 +84,77 @@ def apply_H_on_pair(Ps, Pc, V, kvec, k2, pref, x, y, z):
 
 
 # ---------------------------------------------------------------------------
-# Recursive power generation
+# File I/O helper
+# ---------------------------------------------------------------------------
+
+def _save_power(outdir, n, data, file_format, prefix):
+    """Write one power dict {Ps, Pc} to disk."""
+    stem = outdir / f'{prefix}_{n}'
+    if file_format == 'sym.gz':
+        with gzip.open(str(stem) + '.sym.gz', 'wt', encoding='utf8') as f:
+            f.write(str(data))
+    else:
+        with open(str(stem) + '.pkl', 'wb') as f:
+            pickle.dump(data, f)
+
+
+# ---------------------------------------------------------------------------
+# Strategy A: pure H^n  (recommended default)
+# ---------------------------------------------------------------------------
+
+def generate_H_powers(
+    N, outdir,
+    file_format='pkl',
+    V=None, kvec=None, k2=None, pref=0.5,
+    x=None, y=None, z=None,
+):
+    """Compute and save H^n * psi for n = 0 … N (no energy-window scaling).
+
+    Files named ``H_power_{n}.pkl`` / ``H_power_{n}.sym.gz`` can be reused
+    for any Chebyshev filter by calling
+    ``chebyshev_filter.apply_f_of_H_from_raw_powers`` with the desired a, b.
+
+    sp.expand() is applied at each step so sympy works with compact polynomial
+    expressions (rational coefficients, combined like terms) rather than large
+    unevaluated trees.
+
+    Parameters
+    ----------
+    N : int
+        Maximum power.
+    outdir : str or Path
+        Output directory.
+    file_format : 'pkl' | 'sym.gz'
+        Binary pickle (faster I/O) or compressed text (human-readable).
+    V, kvec, k2, pref, x, y, z
+        Symbolic Hamiltonian ingredients (see apply_H_on_pair).
+
+    Returns
+    -------
+    dict  n -> {'Ps': expr, 'Pc': expr}
+    """
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    Ps = sp.Integer(1)
+    Pc = sp.Integer(0)
+    results = {0: {'Ps': Ps, 'Pc': Pc}}
+    _save_power(outdir, 0, results[0], file_format, prefix='H_power')
+
+    for n in range(1, N + 1):
+        print(f"    H^{n} ...", end=' ', flush=True)
+        Ps_H, Pc_H = apply_H_on_pair(Ps, Pc, V, kvec, k2, pref, x, y, z)
+        Ps = sp.expand(Ps_H)
+        Pc = sp.expand(Pc_H)
+        results[n] = {'Ps': Ps, 'Pc': Pc}
+        _save_power(outdir, n, results[n], file_format, prefix='H_power')
+        print('✓')
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Strategy B: (aH+b)^n  (legacy)
 # ---------------------------------------------------------------------------
 
 def generate_scaled_H_powers(
@@ -86,22 +165,20 @@ def generate_scaled_H_powers(
 ):
     """Compute and save (aH+b)^n * psi for n = 0 … N.
 
-    Result for each n is a dict ``{'Ps': expr, 'Pc': expr}`` representing
-    psi_n = Ps*sinθ + Pc*cosθ.
+    The energy-window scaling (a, b) is baked into the expressions, so
+    the files are specific to one energy window.  Prefer generate_H_powers
+    when you may need to change E_lo / E_hi without recomputing.
+
+    Files named ``H_scaled_power_{n}.pkl`` / ``.sym.gz``.
 
     Parameters
     ----------
     N : int
-        Maximum power to compute.
     a, b : float
-        Chebyshev rescaling: maps energy window [E_lo, E_hi] to [-1, 1]
-        via  a = 2/(E_hi-E_lo),  b = -(E_hi+E_lo)/(E_hi-E_lo).
+        Chebyshev rescaling: a = 2/(E_hi-E_lo), b = -(E_hi+E_lo)/(E_hi-E_lo).
     outdir : str or Path
-        Where to write output files.
     file_format : 'sym.gz' | 'pkl'
-        Compressed-text or binary pickle.
     V, kvec, k2, pref, x, y, z
-        Symbolic ingredients (see apply_H_on_pair).
 
     Returns
     -------
@@ -120,14 +197,7 @@ def generate_scaled_H_powers(
         Ps = a * Ps_H + b * Ps
         Pc = a * Pc_H + b * Pc
         results[n] = {'Ps': Ps, 'Pc': Pc}
-
-        stem = outdir / f'H_scaled_power_{n}'
-        if file_format == 'sym.gz':
-            with gzip.open(str(stem) + '.sym.gz', 'wt', encoding='utf8') as f:
-                f.write(str({'Ps': Ps, 'Pc': Pc}))
-        else:
-            with open(str(stem) + '.pkl', 'wb') as f:
-                pickle.dump(results[n], f)
+        _save_power(outdir, n, results[n], file_format, prefix='H_scaled_power')
         print('✓')
 
     return results
@@ -138,24 +208,28 @@ def generate_scaled_H_powers(
 # ---------------------------------------------------------------------------
 
 def process_all_cubes(
-    manager, N, a, b,
+    manager, N, a=None, b=None,
     base_outdir='H_powers_basis_partitioned',
     file_format='sym.gz',
+    method='raw',
 ):
-    """Generate (aH+b)^n*psi for every cube in *manager*.
-
-    Each cube gets a subdirectory  ``cube_<cx>_<cy>_<cz>/``  inside
-    *base_outdir*, containing ``H_scaled_power_n.sym.gz`` files and a
-    ``cube_info.txt`` summary.
+    """Generate H^n or (aH+b)^n * psi for every cube in *manager*.
 
     Parameters
     ----------
     manager : CubicExpressionManager
     N : int
-    a, b : float  Chebyshev scaling
+    a, b : float
+        Chebyshev scaling; required only when method='scaled'.
     base_outdir : str
     file_format : str
+    method : 'raw' | 'scaled'
+        'raw'    – pure H^n; files reusable for any energy window (default).
+        'scaled' – (aH+b)^n with a,b baked in.
     """
+    if method == 'scaled' and (a is None or b is None):
+        raise ValueError("method='scaled' requires a and b (from E_lo, E_hi)")
+
     base_outdir = Path(base_outdir)
     base_outdir.mkdir(parents=True, exist_ok=True)
 
@@ -169,7 +243,11 @@ def process_all_cubes(
     done = skipped = 0
 
     print(f"\n{'='*70}")
-    print(f"PROCESSING ALL CUBES  N={N}  a={a:.4f}  b={b:.4f}")
+    print(f"PROCESSING ALL CUBES  method={method}  N={N}", end='')
+    if method == 'scaled':
+        print(f"  a={a:.4f}  b={b:.4f}")
+    else:
+        print()
     print(f"Output → {base_outdir}")
     print(f"{'='*70}\n")
 
@@ -192,11 +270,17 @@ def process_all_cubes(
         _write_cube_info(cube_dir, idx, info, N, a, b)
 
         try:
-            generate_scaled_H_powers(
-                N, a, b, outdir=cube_dir, file_format=file_format,
-                V=V_expr, kvec=kvec, k2=k2, pref=pref, x=x, y=y, z=z,
-            )
-            print(f"  ✓ H^0…H^{N} in {cube_dir.name}/")
+            if method == 'scaled':
+                generate_scaled_H_powers(
+                    N, a, b, outdir=cube_dir, file_format=file_format,
+                    V=V_expr, kvec=kvec, k2=k2, pref=pref, x=x, y=y, z=z,
+                )
+            else:
+                generate_H_powers(
+                    N, outdir=cube_dir, file_format=file_format,
+                    V=V_expr, kvec=kvec, k2=k2, pref=pref, x=x, y=y, z=z,
+                )
+            print(f"  ✓ powers 0…{N} in {cube_dir.name}/")
             done += 1
         except Exception as exc:
             print(f"  ✗ Error: {exc}")
@@ -206,16 +290,15 @@ def process_all_cubes(
 
 
 def process_specific_cubes(
-    manager, cube_indices, N, a, b,
+    manager, cube_indices, N, a=None, b=None,
     base_outdir='H_powers_basis_partitioned',
     file_format='sym.gz',
+    method='raw',
 ):
-    """Like :func:`process_all_cubes` but for a subset of cube indices.
+    """Like process_all_cubes but for a subset of cube indices."""
+    if method == 'scaled' and (a is None or b is None):
+        raise ValueError("method='scaled' requires a and b")
 
-    Parameters
-    ----------
-    cube_indices : list of (i, j, k) tuples
-    """
     base_outdir = Path(base_outdir)
     base_outdir.mkdir(parents=True, exist_ok=True)
 
@@ -225,7 +308,7 @@ def process_specific_cubes(
     k2   = kx**2 + ky**2 + kz**2
     pref = 0.5
 
-    print(f"Processing {len(cube_indices)} specific cubes ...")
+    print(f"Processing {len(cube_indices)} specific cubes (method={method}) ...")
 
     for idx in cube_indices:
         i, j, k = idx
@@ -243,10 +326,16 @@ def process_specific_cubes(
         _write_cube_info(cube_dir, idx, info, N, a, b)
 
         try:
-            generate_scaled_H_powers(
-                N, a, b, outdir=cube_dir, file_format=file_format,
-                V=V_expr, kvec=kvec, k2=k2, pref=pref, x=x, y=y, z=z,
-            )
+            if method == 'scaled':
+                generate_scaled_H_powers(
+                    N, a, b, outdir=cube_dir, file_format=file_format,
+                    V=V_expr, kvec=kvec, k2=k2, pref=pref, x=x, y=y, z=z,
+                )
+            else:
+                generate_H_powers(
+                    N, outdir=cube_dir, file_format=file_format,
+                    V=V_expr, kvec=kvec, k2=k2, pref=pref, x=x, y=y, z=z,
+                )
             print(f"    ✓ complete")
         except Exception as exc:
             print(f"    ✗ Error: {exc}")
@@ -270,6 +359,6 @@ def _write_cube_info(cube_dir, idx, info, N, a, b):
         f.write(f"Atoms       : {info['n_atoms']}\n")
         f.write(f"Cube size   : {info['cube_size']:.6f} Bohr\n")
         f.write(f"r_cut       : {info['r_cut']:.6f} Bohr\n")
-        f.write(f"a           : {a:.6f}\n")
-        f.write(f"b           : {b:.6f}\n")
+        f.write(f"a           : {a if a is not None else 'N/A (raw H^n mode)'}\n")
+        f.write(f"b           : {b if b is not None else 'N/A (raw H^n mode)'}\n")
         f.write(f"N (max pow) : {N}\n")
