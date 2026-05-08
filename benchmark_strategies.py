@@ -789,7 +789,7 @@ def main():
             break
 
     header = (f'{"Strategy":<18} {"exp":>4} {"ops_post":>9} {"ms/wave":>9} '
-              f'{"speedup":>8} {"warmup_ms":>10} {"max_err":>10}')
+              f'{"vs_ref":>10} {"warmup_ms":>10} {"max_err":>10}')
     print(header)
     print('-' * len(header))
     for full_name in all_results:
@@ -799,11 +799,17 @@ def main():
             continue
         mspw  = r.get('ms_per_wave')
         exp_s = 'T' if r.get('expand', True) else 'F'
-        spd   = f'{ref_ms/mspw:.2f}x' if (ref_ms and mspw) else '-'
+        if ref_ms and mspw:
+            ratio = ref_ms / mspw
+            # Show as Nx faster (ratio>1) or 1/Nx slower (ratio<1) so the
+            # sign of the comparison is always obvious in the output.
+            spd = f'{ratio:.2f}x' if ratio >= 0.1 else f'1/{1/ratio:.0f}x'
+        else:
+            spd = '-'
         err   = f'{r["max_err"]:.1e}' if r.get('max_err') is not None else '-'
         wmup  = f'{r["warmup_ms"]:.1f}' if r.get('warmup_ms') else '-'
         print(f'{full_name:<18} {exp_s:>4} {r["ops_post"]:>9} '
-              f'{(mspw or 0):>9.3f} {spd:>8} {wmup:>10} {err:>10}')
+              f'{(mspw or 0):>9.3f} {spd:>10} {wmup:>10} {err:>10}')
 
     result_file = outdir / f'benchmark_m{args.m}.json'
     with open(result_file, 'w') as f:
