@@ -1,0 +1,14 @@
+Cube center : (np.float64(-6.0), np.float64(2.0), np.float64(14.0)) Bohr
+Cube index  : (2, 4, 7)
+Cube size   : 4.000000 Bohr
+r_cut       : 5.000000 Bohr
+
+Relevant atoms: 4  (inside=0, outside=4)
+  As: 1
+  P1: 3
+
+Atom list:
+  P1  ( -3.5935,  3.5935,  9.3197) dist=5.4987 in=N
+  P1  ( -2.1326,  2.1326,  9.3197) dist=6.0729 in=N
+  As  ( -2.8631,  2.8631,  8.5892) dist=6.3136 in=N
+  P1  ( -7.3018, -1.5756,  7.3018) dist=7.7036 in=N
