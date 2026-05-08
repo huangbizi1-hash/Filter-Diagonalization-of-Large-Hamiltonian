@@ -115,30 +115,24 @@ def _safe_lambdify(sym_args, expr, modules='numpy', chunk_size=250):
 # ============================================================
 
 def _julia_eval_filter(expr_cos, expr_sin, X, Y, Z, k_vals, b_vals,
-                       work_dir, julia_exe='julia'):
+                       work_dir, julia_exe='julia', jl_cache_path=None):
     """Evaluate f(H)*psi on the 3-D grid using Julia JIT compilation.
 
-    Generates a standalone ``.jl`` script (no Julia packages required),
-    writes grid and k/b data as raw float64 binary, calls Julia via
-    subprocess, and reads back the result array.
+    Optimisations vs plain subprocess approach:
+    - Separate @inline poly/exp functions per group (JIT specialisation)
+    - Precomputed exp terms (once per grid, reused across waves)
+    - Vectorised trig via Julia's @. broadcast (SLEEF SIMD)
+    - Pre-allocated working buffers (no per-wave heap allocation)
+    - Warmup wave triggers JIT; remaining waves are timed separately
 
-    Parameters
-    ----------
-    expr_cos, expr_sin : sympy expressions (envelopes of cos/sin)
-    X, Y, Z  : 3-D numpy arrays (Ng, Ng, Ng)
-    k_vals   : (n_waves, 3) float array of k vectors
-    b_vals   : (n_waves,)   float array of phase offsets
-    work_dir : Path  — ``.jl`` and binary I/O files are placed here
-    julia_exe: str   — Julia executable name (must be on PATH)
+    If jl_cache_path is given and the file exists, the Julia source is
+    loaded from cache (skipping sp.julia_code which can be slow for large
+    polynomials).  Otherwise the script is generated and saved there.
 
     Returns
     -------
-    C_f : numpy array of shape (n_waves, Ng, Ng, Ng)
-
-    Raises
-    ------
-    RuntimeError if the Julia process exits with a non-zero status.
-    FileNotFoundError if the julia executable is not found.
+    C_f   : numpy array (n_waves, Ng, Ng, Ng)
+    timing: dict with warmup_s, eval_s, n_eval_waves, total_wall_s
     """
     from symbolic_code.chebyshev_filter import group_by_exp_combined, apply_horner
     from symbolic_code.julia_codegen import build_julia_batch_script
@@ -148,58 +142,89 @@ def _julia_eval_filter(expr_cos, expr_sin, X, Y, Z, k_vals, b_vals,
     N  = Ng ** 3
     n_waves = len(k_vals)
 
-    # Build grouped+Horner terms (minimises Julia compile time)
-    terms_cos = apply_horner(group_by_exp_combined(expr_cos))
-    terms_sin = apply_horner(group_by_exp_combined(expr_sin))
+    # ---- Julia source (cache-aware) ----
+    jl_cache = Path(jl_cache_path) if jl_cache_path else None
+    if jl_cache is not None and jl_cache.exists():
+        jl_file = jl_cache
+        print(f"  Julia script (cache hit) -> {jl_file}")
+    else:
+        print("  Building Julia source (group+Horner) ...")
+        t_codegen = time.time()
+        terms_cos = apply_horner(group_by_exp_combined(expr_cos))
+        terms_sin = apply_horner(group_by_exp_combined(expr_sin))
+        jl_src    = build_julia_batch_script(terms_cos, terms_sin)
+        t_codegen = time.time() - t_codegen
 
-    # Write Julia script
-    jl_src  = build_julia_batch_script(terms_cos, terms_sin)
-    jl_file = work_dir / 'eval_filter.jl'
-    jl_file.write_text(jl_src, encoding='utf-8')
-    print(f"  Julia script  -> {jl_file}")
+        jl_file = jl_cache if jl_cache else (work_dir / 'eval_filter.jl')
+        if jl_cache:
+            jl_cache.parent.mkdir(parents=True, exist_ok=True)
+        jl_file.write_text(jl_src, encoding='utf-8')
+        tag = '(saved to cache)' if jl_cache else '(in run dir)'
+        print(f"  Julia source built in {t_codegen:.1f}s, saved {tag} -> {jl_file}")
 
-    # Write binary input: [X_flat; Y_flat; Z_flat]
-    grid_bin = work_dir / '_grid.bin'
+    # ---- binary I/O files ----
+    grid_bin  = work_dir / '_grid.bin'
+    kvals_bin = work_dir / '_kvals.bin'
+    out_bin   = work_dir / '_cfilt.bin'
+
     with open(grid_bin, 'wb') as f:
         X.ravel().astype('<f8').tofile(f)
         Y.ravel().astype('<f8').tofile(f)
         Z.ravel().astype('<f8').tofile(f)
 
-    # Write k/b values: [kx0,ky0,kz0,b0, kx1,…] (n_waves × 4 float64)
-    kvals_bin = work_dir / '_kvals.bin'
-    kb = np.column_stack([k_vals, b_vals]).astype('<f8')  # (n_waves, 4)
+    kb = np.column_stack([k_vals, b_vals]).astype('<f8')
     kb.ravel().tofile(str(kvals_bin))
 
-    out_bin = work_dir / '_cfilt.bin'
-
-    # Run Julia
+    # ---- run Julia ----
     cmd = [julia_exe, str(jl_file),
            str(grid_bin), str(kvals_bin), str(out_bin),
            str(N), str(n_waves)]
-    print(f"  Running: {' '.join(cmd[:2])} eval_filter.jl ... (JIT compile on first run)")
-    t0 = time.time()
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    julia_time = time.time() - t0
+    print(f"  Running Julia (warmup+eval, n_waves={n_waves}) ...")
+    t_wall0 = time.time()
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    total_wall_s = time.time() - t_wall0
 
-    if result.returncode != 0:
+    if proc.returncode != 0:
         raise RuntimeError(
-            f"Julia exited with code {result.returncode}.\n"
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            f"Julia exited with code {proc.returncode}.\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
         )
-    if result.stdout.strip():
-        print(f"  Julia stdout: {result.stdout.strip()}")
-    print(f"  Julia wall time: {julia_time:.1f} s")
 
-    # Read back results and reshape
+    # ---- parse JSON timing from last stdout line ----
+    timing = {'warmup_s': None, 'eval_s': None, 'n_eval_waves': None,
+              'total_wall_s': total_wall_s}
+    for line in reversed(proc.stdout.splitlines()):
+        line = line.strip()
+        if line.startswith('{') and line.endswith('}'):
+            try:
+                t = json.loads(line)
+                timing.update(t)
+            except json.JSONDecodeError:
+                pass
+            break
+
+    eval_s   = timing['eval_s']
+    warmup_s = timing['warmup_s']
+    n_eval   = timing['n_eval_waves']
+    if eval_s is not None and n_eval:
+        ms_per_wave = eval_s / n_eval * 1000
+        print(f"  Julia  warmup  {warmup_s:.2f}s  |  "
+              f"eval {eval_s:.2f}s / {n_eval} waves  "
+              f"({ms_per_wave:.2f} ms/wave)  |  wall {total_wall_s:.1f}s")
+    else:
+        print(f"  Julia wall time: {total_wall_s:.1f}s")
+        if proc.stdout.strip():
+            print(f"  Julia stdout: {proc.stdout.strip()}")
+
+    # ---- read results ----
     raw = np.fromfile(str(out_bin), dtype='<f8')
     C_f = raw.reshape(n_waves, Ng, Ng, Ng)
 
-    # Clean up temporary binary files (keep .jl for inspection)
     grid_bin.unlink(missing_ok=True)
     kvals_bin.unlink(missing_ok=True)
     out_bin.unlink(missing_ok=True)
 
-    return C_f
+    return C_f, timing
 
 
 # ============================================================
@@ -613,11 +638,19 @@ def test_filter_diag(m=6, E_lo=4.5, E_hi=None, L=5.5, Ng=22,
     b_vals = rng.uniform(0, 2 * np.pi, n_waves)
 
     # ---- evaluate f(H)*psi (backend-dependent) ----
+    julia_timing = {}
     print(f"  Evaluating for {n_waves} plane waves  [backend={eval_backend}] ...")
     if eval_backend == 'julia':
         _jdir = Path(run_dir) if run_dir is not None else Path(tempfile.mkdtemp(prefix='ho3d_jl_'))
-        C_f = _julia_eval_filter(expr_cos, expr_sin, X, Y, Z, k_vals, b_vals,
-                                 work_dir=_jdir, julia_exe=julia_exe)
+        # Julia source cache: skip sp.julia_code on re-runs with same m/a/b
+        _jl_cache = None
+        if cache_dir is not None:
+            a_key = f"{source_info['chebyshev_a']:.8g}".replace('.','p').replace('-','m')
+            b_key = f"{source_info['chebyshev_b']:.8g}".replace('.','p').replace('-','m')
+            _jl_cache = Path(cache_dir) / f"julia_eval_m{m}_{a_key}_{b_key}.jl"
+        C_f, julia_timing = _julia_eval_filter(
+            expr_cos, expr_sin, X, Y, Z, k_vals, b_vals,
+            work_dir=_jdir, julia_exe=julia_exe, jl_cache_path=_jl_cache)
     else:
         xs, ys, zs = sp.symbols('x y z')
         kx_s, ky_s, kz_s, b_s = sp.symbols('kx ky kz b')
@@ -673,6 +706,7 @@ def test_filter_diag(m=6, E_lo=4.5, E_hi=None, L=5.5, Ng=22,
         'build_time_s'       : build_time,
         'filter_mode'        : filter_mode,
         'eval_backend'       : eval_backend,
+        'julia_timing'       : julia_timing if julia_timing else None,
         'E_hi'               : E_hi,
         'k_max'              : k_max,
         **source_info,
