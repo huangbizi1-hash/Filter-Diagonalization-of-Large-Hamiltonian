@@ -105,6 +105,7 @@ def _save_power(outdir, n, data, file_format, prefix):
 def generate_H_powers(
     N, outdir,
     file_format='pkl',
+    expand=True,
     V=None, kvec=None, k2=None, pref=0.5,
     x=None, y=None, z=None,
 ):
@@ -114,10 +115,6 @@ def generate_H_powers(
     for any Chebyshev filter by calling
     ``chebyshev_filter.apply_f_of_H_from_raw_powers`` with the desired a, b.
 
-    sp.expand() is applied at each step so sympy works with compact polynomial
-    expressions (rational coefficients, combined like terms) rather than large
-    unevaluated trees.
-
     Parameters
     ----------
     N : int
@@ -126,6 +123,13 @@ def generate_H_powers(
         Output directory.
     file_format : 'pkl' | 'sym.gz'
         Binary pickle (faster I/O) or compressed text (human-readable).
+    expand : bool
+        If True (default), call sp.expand() at each step so sympy works with
+        compact flat-polynomial form (combined like terms, rational coefficients).
+        If False, skip sp.expand() to preserve the product/sum tree structure —
+        e.g. ``V * Ps`` stays as-is instead of being distributed.  The
+        unexpanded trees are larger in sympy but carry factored structure that
+        sp.cse() can exploit when generating Julia code.
     V, kvec, k2, pref, x, y, z
         Symbolic Hamiltonian ingredients (see apply_H_on_pair).
 
@@ -144,8 +148,12 @@ def generate_H_powers(
     for n in range(1, N + 1):
         print(f"    H^{n} ...", end=' ', flush=True)
         Ps_H, Pc_H = apply_H_on_pair(Ps, Pc, V, kvec, k2, pref, x, y, z)
-        Ps = sp.expand(Ps_H)
-        Pc = sp.expand(Pc_H)
+        if expand:
+            Ps = sp.expand(Ps_H)
+            Pc = sp.expand(Pc_H)
+        else:
+            Ps = Ps_H
+            Pc = Pc_H
         results[n] = {'Ps': Ps, 'Pc': Pc}
         _save_power(outdir, n, results[n], file_format, prefix='H_power')
         print('✓')

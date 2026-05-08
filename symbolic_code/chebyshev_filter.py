@@ -118,7 +118,8 @@ def chebyshev_coeffs_transformed(n, a=1.0, b=0.0):
 # f(H)*psi assembly – Path A: raw H^n files  (recommended)
 # ---------------------------------------------------------------------------
 
-def apply_f_of_H_from_raw_powers(folder, m, a, b, file_type='pkl'):
+def apply_f_of_H_from_raw_powers(folder, m, a, b, file_type='pkl',
+                                  return_envelopes=False):
     """Assemble f(H)*psi from raw H^n files (energy-window independent).
 
     Expands T_m(aH+b) in the monomial basis via chebyshev_coeffs_transformed,
@@ -135,10 +136,17 @@ def apply_f_of_H_from_raw_powers(folder, m, a, b, file_type='pkl'):
     m : int                Chebyshev order
     a, b : float           Chebyshev rescaling (from E_lo, E_hi)
     file_type : str
+    return_envelopes : bool
+        If False (default), return the full psi_fH = Ps*sin(θ)+Pc*cos(θ).
+        If True, return (expr_cos, expr_sin) = (Pc_total, Ps_total) directly,
+        skipping the sin/cos wrapping and the expand() call inside
+        extract_cos_sin_coeffs.  Use this with expand=False H^n caches to
+        preserve the unexpanded product-tree structure for sp.cse().
 
     Returns
     -------
-    psi_fH : sympy expression in x, y, z, kx, ky, kz, b
+    psi_fH : sympy expression  (return_envelopes=False)
+    (expr_cos, expr_sin) : tuple of sympy expressions  (return_envelopes=True)
     """
     coeffs  = chebyshev_coeffs_transformed(m, a=a, b=b)
     results = load_H_raw_powers(folder, m, file_type=file_type)
@@ -164,6 +172,10 @@ def apply_f_of_H_from_raw_powers(folder, m, a, b, file_type='pkl'):
                 )
             Ps_total += c * entry['Ps']
             Pc_total += c * entry['Pc']
+
+    if return_envelopes:
+        # Pc_total = coeff of cos(theta), Ps_total = coeff of sin(theta)
+        return Pc_total, Ps_total
 
     psi_fH = Ps_total * sp.sin(theta) + Pc_total * sp.cos(theta)
     return psi_fH

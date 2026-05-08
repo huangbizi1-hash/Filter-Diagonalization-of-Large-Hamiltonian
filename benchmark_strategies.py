@@ -1,61 +1,48 @@
 #!/usr/bin/env python3
 """benchmark_strategies.py
-Compare different Julia expression strategies for f(H)*psi evaluation.
+Compare Julia evaluation strategies for f(H)*psi, with and without sp.expand().
 
 Strategies
 ----------
-baseline      current: group_by_exp + Horner + @inline funcs per group
-no_horner     group_by_exp only, flat expanded poly (worst-case reference)
-cse_group     group_by_exp + sp.cse() per group  (replaces Horner with CSE)
-cse_inlined   global sp.cse() across all groups + single monolithic inner loop
-k_separate    separate k-polynomial from spatial-polynomial; precompute k-coefficients
-              once per wave, evaluate pure spatial poly per point
+baseline      group_by_exp + Horner + @inline per group  (current code)
+no_horner     flat poly, no Horner, no CSE               (worst-case reference)
+cse_group     group_by_exp + sp.cse() per group
+cse_inlined   global sp.cse() across all groups, shared temps in @inbounds loop
+k_separate    separate k-polynomial from spatial-polynomial; k-coefficients
+              precomputed once per wave; inner loop is k-free
 
-Theory
-------
-baseline  : Horner rewrites f(x) = a0 + a1*x + a2*x^2 + ... as a0 + x*(a1 + x*(...))
-            For single-variable polys this halves multiplications.  For 6-variable
-            (x,y,z,kx,ky,kz) polys sympy.horner picks one ordering variable and
-            only partially reuses cross-terms — expansion beforehand may discard
-            useful factored structure.
+Expand modes (--compare_expand)
+---------------------------------
+Each strategy can be run on two expression sets:
+  E  – standard: sp.expand() at every H^n step → flat monomial sum
+  N  – noexpand: skip sp.expand() → preserves V*Ps, k2*Ps product structure
 
-cse_group : sp.cse() on the flat expanded poly finds ALL repeated sub-DAGs
-            (e.g. x*y computed 7 times → 1 temp).  Always reduces or matches
-            Horner for op-count; never makes things worse.
+With --compare_expand, all requested strategies are timed on BOTH sets, and
+the table shows rows like  baseline_E, baseline_N, cse_group_E, cse_group_N.
 
-cse_inlined : same CSE but across ALL groups simultaneously, putting shared
-              temps directly in the @inbounds inner loop.  Avoids @inline call
-              overhead and cross-group redundancy.
+Why --n_waves matters
+---------------------
+The Julia script separates a warmup wave (triggers JIT compilation) from the
+remaining n_waves-1 timed waves.  With n_waves=1 the timed section is empty
+and eval_s=0 — all ms/wave values are 0.  Use --n_waves >= 20 for meaningful
+timing; --n_waves 40 is recommended.
 
-k_separate : The polynomial poly(x,y,z,kx,ky,kz) with kx,ky,kz CONSTANT per wave
-             is decomposed as  Σ_α c_α(kx,ky,kz)·xᵃyᵇzᶜ.  For each wave we
-             compute the scalar k-coefficients once (O(Q·K) ops, Q monomials,
-             K ops per k-coeff).  The inner loop then has only spatial multiplications
-             (kx,ky,kz multiply-free).  For large N and small n_waves this wins;
-             for small N or many cheap k-terms Horner/CSE may win.
-
-lookup_blas : (future) precompute spatial-basis matrix B[N,Q], then per wave do
-             BLAS GEMV: out = B @ c_vec.  Not implemented here; use k_separate as
-             approximation since it has the same asymptotic cost.
-
-Metrics reported
-----------------
-  ops_total   : sp.count_ops() summed over all poly parts (lower = fewer FLOPs)
-  n_terms     : total summands across poly parts (before CSE/Horner)
-  n_cse_temps : CSE replacement variables introduced (cse_* strategies only)
-  warmup_ms   : Julia JIT + first-wave time
-  eval_ms/w   : average ms per wave (excluding warmup)
-  speedup     : relative to baseline eval_ms/w (>1 is faster)
-  max_err     : max |output - baseline| (correctness check)
+Why the ops column now shows post-optimisation counts
+------------------------------------------------------
+  baseline   : sp.count_ops of the Horner-transformed poly
+  no_horner  : sp.count_ops of the flat expanded poly (no reduction)
+  cse_group  : total ops in CSE temp assignments + reduced expressions
+  cse_inlined: same, but across all groups jointly
+  k_separate : spatial poly ops + k-coefficient ops per wave
+Lower ops → fewer FLOPs per grid point per wave.
 
 Usage
 -----
-  python benchmark_strategies.py                                 # m=6, all strategies
+  python benchmark_strategies.py                           # m=6, all strategies
   python benchmark_strategies.py --m 8 --n_waves 40
-  python benchmark_strategies.py --strategies baseline,cse_group,k_separate
-  python benchmark_strategies.py --julia_exe /usr/bin/julia --n_reps 5
-  python benchmark_strategies.py --no_check                      # skip correctness check
-  python benchmark_strategies.py --save_jl                       # keep .jl files for inspection
+  python benchmark_strategies.py --m 8 --n_waves 40 --compare_expand
+  python benchmark_strategies.py --strategies baseline,cse_group --n_waves 40
+  python benchmark_strategies.py --save_jl                # keep .jl for inspection
 """
 
 import argparse
@@ -71,7 +58,7 @@ import sympy as sp
 
 
 # ---------------------------------------------------------------------------
-# Julia code helper (same as in julia_codegen.py)
+# Julia code helper
 # ---------------------------------------------------------------------------
 
 def _jl(expr):
@@ -86,7 +73,7 @@ def _jl(expr):
 # ---------------------------------------------------------------------------
 
 def total_ops(terms_list):
-    """Sum sp.count_ops over all poly parts."""
+    """Sum sp.count_ops over all poly parts (pre-optimisation baseline)."""
     return sum(int(sp.count_ops(pp)) for _, pp in terms_list)
 
 def total_terms(terms_list):
@@ -175,7 +162,7 @@ def _main_func(n_cos, n_sin):
 # ---------------------------------------------------------------------------
 
 def build_baseline(terms_cos, terms_sin):
-    """group_by_exp + Horner + @inline per group  (current code)."""
+    """group_by_exp + Horner + @inline per group."""
     from symbolic_code.chebyshev_filter import apply_horner
     tc = apply_horner(terms_cos)
     ts = apply_horner(terms_sin)
@@ -204,7 +191,8 @@ def build_baseline(terms_cos, terms_sin):
           f'        out[i] = ({cos_sum}) * cos_p[i] + ({sin_sum}) * sin_p[i]',
           '    end', 'end', '']
     L += _main_func(n_cos, n_sin)
-    return '\n'.join(L), tc, ts, {}
+    ops_post = total_ops(tc) + total_ops(ts)
+    return '\n'.join(L), tc, ts, {'ops_post': ops_post}
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +200,7 @@ def build_baseline(terms_cos, terms_sin):
 # ---------------------------------------------------------------------------
 
 def build_no_horner(terms_cos, terms_sin):
-    """Flat expanded poly, no Horner, no CSE  (worst-case reference)."""
+    """Flat poly, no Horner, no CSE  (worst-case reference)."""
     n_cos, n_sin = len(terms_cos), len(terms_sin)
     L = ['# strategy: no_horner']
     for i, (_, pp) in enumerate(terms_cos):
@@ -237,7 +225,8 @@ def build_no_horner(terms_cos, terms_sin):
           f'        out[i] = ({cos_sum}) * cos_p[i] + ({sin_sum}) * sin_p[i]',
           '    end', 'end', '']
     L += _main_func(n_cos, n_sin)
-    return '\n'.join(L), terms_cos, terms_sin, {}
+    ops_post = total_ops(terms_cos) + total_ops(terms_sin)
+    return '\n'.join(L), terms_cos, terms_sin, {'ops_post': ops_post}
 
 
 # ---------------------------------------------------------------------------
@@ -245,15 +234,22 @@ def build_no_horner(terms_cos, terms_sin):
 # ---------------------------------------------------------------------------
 
 def build_cse_group(terms_cos, terms_sin):
-    """CSE per poly group; each @inline function gets local CSE temps."""
+    """CSE per poly group; each @inline function gets local CSE temps.
+
+    ops_post counts ops in CSE temp assignments + reduced expressions —
+    the TRUE per-point FLOP count, not the pre-CSE flat-poly count.
+    """
     n_cos, n_sin = len(terms_cos), len(terms_sin)
     L = ['# strategy: cse_group']
     total_cse = 0
+    ops_post = 0
 
     def _poly_cse(name, pp):
-        nonlocal total_cse
+        nonlocal total_cse, ops_post
         repl, (red,) = sp.cse([pp], symbols=sp.numbered_symbols('_s'))
         total_cse += len(repl)
+        ops_post += sum(int(sp.count_ops(expr)) for _, expr in repl)
+        ops_post += int(sp.count_ops(red))
         lines = [f'@inline function {name}(x::Float64, y::Float64, z::Float64,'
                  f' kx::Float64, ky::Float64, kz::Float64)::Float64']
         for sym, expr in repl:
@@ -280,7 +276,8 @@ def build_cse_group(terms_cos, terms_sin):
           f'        out[i] = ({cos_sum}) * cos_p[i] + ({sin_sum}) * sin_p[i]',
           '    end', 'end', '']
     L += _main_func(n_cos, n_sin)
-    return '\n'.join(L), terms_cos, terms_sin, {'n_cse_temps': total_cse}
+    return '\n'.join(L), terms_cos, terms_sin, {
+        'ops_post': ops_post, 'n_cse_temps': total_cse}
 
 
 # ---------------------------------------------------------------------------
@@ -299,14 +296,15 @@ def build_cse_inlined(terms_cos, terms_sin):
     print(f'    [cse_inlined] done in {time.time()-t0:.1f}s  '
           f'({len(repl)} replacements)', flush=True)
 
+    ops_post = (sum(int(sp.count_ops(expr)) for _, expr in repl)
+                + sum(int(sp.count_ops(r)) for r in reduced))
+
     L = ['# strategy: cse_inlined']
     L += _exp_funcs(terms_cos, terms_sin) + _precompute_exp(n_cos, n_sin)
 
-    # CSE preamble lines (computed once per point inside the inner loop)
     cse_lines = [f'        {sym} = {_jl(expr)}' for sym, expr in repl]
     cse_block = '\n'.join(cse_lines) if cse_lines else '        # no shared CSE temps'
 
-    # Group contribution lines using reduced expressions
     cos_lines = '\n'.join(
         f'        _sum_cos += exp_cos[i,{k+1}] * ({_jl(red)})'
         for k, red in enumerate(reduced[:n_cos]))
@@ -330,7 +328,8 @@ def build_cse_inlined(terms_cos, terms_sin):
           '        out[i] = cos_p[i] * _sum_cos + sin_p[i] * _sum_sin',
           '    end', 'end', '']
     L += _main_func(n_cos, n_sin)
-    return '\n'.join(L), terms_cos, terms_sin, {'n_cse_temps': len(repl)}
+    return '\n'.join(L), terms_cos, terms_sin, {
+        'ops_post': ops_post, 'n_cse_temps': len(repl)}
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +337,6 @@ def build_cse_inlined(terms_cos, terms_sin):
 # ---------------------------------------------------------------------------
 
 def _mono_jl(mono):
-    """Julia code for x^a * y^b * z^c (mono = (a,b,c) tuple)."""
     parts = [(v, e) for v, e in zip(('x', 'y', 'z'), mono) if e > 0]
     if not parts:
         return '1.0'
@@ -349,10 +347,6 @@ def _mono_jl(mono):
 
 
 def _try_k_separate(pp):
-    """Decompose pp(x,y,z,kx,ky,kz) → list of ((a,b,c), k_coeff_expr).
-
-    Returns None if the polynomial cannot be expressed as a poly in (x,y,z).
-    """
     x, y, z = sp.symbols('x y z')
     try:
         poly = sp.Poly(sp.expand(pp), x, y, z)
@@ -362,24 +356,16 @@ def _try_k_separate(pp):
 
 
 def build_k_separate(terms_cos, terms_sin):
-    """Separate k-polynomial from spatial polynomial.
-
-    For each poly group pp(x,y,z,kx,ky,kz) we form
-        pp = Σ_α  c_α(kx,ky,kz) · x^a · y^b · z^c
-    The k-coefficients c_α are scalars precomputed once per wave.
-    The inner loop only contains spatial multiplications.
-    Groups that cannot be separated fall back to the flat-poly @inline form.
-    """
+    """Separate k-polynomial from spatial polynomial."""
     n_cos, n_sin = len(terms_cos), len(terms_sin)
-
     L = ['# strategy: k_separate']
 
-    # ---- per-wave k-coefficient variables and inner-loop spatial sums ----
-    k_coeff_lines = []   # declared before @inbounds loop
-    cos_inner = []       # lines inside @inbounds loop for cos groups
-    sin_inner = []       # lines inside @inbounds loop for sin groups
-    fallback_cos = []    # group indices that couldn't be separated
+    k_coeff_lines = []
+    cos_inner = []
+    sin_inner = []
+    fallback_cos = []
     fallback_sin = []
+    ops_post = 0
 
     for i, (_, pp) in enumerate(terms_cos):
         decomp = _try_k_separate(pp)
@@ -390,8 +376,13 @@ def build_k_separate(terms_cos, terms_sin):
             for j, (mono, kc) in enumerate(decomp):
                 vname = f'_kc_c{i}_{j}'
                 k_coeff_lines.append(f'    {vname} = {_jl(kc)}')
+                ops_post += int(sp.count_ops(kc))
                 parts.append(f'{vname} * {_mono_jl(mono)}' if mono != (0,0,0)
                              else vname)
+            # spatial loop ops: monomial mults + additions
+            ops_post += sum(max(sum(1 for e in m if e > 0) - 1, 0)
+                           for m, _ in decomp)
+            ops_post += max(len(decomp) - 1, 0)
             expr = ' + '.join(parts) if parts else '0.0'
             cos_inner.append(f'        _sum_cos += exp_cos[i,{i+1}] * ({expr})')
 
@@ -404,8 +395,12 @@ def build_k_separate(terms_cos, terms_sin):
             for j, (mono, kc) in enumerate(decomp):
                 vname = f'_kc_s{i}_{j}'
                 k_coeff_lines.append(f'    {vname} = {_jl(kc)}')
+                ops_post += int(sp.count_ops(kc))
                 parts.append(f'{vname} * {_mono_jl(mono)}' if mono != (0,0,0)
                              else vname)
+            ops_post += sum(max(sum(1 for e in m if e > 0) - 1, 0)
+                           for m, _ in decomp)
+            ops_post += max(len(decomp) - 1, 0)
             expr = ' + '.join(parts) if parts else '0.0'
             sin_inner.append(f'        _sum_sin += exp_sin[i,{i+1}] * ({expr})')
 
@@ -414,7 +409,6 @@ def build_k_separate(terms_cos, terms_sin):
         print(f'    [k_separate] {n_fallback} groups could not be separated '
               '(falling back to flat poly)', flush=True)
 
-    # Fallback: add @inline functions for non-separable groups
     for i in fallback_cos:
         _, pp = terms_cos[i]
         L += [f'@inline function _poly_cos_{i}(x::Float64, y::Float64, z::Float64,'
@@ -423,6 +417,7 @@ def build_k_separate(terms_cos, terms_sin):
         cos_inner.append(
             f'        _sum_cos += exp_cos[i,{i+1}]'
             f' * _poly_cos_{i}(x, y, z, kx, ky, kz)')
+        ops_post += int(sp.count_ops(pp))
     for i in fallback_sin:
         _, pp = terms_sin[i]
         L += [f'@inline function _poly_sin_{i}(x::Float64, y::Float64, z::Float64,'
@@ -431,6 +426,7 @@ def build_k_separate(terms_cos, terms_sin):
         sin_inner.append(
             f'        _sum_sin += exp_sin[i,{i+1}]'
             f' * _poly_sin_{i}(x, y, z, kx, ky, kz)')
+        ops_post += int(sp.count_ops(pp))
 
     L += _exp_funcs(terms_cos, terms_sin) + _precompute_exp(n_cos, n_sin)
 
@@ -439,7 +435,7 @@ def build_k_separate(terms_cos, terms_sin):
     sin_block = '\n'.join(sin_inner) or '        # no sin terms'
 
     L += [_EVAL_SIG,
-          '    # Per-wave: precompute k-polynomial coefficients (scalars, kx/ky/kz free in loop)',
+          '    # Per-wave: precompute k-polynomial coefficients (scalars, no kx/ky/kz in loop)',
           k_block,
           _TRIG_BLOCK,
           '    @inbounds for i in 1:N',
@@ -451,7 +447,8 @@ def build_k_separate(terms_cos, terms_sin):
           '        out[i] = cos_p[i] * _sum_cos + sin_p[i] * _sum_sin',
           '    end', 'end', '']
     L += _main_func(n_cos, n_sin)
-    return '\n'.join(L), terms_cos, terms_sin, {'n_k_coeffs': len(k_coeff_lines)}
+    return '\n'.join(L), terms_cos, terms_sin, {
+        'ops_post': ops_post, 'n_k_coeffs': len(k_coeff_lines)}
 
 
 # ---------------------------------------------------------------------------
@@ -459,7 +456,7 @@ def build_k_separate(terms_cos, terms_sin):
 # ---------------------------------------------------------------------------
 
 def run_julia(jl_path, X, Y, Z, k_vals, b_vals, work_dir, julia_exe, n_reps=3):
-    """Run a pre-built .jl file, average over n_reps; return timing dict + raw output."""
+    """Run a pre-built .jl file, average over n_reps; return timing dict + output."""
     Ng = X.shape[0]
     N = Ng ** 3
     n_waves = len(k_vals)
@@ -468,12 +465,10 @@ def run_julia(jl_path, X, Y, Z, k_vals, b_vals, work_dir, julia_exe, n_reps=3):
     kvals_bin = Path(work_dir) / '_k.bin'
     out_bin   = Path(work_dir) / '_o.bin'
 
-    # Write grid
     with open(grid_bin, 'wb') as f:
         X.ravel().astype('<f8').tofile(f)
         Y.ravel().astype('<f8').tofile(f)
         Z.ravel().astype('<f8').tofile(f)
-    # Write k/b
     kb = np.column_stack([k_vals, b_vals]).astype('<f8')
     kb.ravel().tofile(str(kvals_bin))
 
@@ -512,41 +507,89 @@ def run_julia(jl_path, X, Y, Z, k_vals, b_vals, work_dir, julia_exe, n_reps=3):
     kvals_bin.unlink(missing_ok=True)
     out_bin.unlink(missing_ok=True)
 
-    # Average eval_s over reps (warmup excluded — it always includes JIT)
     eval_vals = [t['eval_s'] for t in timings if t['eval_s'] is not None]
     n_eval    = timings[0].get('n_eval_waves') or max(n_waves - 1, 1)
     avg_eval  = float(np.mean(eval_vals)) if eval_vals else None
     warmup    = timings[0].get('warmup_s')
 
     return {
-        'warmup_s'      : warmup,
-        'eval_s'        : avg_eval,
-        'n_eval_waves'  : n_eval,
-        'ms_per_wave'   : (avg_eval / n_eval * 1000) if avg_eval else None,
-        'total_wall_s'  : timings[0]['total_wall_s'],
-        'n_reps'        : n_reps,
+        'warmup_s'     : warmup,
+        'eval_s'       : avg_eval,
+        'n_eval_waves' : n_eval,
+        'ms_per_wave'  : (avg_eval / n_eval * 1000) if avg_eval else None,
+        'total_wall_s' : timings[0]['total_wall_s'],
+        'n_reps'       : n_reps,
     }, raw_out
 
 
 # ---------------------------------------------------------------------------
-# Expression preparation  (shared across strategies)
+# Expression preparation
 # ---------------------------------------------------------------------------
 
-def prepare_expressions(m, E_lo, E_hi, cache_dir):
-    """Build psi_fH for 3-D harmonic oscillator, return grouped (exp,poly) lists."""
+def prepare_expressions(m, E_lo, E_hi, cache_dir, expand=True):
+    """Build psi_fH for 3-D HO, return grouped (exp,poly) lists.
+
+    expand=True  (default)
+        Calls sp.expand() at every H^n step → flat monomial sum with rational
+        coefficients.  Loads from / saves to cache_dir.
+
+    expand=False
+        Skips sp.expand() → preserves product structure (V*Ps, k2*Ps, etc.).
+        Loads from / saves to cache_dir (use a separate noexpand cache dir).
+        return_envelopes=True is used to bypass psi_fH.expand() in
+        extract_cos_sin_coeffs, keeping the tree intact for sp.cse().
+    """
     sys.path.insert(0, str(Path(__file__).parent))
-    from test_symbolic_ho3d import build_fH_psi_sympy
     from symbolic_code.chebyshev_filter import (
-        extract_cos_sin_coeffs, group_by_exp_combined)
+        extract_cos_sin_coeffs, group_by_exp_combined,
+        apply_f_of_H_from_raw_powers)
+    from symbolic_code.h_powers import generate_H_powers
+    from test_symbolic_ho3d import _max_cached_power
 
-    print(f'Building f(H)*psi  m={m}  E_lo={E_lo}  E_hi={E_hi:.2f} ...', flush=True)
-    t0 = time.time()
-    psi_fH, info = build_fH_psi_sympy(m, E_lo, E_hi, cache_dir=cache_dir)
-    print(f'  done in {time.time()-t0:.1f}s', flush=True)
+    cache_dir = Path(cache_dir)
+    a   = 2.0 / (E_hi - E_lo)
+    b_sc = -(E_hi + E_lo) / (E_hi - E_lo)
 
-    print('Extracting cos/sin envelopes + grouping by exp ...', flush=True)
+    if expand:
+        from test_symbolic_ho3d import build_fH_psi_sympy
+        print(f'Building f(H)*psi  m={m}  E_lo={E_lo}  E_hi={E_hi:.2f}  '
+              f'[expand=True] ...', flush=True)
+        t0 = time.time()
+        psi_fH, info = build_fH_psi_sympy(m, E_lo, E_hi, cache_dir=str(cache_dir))
+        print(f'  done in {time.time()-t0:.1f}s', flush=True)
+
+        print('Extracting cos/sin envelopes + grouping by exp ...', flush=True)
+        t0 = time.time()
+        expr_cos, expr_sin = extract_cos_sin_coeffs(psi_fH)
+    else:
+        # No-expand path: generate H^n without sp.expand() if not cached, then
+        # return envelopes directly (bypassing extract_cos_sin_coeffs which calls
+        # .expand() and would destroy the preserved tree structure).
+        max_n = _max_cached_power(cache_dir)
+        if max_n < m:
+            print(f'  Building noexpand H^n cache (m={m}) in {cache_dir} ...',
+                  flush=True)
+            x, y, z = sp.symbols('x y z')
+            kx, ky, kz = sp.symbols('kx ky kz')
+            V_sym = sp.Rational(1, 2) * (x**2 + y**2 + z**2)
+            t0 = time.time()
+            generate_H_powers(
+                m, cache_dir, file_format='pkl', expand=False,
+                V=V_sym, kvec=(kx, ky, kz), k2=kx**2+ky**2+kz**2,
+                pref=0.5, x=x, y=y, z=z)
+            print(f'  done in {time.time()-t0:.1f}s', flush=True)
+        else:
+            print(f'  Noexpand H^n cache hit (max_n={max_n}): {cache_dir}',
+                  flush=True)
+
+        print(f'Assembling f(H)*psi envelopes  [expand=False] ...', flush=True)
+        t0 = time.time()
+        # return_envelopes=True returns (Pc_total, Ps_total) without expanding
+        expr_cos, expr_sin = apply_f_of_H_from_raw_powers(
+            cache_dir, m, a=a, b=b_sc, return_envelopes=True)
+        info = {'expand': False, 'cache_dir': str(cache_dir)}
+
     t0 = time.time()
-    expr_cos, expr_sin = extract_cos_sin_coeffs(psi_fH)
     terms_cos = group_by_exp_combined(expr_cos)
     terms_sin = group_by_exp_combined(expr_sin)
     print(f'  done in {time.time()-t0:.1f}s  '
@@ -586,11 +629,19 @@ def main():
     parser.add_argument('--Ng', type=int, default=22,
                         help='Grid points per axis (default 22)')
     parser.add_argument('--n_waves', type=int, default=40,
-                        help='Plane waves for timing (default 40)')
+                        help='Plane waves (default 40; use >= 20 for valid timing)')
     parser.add_argument('--n_reps', type=int, default=3,
                         help='Julia timing repetitions (default 3)')
     parser.add_argument('--cache_dir', default='ho3d_h_powers_cache',
-                        help='H^n cache dir (default ho3d_h_powers_cache/)')
+                        help='H^n cache dir for expand=True (default ho3d_h_powers_cache/)')
+    parser.add_argument('--noexp_cache_dir', default='ho3d_h_powers_cache_noexpand',
+                        help='H^n cache dir for expand=False '
+                             '(default ho3d_h_powers_cache_noexpand/)')
+    parser.add_argument('--compare_expand', action='store_true',
+                        help='Run each strategy on BOTH expand=True (_E) and '
+                             'expand=False (_N); shows combined table')
+    parser.add_argument('--no_expand', action='store_true',
+                        help='Run on expand=False only (separate from default expand=True)')
     parser.add_argument('--strategies', default=','.join(BUILDERS),
                         help=f'Comma-separated strategies (default: all)')
     parser.add_argument('--julia_exe', default='julia',
@@ -598,9 +649,9 @@ def main():
     parser.add_argument('--no_check', action='store_true',
                         help='Skip correctness check vs baseline')
     parser.add_argument('--save_jl', action='store_true',
-                        help='Keep generated .jl files (default: delete after run)')
+                        help='Keep generated .jl files after run')
     parser.add_argument('--outdir', default='benchmark_results',
-                        help='Dir for results JSON and .jl files (default benchmark_results/)')
+                        help='Dir for results and .jl files (default benchmark_results/)')
     args = parser.parse_args()
 
     requested = [s.strip() for s in args.strategies.split(',')]
@@ -610,8 +661,12 @@ def main():
         print(f'Valid: {list(BUILDERS.keys())}')
         sys.exit(1)
 
-    # Auto E_hi
-    dx = 2 * args.L / args.Ng
+    if args.n_waves < 2:
+        print(f'\nWARNING: --n_waves={args.n_waves} → the Julia timed section runs '
+              f'n_waves-1=0 iterations, so eval_s=0 and ms/wave=0 for ALL strategies.  '
+              f'Use --n_waves 40 for meaningful timing.\n')
+
+    dx   = 2 * args.L / args.Ng
     E_hi = args.E_hi if args.E_hi is not None else (
         0.5 * 3 * (np.pi / dx) ** 2 + 0.5 * 3 * (args.L - dx) ** 2
     )
@@ -620,127 +675,147 @@ def main():
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # Build expressions (shared across strategies)
-    terms_cos, terms_sin, expr_info = prepare_expressions(
-        args.m, args.E_lo, E_hi, args.cache_dir)
+    # Each entry: (label_suffix, cache_dir_path, expand_bool)
+    if args.compare_expand:
+        datasets = [
+            ('_E', args.cache_dir,       True),
+            ('_N', args.noexp_cache_dir, False),
+        ]
+    elif args.no_expand:
+        datasets = [('', args.noexp_cache_dir, False)]
+    else:
+        datasets = [('', args.cache_dir, True)]
 
-    # Grid
     x1 = np.linspace(-args.L, args.L, args.Ng, endpoint=False)
     X, Y, Z = np.meshgrid(x1, x1, x1, indexing='ij')
-
-    rng = np.random.default_rng(42)
+    rng    = np.random.default_rng(42)
     k_vals = rng.uniform(-1.0, 1.0, (args.n_waves, 3))
     b_vals = rng.uniform(0, 2 * np.pi, args.n_waves)
 
-    # Raw op counts on the FLAT (unmodified) expressions
-    ops_flat = total_ops(terms_cos) + total_ops(terms_sin)
-    nterms_flat = total_terms(terms_cos) + total_terms(terms_sin)
-
-    print(f'\nFlat poly complexity: {ops_flat} total ops, {nterms_flat} terms')
-    print(f'Grid: {args.Ng}^3={args.Ng**3} pts  n_waves={args.n_waves}  n_reps={args.n_reps}')
-    print()
-
-    # Run each strategy
-    results = {}
-    baseline_out = None
+    all_results = {}
+    reference_out = None   # expand=True baseline used for correctness checks
 
     with tempfile.TemporaryDirectory(prefix='bench_jl_') as work_dir:
-        for name in requested:
-            print(f'{"="*55}')
-            print(f'Strategy: {name}')
-            t_build = time.time()
-            try:
-                jl_src, tc, ts, extra = BUILDERS[name](terms_cos, terms_sin)
-            except Exception as exc:
-                print(f'  BUILD FAILED: {exc}')
-                results[name] = {'error': str(exc)}
-                continue
-            t_build = time.time() - t_build
+        for suffix, cache_dir, expand in datasets:
+            print(f'\n{"─"*60}')
+            print(f'Dataset: expand={expand}  cache={cache_dir}')
+            print(f'{"─"*60}')
+            terms_cos, terms_sin, _ = prepare_expressions(
+                args.m, args.E_lo, E_hi, cache_dir, expand=expand)
 
-            # Compute ops on the strategy's actual poly terms
-            ops_used = total_ops(tc) + total_ops(ts)
-            nterms_used = total_terms(tc) + total_terms(ts)
+            ops_flat    = total_ops(terms_cos)   + total_ops(terms_sin)
+            nterms_flat = total_terms(terms_cos) + total_terms(terms_sin)
+            print(f'\nFlat poly (pre-optim): {ops_flat} ops  {nterms_flat} terms')
+            print(f'Grid: {args.Ng}^3={args.Ng**3} pts  '
+                  f'n_waves={args.n_waves}  n_reps={args.n_reps}\n')
 
-            jl_file = outdir / f'eval_{name}_m{args.m}.jl'
-            jl_file.write_text(jl_src, encoding='utf-8')
-            print(f'  .jl written ({len(jl_src):,} bytes)  build_time={t_build:.1f}s')
-            print(f'  ops={ops_used}  terms={nterms_used}  '
-                  + ('  '.join(f'{k}={v}' for k, v in extra.items())))
+            for name in requested:
+                full_name = name + suffix
+                print(f'{"="*55}')
+                print(f'Strategy: {full_name}  (expand={expand})')
+                t_build = time.time()
+                try:
+                    jl_src, tc, ts, extra = BUILDERS[name](terms_cos, terms_sin)
+                except Exception as exc:
+                    print(f'  BUILD FAILED: {exc}')
+                    all_results[full_name] = {'error': str(exc)}
+                    continue
+                t_build = time.time() - t_build
 
-            try:
-                timing, raw_out = run_julia(
-                    jl_file, X, Y, Z, k_vals, b_vals, work_dir,
-                    args.julia_exe, n_reps=args.n_reps)
-            except RuntimeError as exc:
-                print(f'  JULIA FAILED: {exc}')
-                results[name] = {'error': str(exc), 'ops': ops_used}
+                ops_post = extra.get('ops_post', total_ops(tc) + total_ops(ts))
+
+                jl_file = outdir / f'eval_{full_name}_m{args.m}.jl'
+                jl_file.write_text(jl_src, encoding='utf-8')
+                extra_str = '  '.join(
+                    f'{k}={v}' for k, v in extra.items() if k != 'ops_post')
+                print(f'  .jl written ({len(jl_src):,} bytes)  '
+                      f'build_time={t_build:.1f}s')
+                print(f'  ops_post={ops_post}  {extra_str}')
+
+                try:
+                    timing, raw_out = run_julia(
+                        jl_file, X, Y, Z, k_vals, b_vals, work_dir,
+                        args.julia_exe, n_reps=args.n_reps)
+                except RuntimeError as exc:
+                    print(f'  JULIA FAILED: {exc}')
+                    all_results[full_name] = {'error': str(exc),
+                                              'ops_post': ops_post}
+                    if not args.save_jl:
+                        jl_file.unlink(missing_ok=True)
+                    continue
+
+                mspw = timing['ms_per_wave']
+                print(f'  warmup={timing["warmup_s"]*1000:.1f}ms  '
+                      f'eval={mspw:.3f}ms/wave  wall={timing["total_wall_s"]:.1f}s')
+
+                max_err = None
+                if not args.no_check and raw_out is not None:
+                    if name == 'baseline' and expand:
+                        reference_out = raw_out.copy()
+                        max_err = 0.0
+                    elif reference_out is not None:
+                        diff = np.abs(raw_out - reference_out)
+                        max_err = float(diff.max())
+                        status = 'OK' if max_err < 1e-6 else 'WARNING'
+                        print(f'  vs reference: max|diff|={max_err:.2e}  [{status}]')
+
+                all_results[full_name] = {
+                    'ops_post'    : ops_post,
+                    'ops_flat'    : ops_flat,
+                    'expand'      : expand,
+                    'ms_per_wave' : mspw,
+                    'warmup_ms'   : timing['warmup_s'] * 1000 if timing['warmup_s'] else None,
+                    'total_wall_s': timing['total_wall_s'],
+                    'max_err'     : max_err,
+                    'build_time_s': t_build,
+                    **{k: v for k, v in extra.items() if k != 'ops_post'},
+                }
+
                 if not args.save_jl:
                     jl_file.unlink(missing_ok=True)
-                continue
 
-            mspw = timing['ms_per_wave']
-            print(f'  warmup={timing["warmup_s"]*1000:.1f}ms  '
-                  f'eval={mspw:.3f}ms/wave  wall={timing["total_wall_s"]:.1f}s')
-
-            # Correctness check
-            max_err = None
-            if not args.no_check and raw_out is not None:
-                if name == 'baseline':
-                    baseline_out = raw_out.copy()
-                    max_err = 0.0
-                elif baseline_out is not None:
-                    diff = np.abs(raw_out - baseline_out)
-                    max_err = float(diff.max())
-                    status = 'OK' if max_err < 1e-8 else 'WARNING'
-                    print(f'  correctness vs baseline: max|diff|={max_err:.2e}  [{status}]')
-
-            results[name] = {
-                'ops'        : ops_used,
-                'n_terms'    : nterms_used,
-                'ms_per_wave': mspw,
-                'warmup_ms'  : timing['warmup_s'] * 1000 if timing['warmup_s'] else None,
-                'total_wall_s': timing['total_wall_s'],
-                'max_err'    : max_err,
-                'build_time_s': t_build,
-                **extra,
-            }
-
-            if not args.save_jl:
-                jl_file.unlink(missing_ok=True)
-
-    # Comparison table
+    # ---- Summary table ----
     print(f'\n{"="*80}')
     print(f'SUMMARY  m={args.m}  E_lo={args.E_lo}  E_hi={E_hi:.2f}  '
           f'Ng={args.Ng}  n_waves={args.n_waves}')
+    if args.n_waves < 2:
+        print('  *** n_waves<2: ms/wave=0, speedup meaningless — use --n_waves 40 ***')
     print(f'{"="*80}')
 
-    baseline_ms = (results.get('baseline') or {}).get('ms_per_wave')
+    ref_ms = None
+    for cand in ('baseline', 'baseline_E'):
+        if cand in all_results and all_results[cand].get('ms_per_wave'):
+            ref_ms = all_results[cand]['ms_per_wave']
+            break
 
-    header = f'{"Strategy":<14} {"ops":>7} {"terms":>6} {"ms/wave":>9} {"speedup":>8} {"max_err":>10}'
+    header = (f'{"Strategy":<18} {"exp":>4} {"ops_post":>9} {"ms/wave":>9} '
+              f'{"speedup":>8} {"warmup_ms":>10} {"max_err":>10}')
     print(header)
     print('-' * len(header))
-    for name in requested:
-        r = results.get(name, {})
+    for full_name in all_results:
+        r = all_results[full_name]
         if 'error' in r:
-            print(f'{name:<14}  ERROR: {r["error"][:40]}')
+            print(f'{full_name:<18}  ERROR: {r["error"][:45]}')
             continue
-        mspw = r.get('ms_per_wave')
-        spd  = f'{baseline_ms/mspw:.2f}x' if (baseline_ms and mspw) else '-'
-        err  = f'{r["max_err"]:.1e}' if r.get('max_err') is not None else '-'
-        print(f'{name:<14} {r["ops"]:>7} {r["n_terms"]:>6} '
-              f'{(mspw or 0):>9.3f} {spd:>8} {err:>10}')
+        mspw  = r.get('ms_per_wave')
+        exp_s = 'T' if r.get('expand', True) else 'F'
+        spd   = f'{ref_ms/mspw:.2f}x' if (ref_ms and mspw) else '-'
+        err   = f'{r["max_err"]:.1e}' if r.get('max_err') is not None else '-'
+        wmup  = f'{r["warmup_ms"]:.1f}' if r.get('warmup_ms') else '-'
+        print(f'{full_name:<18} {exp_s:>4} {r["ops_post"]:>9} '
+              f'{(mspw or 0):>9.3f} {spd:>8} {wmup:>10} {err:>10}')
 
-    # Save JSON
     result_file = outdir / f'benchmark_m{args.m}.json'
     with open(result_file, 'w') as f:
         json.dump({
             'args': {'m': args.m, 'E_lo': args.E_lo, 'E_hi': E_hi,
-                     'Ng': args.Ng, 'n_waves': args.n_waves, 'n_reps': args.n_reps},
-            'flat_ops': ops_flat, 'flat_terms': nterms_flat,
-            'results': results,
+                     'Ng': args.Ng, 'n_waves': args.n_waves,
+                     'n_reps': args.n_reps,
+                     'compare_expand': args.compare_expand,
+                     'no_expand': args.no_expand},
+            'results': all_results,
         }, f, indent=2, default=str)
     print(f'\nResults → {result_file}')
-
     if args.save_jl:
         print(f'.jl files → {outdir}/')
 
