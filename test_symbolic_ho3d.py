@@ -44,6 +44,8 @@ Usage
     python test_symbolic_ho3d.py --filter_mode bandpass --E_lo 0.5 --E_hi 6.5
     python test_symbolic_ho3d.py --no_cache                   # always recompute H^n
     python test_symbolic_ho3d.py --n_waves 120 --k_max 2.0   # more waves, wider k range
+    python test_symbolic_ho3d.py --eval_backend julia         # use Julia JIT (julia must be on PATH)
+    python test_symbolic_ho3d.py --eval_backend julia --julia_exe /path/to/julia
 """
 
 import argparse
@@ -51,6 +53,7 @@ import datetime
 import json
 import pickle
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -105,6 +108,98 @@ def _safe_lambdify(sym_args, expr, modules='numpy', chunk_size=250):
         return result
 
     return _f
+
+
+# ============================================================
+# Julia evaluation backend
+# ============================================================
+
+def _julia_eval_filter(expr_cos, expr_sin, X, Y, Z, k_vals, b_vals,
+                       work_dir, julia_exe='julia'):
+    """Evaluate f(H)*psi on the 3-D grid using Julia JIT compilation.
+
+    Generates a standalone ``.jl`` script (no Julia packages required),
+    writes grid and k/b data as raw float64 binary, calls Julia via
+    subprocess, and reads back the result array.
+
+    Parameters
+    ----------
+    expr_cos, expr_sin : sympy expressions (envelopes of cos/sin)
+    X, Y, Z  : 3-D numpy arrays (Ng, Ng, Ng)
+    k_vals   : (n_waves, 3) float array of k vectors
+    b_vals   : (n_waves,)   float array of phase offsets
+    work_dir : Path  — ``.jl`` and binary I/O files are placed here
+    julia_exe: str   — Julia executable name (must be on PATH)
+
+    Returns
+    -------
+    C_f : numpy array of shape (n_waves, Ng, Ng, Ng)
+
+    Raises
+    ------
+    RuntimeError if the Julia process exits with a non-zero status.
+    FileNotFoundError if the julia executable is not found.
+    """
+    from symbolic_code.chebyshev_filter import group_by_exp_combined, apply_horner
+    from symbolic_code.julia_codegen import build_julia_batch_script
+
+    work_dir = Path(work_dir)
+    Ng = X.shape[0]
+    N  = Ng ** 3
+    n_waves = len(k_vals)
+
+    # Build grouped+Horner terms (minimises Julia compile time)
+    terms_cos = apply_horner(group_by_exp_combined(expr_cos))
+    terms_sin = apply_horner(group_by_exp_combined(expr_sin))
+
+    # Write Julia script
+    jl_src  = build_julia_batch_script(terms_cos, terms_sin)
+    jl_file = work_dir / 'eval_filter.jl'
+    jl_file.write_text(jl_src, encoding='utf-8')
+    print(f"  Julia script  -> {jl_file}")
+
+    # Write binary input: [X_flat; Y_flat; Z_flat]
+    grid_bin = work_dir / '_grid.bin'
+    with open(grid_bin, 'wb') as f:
+        X.ravel().astype('<f8').tofile(f)
+        Y.ravel().astype('<f8').tofile(f)
+        Z.ravel().astype('<f8').tofile(f)
+
+    # Write k/b values: [kx0,ky0,kz0,b0, kx1,…] (n_waves × 4 float64)
+    kvals_bin = work_dir / '_kvals.bin'
+    kb = np.column_stack([k_vals, b_vals]).astype('<f8')  # (n_waves, 4)
+    kb.ravel().tofile(str(kvals_bin))
+
+    out_bin = work_dir / '_cfilt.bin'
+
+    # Run Julia
+    cmd = [julia_exe, str(jl_file),
+           str(grid_bin), str(kvals_bin), str(out_bin),
+           str(N), str(n_waves)]
+    print(f"  Running: {' '.join(cmd[:2])} eval_filter.jl ... (JIT compile on first run)")
+    t0 = time.time()
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    julia_time = time.time() - t0
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Julia exited with code {result.returncode}.\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    if result.stdout.strip():
+        print(f"  Julia stdout: {result.stdout.strip()}")
+    print(f"  Julia wall time: {julia_time:.1f} s")
+
+    # Read back results and reshape
+    raw = np.fromfile(str(out_bin), dtype='<f8')
+    C_f = raw.reshape(n_waves, Ng, Ng, Ng)
+
+    # Clean up temporary binary files (keep .jl for inspection)
+    grid_bin.unlink(missing_ok=True)
+    kvals_bin.unlink(missing_ok=True)
+    out_bin.unlink(missing_ok=True)
+
+    return C_f
 
 
 # ============================================================
@@ -462,11 +557,16 @@ def test_single_H_step():
 
 def test_filter_diag(m=6, E_lo=4.5, E_hi=None, L=5.5, Ng=22,
                      n_waves=60, k_max=1.5, method='H_powers', cache_dir=None,
-                     filter_mode='explosion'):
+                     filter_mode='explosion', eval_backend='numpy', run_dir=None,
+                     julia_exe='julia'):
     """Full Chebyshev pipeline: build, evaluate, diagonalise, compare.
 
     filter_mode='explosion': target eigenvalues < E_lo (amplified region).
     filter_mode='bandpass':  target eigenvalues in [E_lo, E_hi].
+
+    eval_backend='numpy'  – use _safe_lambdify + NumPy (default).
+    eval_backend='julia'  – generate a .jl script and call Julia via subprocess;
+                            run_dir is used to store eval_filter.jl and I/O.
 
     Returns (ok, result_dict).
     """
@@ -500,31 +600,38 @@ def test_filter_diag(m=6, E_lo=4.5, E_hi=None, L=5.5, Ng=22,
     build_time = time.time() - t0
     print(f"  Done in {build_time:.1f} s")
 
-    # ---- lambdify ----
+    # ---- extract cos/sin envelopes ----
     expr_cos, expr_sin = extract_cos_sin_coeffs(psi_fH)
-    xs, ys, zs = sp.symbols('x y z')
-    kx_s, ky_s, kz_s, b_s = sp.symbols('kx ky kz b')
-    sym_args = [xs, ys, zs, kx_s, ky_s, kz_s, b_s]
-    print("  Lambdifying cos/sin envelopes ...")
-    f_cos = _safe_lambdify(sym_args, expr_cos)
-    f_sin = _safe_lambdify(sym_args, expr_sin)
 
     # ---- numerical grid ----
     x1, X, Y, Z = make_grid(L=L, N=Ng)
     V3d = 0.5 * (X**2 + Y**2 + Z**2)
 
-    # ---- evaluate f(H)*psi for many plane waves ----
+    # ---- random plane waves ----
     rng    = np.random.default_rng(42)
     k_vals = rng.uniform(-k_max, k_max, (n_waves, 3))
     b_vals = rng.uniform(0, 2 * np.pi, n_waves)
-    print(f"  Evaluating for {n_waves} plane waves ...")
-    C_f = np.zeros((n_waves, Ng, Ng, Ng), dtype=np.float64)
-    for iw, (kv, bv) in enumerate(zip(k_vals, b_vals)):
-        kx_v, ky_v, kz_v = kv
-        phase = kx_v*X + ky_v*Y + kz_v*Z + bv
-        fc = np.asarray(f_cos(X, Y, Z, kx_v, ky_v, kz_v, bv), dtype=float)
-        fs = np.asarray(f_sin(X, Y, Z, kx_v, ky_v, kz_v, bv), dtype=float)
-        C_f[iw] = fc * np.cos(phase) + fs * np.sin(phase)
+
+    # ---- evaluate f(H)*psi (backend-dependent) ----
+    print(f"  Evaluating for {n_waves} plane waves  [backend={eval_backend}] ...")
+    if eval_backend == 'julia':
+        _jdir = Path(run_dir) if run_dir is not None else Path(tempfile.mkdtemp(prefix='ho3d_jl_'))
+        C_f = _julia_eval_filter(expr_cos, expr_sin, X, Y, Z, k_vals, b_vals,
+                                 work_dir=_jdir, julia_exe=julia_exe)
+    else:
+        xs, ys, zs = sp.symbols('x y z')
+        kx_s, ky_s, kz_s, b_s = sp.symbols('kx ky kz b')
+        sym_args = [xs, ys, zs, kx_s, ky_s, kz_s, b_s]
+        print("  Lambdifying cos/sin envelopes ...")
+        f_cos = _safe_lambdify(sym_args, expr_cos)
+        f_sin = _safe_lambdify(sym_args, expr_sin)
+        C_f = np.zeros((n_waves, Ng, Ng, Ng), dtype=np.float64)
+        for iw, (kv, bv) in enumerate(zip(k_vals, b_vals)):
+            kx_v, ky_v, kz_v = kv
+            phase = kx_v*X + ky_v*Y + kz_v*Z + bv
+            fc = np.asarray(f_cos(X, Y, Z, kx_v, ky_v, kz_v, bv), dtype=float)
+            fs = np.asarray(f_sin(X, Y, Z, kx_v, ky_v, kz_v, bv), dtype=float)
+            C_f[iw] = fc * np.cos(phase) + fs * np.sin(phase)
 
     # ---- SVD filter diagonalisation ----
     print("  SVD filter diagonalisation ...")
@@ -565,6 +672,7 @@ def test_filter_diag(m=6, E_lo=4.5, E_hi=None, L=5.5, Ng=22,
         'runtime_s'          : runtime,
         'build_time_s'       : build_time,
         'filter_mode'        : filter_mode,
+        'eval_backend'       : eval_backend,
         'E_hi'               : E_hi,
         'k_max'              : k_max,
         **source_info,
@@ -615,6 +723,12 @@ def main():
                         help='Disable H^n cache (always recompute, no saving)')
     parser.add_argument('--outdir', default='results',
                         help='Root folder for timestamped run dirs (default results/)')
+    parser.add_argument('--eval_backend', default='numpy',
+                        choices=['numpy', 'julia'],
+                        help='numpy: lambdify+NumPy (default); '
+                             'julia: generate .jl and call Julia via subprocess')
+    parser.add_argument('--julia_exe', default='julia',
+                        help='Julia executable name or full path (default: julia)')
     args = parser.parse_args()
 
     # Always compute the reference E_hi from grid parameters and print it
@@ -654,10 +768,12 @@ def main():
             'Ng'          : args.Ng,
             'n_waves'     : args.n_waves,
             'k_max'       : args.k_max,
-            'method'      : args.method,
-            'filter_mode' : args.filter_mode,
-            'cache_dir'   : str(cache_dir) if cache_dir else None,
-            'quick'       : args.quick,
+            'method'       : args.method,
+            'filter_mode'  : args.filter_mode,
+            'eval_backend' : args.eval_backend,
+            'julia_exe'    : args.julia_exe,
+            'cache_dir'    : str(cache_dir) if cache_dir else None,
+            'quick'        : args.quick,
         },
         'filter_plot' : filter_fname,
     }
@@ -681,6 +797,9 @@ def main():
             method=args.method,
             cache_dir=cache_dir,
             filter_mode=args.filter_mode,
+            eval_backend=args.eval_backend,
+            run_dir=run_dir,
+            julia_exe=args.julia_exe,
         )
         all_ok['Test2_filter_diag'] = ok2
         run_meta['test2'] = data2

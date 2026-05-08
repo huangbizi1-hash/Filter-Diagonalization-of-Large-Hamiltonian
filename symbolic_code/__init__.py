@@ -41,6 +41,12 @@ from .chebyshev_filter import (
     svd_H,
 )
 from .filter_plot import filter_response, plot_chebyshev_filter, print_filter_summary
+from .julia_codegen import (
+    expr_to_julia_code,
+    build_julia_scalar_function,
+    build_julia_batch_script,
+    build_julia_benchmark_script,
+)
 
 __all__ = [
     # space partition
@@ -58,4 +64,7 @@ __all__ = [
     "group_by_exp_combined", "extract_cos_sin_coeffs", "apply_horner", "svd_H",
     # filter plotting
     "filter_response", "plot_chebyshev_filter", "print_filter_summary",
+    # Julia code generation
+    "expr_to_julia_code", "build_julia_scalar_function",
+    "build_julia_batch_script", "build_julia_benchmark_script",
 ]
