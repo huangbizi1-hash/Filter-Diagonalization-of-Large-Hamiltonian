@@ -43,6 +43,7 @@ Usage
     python test_symbolic_ho3d.py --m 8 --E_lo 5.0            # target E < 5
     python test_symbolic_ho3d.py --filter_mode bandpass --E_lo 0.5 --E_hi 6.5
     python test_symbolic_ho3d.py --no_cache                   # always recompute H^n
+    python test_symbolic_ho3d.py --n_waves 120 --k_max 2.0   # more waves, wider k range
 """
 
 import argparse
@@ -460,7 +461,7 @@ def test_single_H_step():
 # ============================================================
 
 def test_filter_diag(m=6, E_lo=4.5, E_hi=None, L=5.5, Ng=22,
-                     n_waves=60, method='H_powers', cache_dir=None,
+                     n_waves=60, k_max=1.5, method='H_powers', cache_dir=None,
                      filter_mode='explosion'):
     """Full Chebyshev pipeline: build, evaluate, diagonalise, compare.
 
@@ -483,7 +484,7 @@ def test_filter_diag(m=6, E_lo=4.5, E_hi=None, L=5.5, Ng=22,
     print("\n" + "="*60)
     print(f"Test 2: filter diagonalisation on 3D HO")
     print(f"        m={m}  E_lo={E_lo}  E_hi={E_hi:.4f}  "
-          f"mode={filter_mode}  method={method}")
+          f"mode={filter_mode}  method={method}  k_max={k_max}")
     target_desc = f'E < {E_lo}' if filter_mode == 'explosion' else f'E ∈ [{E_lo}, {E_hi}]'
     print(f"        target: {len(exact)} eigenvalue(s) with {target_desc}")
     print("="*60)
@@ -514,7 +515,7 @@ def test_filter_diag(m=6, E_lo=4.5, E_hi=None, L=5.5, Ng=22,
 
     # ---- evaluate f(H)*psi for many plane waves ----
     rng    = np.random.default_rng(42)
-    k_vals = rng.uniform(-1.5, 1.5, (n_waves, 3))
+    k_vals = rng.uniform(-k_max, k_max, (n_waves, 3))
     b_vals = rng.uniform(0, 2 * np.pi, n_waves)
     print(f"  Evaluating for {n_waves} plane waves ...")
     C_f = np.zeros((n_waves, Ng, Ng, Ng), dtype=np.float64)
@@ -565,6 +566,7 @@ def test_filter_diag(m=6, E_lo=4.5, E_hi=None, L=5.5, Ng=22,
         'build_time_s'       : build_time,
         'filter_mode'        : filter_mode,
         'E_hi'               : E_hi,
+        'k_max'              : k_max,
         **source_info,
         'energies_recovered' : [float(e) for e in recovered],
         'energies_exact'     : [float(e) for e in exact],
@@ -596,6 +598,9 @@ def main():
                         help='Grid points per axis (default 22)')
     parser.add_argument('--n_waves', type=int, default=60,
                         help='Number of random plane waves (default 60)')
+    parser.add_argument('--k_max', type=float, default=1.5,
+                        help='Abs. range for random k vectors: uniform(-k_max, k_max) '
+                             'per axis (default 1.5)')
     parser.add_argument('--method', default='H_powers',
                         choices=['H_powers', 'scaled'],
                         help='H_powers=pure H^n (default); scaled=(aH+b)^n')
@@ -612,16 +617,16 @@ def main():
                         help='Root folder for timestamped run dirs (default results/)')
     args = parser.parse_args()
 
-    # Auto-compute E_hi if not provided
-    E_hi = args.E_hi
-    if E_hi is None:
-        E_hi = estimate_E_hi(args.L, args.Ng)
-        dx    = 2.0 * args.L / args.Ng
-        T_max = 0.5 * 3 * (np.pi / dx) ** 2
-        V_max = 0.5 * 3 * (args.L - dx) ** 2
-        print(f"Auto E_hi = {E_hi:.4f}  "
-              f"(T_max={T_max:.2f} + V_max={V_max:.2f}, "
-              f"grid {args.Ng}³, L={args.L})")
+    # Always compute the reference E_hi from grid parameters and print it
+    dx        = 2.0 * args.L / args.Ng
+    T_max     = 0.5 * 3 * (np.pi / dx) ** 2
+    V_max     = 0.5 * 3 * (args.L - dx) ** 2
+    E_hi_ref  = T_max + V_max
+    print(f"E_hi_ref = {E_hi_ref:.4f}  "
+          f"(T_max={T_max:.2f} + V_max={V_max:.2f}, "
+          f"grid {args.Ng}³, L={args.L})")
+
+    E_hi = args.E_hi if args.E_hi is not None else E_hi_ref
 
     cache_dir = None if args.no_cache else args.cache_dir
 
@@ -643,10 +648,12 @@ def main():
             'm'           : args.m,
             'E_lo'        : args.E_lo,
             'E_hi'        : E_hi,
+            'E_hi_ref'    : E_hi_ref,
             'E_hi_auto'   : args.E_hi is None,
             'L'           : args.L,
             'Ng'          : args.Ng,
             'n_waves'     : args.n_waves,
+            'k_max'       : args.k_max,
             'method'      : args.method,
             'filter_mode' : args.filter_mode,
             'cache_dir'   : str(cache_dir) if cache_dir else None,
@@ -670,6 +677,7 @@ def main():
             L=args.L,
             Ng=args.Ng,
             n_waves=args.n_waves,
+            k_max=args.k_max,
             method=args.method,
             cache_dir=cache_dir,
             filter_mode=args.filter_mode,
