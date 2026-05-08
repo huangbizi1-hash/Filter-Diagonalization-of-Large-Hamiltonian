@@ -70,6 +70,43 @@ from symbolic_code.filter_plot import plot_chebyshev_filter
 
 
 # ============================================================
+# Lambdify helper
+# ============================================================
+
+def _safe_lambdify(sym_args, expr, modules='numpy', chunk_size=250):
+    """Lambdify that handles large flat polynomials.
+
+    sp.lambdify generates Python source code whose arithmetic tree mirrors the
+    expression structure.  For a flat expanded polynomial with N terms the
+    source is a single left-recursive sum of depth N-1.  Python's compiler
+    hits its default recursion limit (~1000) once N exceeds roughly 1000.
+
+    This helper checks the number of top-level summands.  If they fit in one
+    chunk, it falls through to ordinary lambdify.  Otherwise it splits into
+    chunks of at most *chunk_size* terms, lambdifies each chunk separately,
+    and returns a wrapper that sums them at evaluation time.
+    """
+    terms = sp.Add.make_args(expr)          # (expr,) if not a sum
+    if len(terms) <= chunk_size:
+        return sp.lambdify(sym_args, expr, modules)
+
+    n_chunks = (len(terms) + chunk_size - 1) // chunk_size
+    print(f"    [safe_lambdify: {len(terms)} terms → {n_chunks} chunks of ≤{chunk_size}]")
+    chunk_funcs = []
+    for i in range(0, len(terms), chunk_size):
+        chunk_expr = sp.Add(*terms[i : i + chunk_size])
+        chunk_funcs.append(sp.lambdify(sym_args, chunk_expr, modules))
+
+    def _f(*args):
+        result = chunk_funcs[0](*args)
+        for fn in chunk_funcs[1:]:
+            result = result + fn(*args)
+        return result
+
+    return _f
+
+
+# ============================================================
 # Grid helpers
 # ============================================================
 
@@ -468,8 +505,8 @@ def test_filter_diag(m=6, E_lo=4.5, E_hi=None, L=5.5, Ng=22,
     kx_s, ky_s, kz_s, b_s = sp.symbols('kx ky kz b')
     sym_args = [xs, ys, zs, kx_s, ky_s, kz_s, b_s]
     print("  Lambdifying cos/sin envelopes ...")
-    f_cos = sp.lambdify(sym_args, expr_cos, 'numpy')
-    f_sin = sp.lambdify(sym_args, expr_sin, 'numpy')
+    f_cos = _safe_lambdify(sym_args, expr_cos)
+    f_sin = _safe_lambdify(sym_args, expr_sin)
 
     # ---- numerical grid ----
     x1, X, Y, Z = make_grid(L=L, N=Ng)
