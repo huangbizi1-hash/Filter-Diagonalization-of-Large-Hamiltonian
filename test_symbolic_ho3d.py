@@ -9,34 +9,46 @@ Exact eigenvalues:  E_n = n + 1.5   (n = nx + ny + nz = 0, 1, 2, ...)
 On every run a timestamped sub-folder is created inside --outdir (default
 ``results/``).  It contains:
 
-    filter_N<m>_E<lo>-<hi>.png  –  Chebyshev filter plot (no H^n needed)
-    results.json                –  runtime, source info, recovered energies
-
-Tests
------
-1. Single H step : symbolic apply_H_on_pair vs FFT  (grid-aligned k)
-2. Filter diag   : full pipeline, recover lowest HO eigenvalues
+    filter_m<m>_E<lo>-<hi>.png          – filter plot (generated immediately)
+    filter_m<m>_E<lo>-<hi>_recovered.png – filter + recovered eigenvalues overlay
+    results.json                         – runtime, source info, energies
 
 H-power strategies (--method)
 ------------------------------
 H_powers (default)
-    Pure H^n with sp.expand().  Rational coefficients → compact expressions.
-    a, b applied at assembly, so H^n files are reusable across energy windows.
+    Pure H^n via sp.expand().  Rational coefficients → compact expressions.
+    Files saved in --cache_dir (default ho3d_h_powers_cache/) and reused
+    across runs.  a, b applied only at assembly time.
 scaled
-    (aH+b)^n with a, b baked in (legacy, for comparison).
+    (aH+b)^n with a, b baked in (legacy, no caching).
+
+Filter modes (--filter_mode)
+-----------------------------
+explosion (default)
+    Amplifies E < E_lo, suppresses E ∈ [E_lo, E_hi].
+    Use when you want eigenvalues BELOW a threshold, e.g. --E_lo 5.
+bandpass
+    Narrow window; Test 2 checks eigenvalues inside [E_lo, E_hi].
+
+E_hi
+----
+Omit --E_hi to auto-compute:  E_hi = max_kinetic + max_HO_potential on grid.
+  max_kinetic   = 0.5 * 3 * (π/dx)²   (3D Nyquist corner)
+  max_potential = 0.5 * 3 * (L-dx)²   (HO at farthest grid point)
 
 Usage
 -----
-    python test_symbolic_ho3d.py                              # both tests, H^n
+    python test_symbolic_ho3d.py                              # explosion, auto E_hi
     python test_symbolic_ho3d.py --quick                      # Test 1 only
-    python test_symbolic_ho3d.py --N 6 --E_lo 0.5 --E_hi 6.5
-    python test_symbolic_ho3d.py --method scaled              # legacy path
-    python test_symbolic_ho3d.py --outdir /scratch/myresults  # custom output root
+    python test_symbolic_ho3d.py --m 8 --E_lo 5.0            # target E < 5
+    python test_symbolic_ho3d.py --filter_mode bandpass --E_lo 0.5 --E_hi 6.5
+    python test_symbolic_ho3d.py --no_cache                   # always recompute H^n
 """
 
 import argparse
 import datetime
 import json
+import pickle
 import shutil
 import sys
 import tempfile
@@ -47,98 +59,19 @@ import numpy as np
 import sympy as sp
 
 from symbolic_code.h_powers import (
-    apply_H_on_pair,
-    generate_H_powers,
-    generate_scaled_H_powers,
+    apply_H_on_pair, generate_H_powers, generate_scaled_H_powers,
 )
 from symbolic_code.chebyshev_filter import (
     chebyshev_coeffs_transformed,
-    apply_f_of_H_from_raw_powers,
-    apply_f_of_H_on_psi,
-    extract_cos_sin_coeffs,
-    svd_H,
+    apply_f_of_H_from_raw_powers, apply_f_of_H_on_psi,
+    extract_cos_sin_coeffs, svd_H,
 )
 from symbolic_code.filter_plot import plot_chebyshev_filter
 
 
-# ---------------------------------------------------------------------------
-# Results-folder helpers
-# ---------------------------------------------------------------------------
-
-def make_run_dir(outdir, N, E_lo, E_hi, method):
-    """Create and return a timestamped run directory inside *outdir*."""
-    ts  = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    tag = f'N{N}_E{E_lo:.2f}-{E_hi:.2f}_{method}'
-    run_dir = Path(outdir) / f'run_{ts}_{tag}'
-    run_dir.mkdir(parents=True, exist_ok=True)
-    return run_dir
-
-
-def save_filter_plot(run_dir, N, E_lo, E_hi, recovered_eigs=None):
-    """Plot |T_N(aE+b)| and save PNG to *run_dir*.
-
-    Exact HO eigenvalues are shown as tick markers.  If *recovered_eigs* is
-    given (after Test 2), a second file is saved with both sets overlaid.
-    Returns the filename of the primary plot.
-    """
-    exact_eigs = [1.5, 2.5, 2.5, 2.5, 3.5, 3.5, 3.5, 3.5, 3.5, 3.5]
-    fname = f'filter_N{N}_E{E_lo:.2f}-{E_hi:.2f}.png'
-    out   = run_dir / fname
-    plot_chebyshev_filter(
-        m_list=[N],
-        E_lo=E_lo, E_hi=E_hi,
-        mode='bandpass',
-        eigenvalues=exact_eigs,
-        out_path=str(out),
-    )
-    import matplotlib.pyplot as plt
-    plt.close('all')
-
-    if recovered_eigs is not None:
-        fname2 = f'filter_N{N}_E{E_lo:.2f}-{E_hi:.2f}_recovered.png'
-        out2   = run_dir / fname2
-        fig, ax = plot_chebyshev_filter(
-            m_list=[N],
-            E_lo=E_lo, E_hi=E_hi,
-            mode='bandpass',
-            eigenvalues=exact_eigs,
-        )
-        # overlay recovered eigenvalues in a different colour
-        rec = np.asarray(recovered_eigs)
-        ybot = ax.get_ylim()[0]
-        ax.scatter(
-            rec, np.full_like(rec, ybot),
-            marker='v', s=40, color='steelblue', zorder=5,
-            label='recovered',
-        )
-        ax.legend(fontsize=9, ncol=2, loc='upper right')
-        fig.savefig(str(out2), dpi=150, bbox_inches='tight')
-        plt.close('all')
-        print(f'  Saved -> {out2}')
-
-    return fname
-
-
-def write_json(run_dir, data):
-    """Serialise *data* to run_dir/results.json (numpy-safe)."""
-    def _cvt(obj):
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, (np.integer, np.floating)):
-            return obj.item()
-        if isinstance(obj, Path):
-            return str(obj)
-        raise TypeError(f'Not JSON-serialisable: {type(obj)}')
-
-    out = run_dir / 'results.json'
-    with open(out, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, default=_cvt)
-    print(f'  Results JSON -> {out}')
-
-
-# ---------------------------------------------------------------------------
-# Grid and FFT helpers
-# ---------------------------------------------------------------------------
+# ============================================================
+# Grid helpers
+# ============================================================
 
 def make_grid(L=5.5, N=22):
     """Return 1-D coordinate array and 3-D meshgrids for [-L, L)."""
@@ -164,67 +97,262 @@ def fft_apply_H(psi3d, x1, V3d):
     return Hkin + V3d * psi3d
 
 
-# ---------------------------------------------------------------------------
+def estimate_E_hi(L, N_grid, pref=0.5):
+    """Upper bound on H eigenvalues representable on the grid.
+
+    T_max = pref * 3 * (pi/dx)^2   – kinetic energy at 3-D Nyquist corner
+    V_max = pref * 3 * (L-dx)^2    – HO potential at farthest grid point
+    """
+    dx    = 2.0 * L / N_grid
+    k_max = np.pi / dx
+    T_max = pref * 3.0 * k_max ** 2
+    x_max = L - dx
+    V_max = pref * 3.0 * x_max ** 2
+    return T_max + V_max
+
+
+# ============================================================
+# Exact 3D HO spectrum
+# ============================================================
+
+def ho3d_spectrum(E_max):
+    """Sorted list of exact 3D HO eigenvalues (with degeneracy) <= E_max.
+
+    E_n = n + 1.5,  deg(n) = (n+1)(n+2)/2,  n = nx+ny+nz.
+    """
+    eigs = []
+    for n in range(int(E_max) + 2):
+        E = n + 1.5
+        if E > E_max + 1e-10:
+            break
+        deg = (n + 1) * (n + 2) // 2
+        eigs.extend([float(E)] * deg)
+    return sorted(eigs)
+
+
+# ============================================================
+# H^n cache management (HO 3D specific)
+# ============================================================
+
+def _max_cached_power(cache_dir):
+    """Return the highest n for which H_power_n.pkl exists, or -1."""
+    cache_dir = Path(cache_dir)
+    if not cache_dir.exists():
+        return -1
+    ns = []
+    for f in cache_dir.glob('H_power_*.pkl'):
+        try:
+            ns.append(int(f.stem.split('_')[-1]))
+        except (ValueError, IndexError):
+            pass
+    return max(ns) if ns else -1
+
+
+def _extend_H_powers_cache(cache_dir, m_target, V, kvec, k2, pref, x, y, z):
+    """Ensure H_power_0.pkl … H_power_{m_target}.pkl exist in cache_dir.
+
+    If cache already has powers up to some n < m_target, extends from there
+    so that previously computed work is not repeated.
+    If cache is empty, computes from scratch via generate_H_powers.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    max_n = _max_cached_power(cache_dir)
+
+    if max_n >= m_target:
+        return  # already sufficient
+
+    if max_n < 0:
+        # Empty cache – compute everything from scratch
+        generate_H_powers(
+            m_target, cache_dir, file_format='pkl',
+            V=V, kvec=kvec, k2=k2, pref=pref, x=x, y=y, z=z,
+        )
+        return
+
+    # Extend H^(max_n+1) … H^m_target continuing from cached H^max_n
+    print(f"  Extending cache: H^{max_n+1} … H^{m_target} ...")
+    with open(cache_dir / f'H_power_{max_n}.pkl', 'rb') as fh:
+        data = pickle.load(fh)
+    Ps, Pc = data['Ps'], data['Pc']
+
+    for n in range(max_n + 1, m_target + 1):
+        print(f"    H^{n} ...", end=' ', flush=True)
+        Ps_H, Pc_H = apply_H_on_pair(Ps, Pc, V, kvec, k2, pref, x, y, z)
+        Ps = sp.expand(Ps_H)
+        Pc = sp.expand(Pc_H)
+        with open(cache_dir / f'H_power_{n}.pkl', 'wb') as fh:
+            pickle.dump({'Ps': Ps, 'Pc': Pc}, fh)
+        print('✓')
+
+    # Guard: ensure n=0 entry exists (always trivial but required by loader)
+    p0 = cache_dir / 'H_power_0.pkl'
+    if not p0.exists():
+        with open(p0, 'wb') as fh:
+            pickle.dump({'Ps': sp.Integer(1), 'Pc': sp.Integer(0)}, fh)
+
+
+# ============================================================
 # Symbolic helpers
-# ---------------------------------------------------------------------------
+# ============================================================
 
 def ho_potential_sympy():
-    """Return HO potential as sympy expression plus (x, y, z) symbols."""
+    """Return HO potential as sympy expression + (x, y, z) symbols."""
     x, y, z = sp.symbols('x y z')
     V = sp.Rational(1, 2) * (x**2 + y**2 + z**2)
     return V, x, y, z
 
 
-def build_fH_psi_sympy(N_cheby, E_lo, E_hi, method='H_powers'):
+def build_fH_psi_sympy(m, E_lo, E_hi, method='H_powers', cache_dir=None):
     """Compute f(H)*psi symbolically.  Returns (psi_fH, source_info dict).
 
-    source_info records where / how the H-power expressions were built, so
-    it can be written verbatim into results.json.
+    For method='H_powers' with a cache_dir:
+      - Checks cache for existing H_power_n.pkl files
+      - Loads from cache if all 0..m are present; extends/computes otherwise
+      - Saves newly computed powers to cache_dir for future reuse
+
+    source_info is written verbatim into results.json.
     """
     V_sym, x, y, z = ho_potential_sympy()
     kx, ky, kz, b  = sp.symbols('kx ky kz b')
     kvec = (kx, ky, kz)
     k2   = kx**2 + ky**2 + kz**2
-
     a    =  2.0 / (E_hi - E_lo)
     b_sc = -(E_hi + E_lo) / (E_hi - E_lo)
 
-    tmpdir = tempfile.mkdtemp(prefix='ho_hpow_')
-    source_info = {
-        'h_powers_source' : 'computed_fresh',
-        'h_powers_tmpdir' : tmpdir,   # cleaned up before function returns
-        'h_powers_method' : method,
-        'chebyshev_a'     : a,
-        'chebyshev_b'     : b_sc,
-    }
-    try:
-        if method == 'H_powers':
-            generate_H_powers(
-                N_cheby, tmpdir, file_format='pkl',
-                V=V_sym, kvec=kvec, k2=k2, pref=0.5,
-                x=x, y=y, z=z,
-            )
-            psi_fH = apply_f_of_H_from_raw_powers(tmpdir, N_cheby, a=a, b=b_sc)
+    if method == 'H_powers' and cache_dir is not None:
+        cache_dir  = Path(cache_dir)
+        max_n      = _max_cached_power(cache_dir)
+        from_cache = (max_n >= m)
+
+        if not from_cache:
+            print(f"  H^n cache: max_n={max(max_n, 0)}, need {m} → computing …")
+            _extend_H_powers_cache(cache_dir, m, V_sym, kvec, k2, 0.5, x, y, z)
         else:
-            coeffs = chebyshev_coeffs_transformed(N_cheby, a=a, b=b_sc)
-            generate_scaled_H_powers(
-                N_cheby, a, b_sc, outdir=tmpdir, file_format='pkl',
-                V=V_sym, kvec=kvec, k2=k2, pref=0.5,
-                x=x, y=y, z=z,
-            )
-            psi_fH = apply_f_of_H_on_psi(tmpdir, coeffs, N_cheby, file_type='pkl')
-    finally:
-        shutil.rmtree(tmpdir)
+            print(f"  H^n cache hit: loading H^0..{m} from {cache_dir}")
+
+        psi_fH = apply_f_of_H_from_raw_powers(cache_dir, m, a=a, b=b_sc)
+        source_info = {
+            'h_powers_source'     : str(cache_dir.resolve()),
+            'h_powers_from_cache' : from_cache,
+            'h_powers_method'     : method,
+            'chebyshev_a'         : a,
+            'chebyshev_b'         : b_sc,
+        }
+
+    else:
+        # No cache: compute in a temp directory, delete after use
+        tmpdir = tempfile.mkdtemp(prefix='ho_hpow_')
+        source_info = {
+            'h_powers_source'     : 'computed_fresh',
+            'h_powers_from_cache' : False,
+            'h_powers_method'     : method,
+            'chebyshev_a'         : a,
+            'chebyshev_b'         : b_sc,
+        }
+        try:
+            if method == 'H_powers':
+                generate_H_powers(
+                    m, tmpdir, file_format='pkl',
+                    V=V_sym, kvec=kvec, k2=k2, pref=0.5, x=x, y=y, z=z,
+                )
+                psi_fH = apply_f_of_H_from_raw_powers(tmpdir, m, a=a, b=b_sc)
+            else:
+                coeffs = chebyshev_coeffs_transformed(m, a=a, b=b_sc)
+                generate_scaled_H_powers(
+                    m, a, b_sc, outdir=tmpdir, file_format='pkl',
+                    V=V_sym, kvec=kvec, k2=k2, pref=0.5, x=x, y=y, z=z,
+                )
+                psi_fH = apply_f_of_H_on_psi(tmpdir, coeffs, m, file_type='pkl')
+        finally:
+            shutil.rmtree(tmpdir)
 
     return psi_fH, source_info
 
 
-# ---------------------------------------------------------------------------
+# ============================================================
+# Results-folder helpers
+# ============================================================
+
+def make_run_dir(outdir, m, E_lo, E_hi, method):
+    """Create and return a timestamped run directory inside *outdir*."""
+    ts      = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    tag     = f'm{m}_E{E_lo:.2f}-{E_hi:.2f}_{method}'
+    run_dir = Path(outdir) / f'run_{ts}_{tag}'
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def save_filter_plot(run_dir, m, E_lo, E_hi, filter_mode, recovered_eigs=None):
+    """Plot |T_m(aE+b)| and save PNG.  Returns primary filename.
+
+    Exact HO eigenvalues appropriate to the filter mode are shown as markers.
+    If *recovered_eigs* is given, a second '_recovered' file is also written.
+    """
+    import matplotlib.pyplot as plt
+
+    # Choose eigenvalue markers based on filter mode
+    if filter_mode == 'explosion':
+        markers = sorted(set(ho3d_spectrum(E_lo - 1e-10)))  # E < E_lo
+    else:
+        markers = sorted(set(
+            e for e in ho3d_spectrum(E_hi) if E_lo <= e <= E_hi
+        ))
+
+    fname = f'filter_m{m}_E{E_lo:.2f}-{E_hi:.2f}.png'
+    plot_chebyshev_filter(
+        m_list=[m],
+        E_lo=E_lo, E_hi=E_hi,
+        mode=filter_mode,
+        eigenvalues=markers or None,
+        out_path=str(run_dir / fname),
+    )
+    plt.close('all')
+
+    if recovered_eigs is not None:
+        fname2 = f'filter_m{m}_E{E_lo:.2f}-{E_hi:.2f}_recovered.png'
+        fig, ax = plot_chebyshev_filter(
+            m_list=[m],
+            E_lo=E_lo, E_hi=E_hi,
+            mode=filter_mode,
+            eigenvalues=markers or None,
+        )
+        rec  = np.asarray(recovered_eigs)
+        ybot = ax.get_ylim()[0]
+        ax.scatter(rec, np.full_like(rec, ybot),
+                   marker='v', s=40, color='steelblue', zorder=5,
+                   label='recovered')
+        ax.legend(fontsize=9, ncol=2, loc='upper right')
+        fig.savefig(str(run_dir / fname2), dpi=150, bbox_inches='tight')
+        print(f'  Saved -> {run_dir / fname2}')
+        plt.close('all')
+
+    return fname
+
+
+def write_json(run_dir, data):
+    """Serialise *data* to run_dir/results.json (numpy-safe)."""
+    def _cvt(obj):
+        if isinstance(obj, np.ndarray):              return obj.tolist()
+        if isinstance(obj, (np.integer, np.floating)): return obj.item()
+        if isinstance(obj, Path):                    return str(obj)
+        raise TypeError(f'Not JSON-serialisable: {type(obj)}')
+
+    out = run_dir / 'results.json'
+    with open(out, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, default=_cvt)
+    print(f'  Results JSON -> {out}')
+
+
+# ============================================================
 # Test 1 – single H step
-# ---------------------------------------------------------------------------
+# ============================================================
 
 def test_single_H_step():
     """Verify symbolic H*psi matches FFT H*psi for grid-aligned k.
+
+    Only grid-aligned k vectors (k ∈ 2π/L·ℤ) give an exact FFT kinetic
+    energy.  Expected max error < 1e-8 (floating-point only).
 
     Returns (ok, result_dict).
     """
@@ -237,7 +365,6 @@ def test_single_H_step():
     x1, X, Y, Z = make_grid(L=L, N=N)
     V3d = 0.5 * (X**2 + Y**2 + Z**2)
 
-    # Grid-aligned k: only these give an FFT kinetic energy that is exact.
     k_grid  = grid_kvecs(x1)
     small_k = k_grid[k_grid > 0][:4]   # e.g. ~[0.628, 1.257, 1.885, 2.513]
 
@@ -246,19 +373,19 @@ def test_single_H_step():
     kvec = (kx_s, ky_s, kz_s)
     k2   = kx_s**2 + ky_s**2 + kz_s**2
 
-    # Analytical H*sin(k·r+b) = (0.5k² + 0.5r²)*sin(k·r+b)
+    # Analytical result: H*sin(k·r+b) = (0.5k² + 0.5r²)*sin(k·r+b)
     Ps_new, Pc_new = apply_H_on_pair(
         sp.Integer(1), sp.Integer(0),
         V_sym, kvec, k2, 0.5, xs, ys, zs,
     )
     theta_sym = kx_s*xs + ky_s*ys + kz_s*zs + b_s
     Hpsi_expr = Ps_new * sp.sin(theta_sym) + Pc_new * sp.cos(theta_sym)
-    f_Hpsi = sp.lambdify(
+    f_Hpsi    = sp.lambdify(
         [xs, ys, zs, kx_s, ky_s, kz_s, b_s], Hpsi_expr, 'numpy'
     )
 
     rng = np.random.default_rng(0)
-    b_vals = rng.uniform(0, np.pi, 6)
+    b_vals    = rng.uniform(0, np.pi, 6)
     k_triples = [
         (small_k[0], small_k[1], small_k[2]),
         (small_k[1], small_k[0], small_k[3]),
@@ -275,13 +402,12 @@ def test_single_H_step():
         Hpsi_sym = f_Hpsi(X, Y, Z, kx_v, ky_v, kz_v, b_v)
         err = float(np.max(np.abs(Hpsi_sym - Hpsi_num)))
         errors.append(err)
-        print(f"  k=({kx_v:+.3f},{ky_v:+.3f},{kz_v:+.3f})  "
-              f"max|sym-FFT| = {err:.2e}")
+        print(f"  k=({kx_v:+.3f},{ky_v:+.3f},{kz_v:+.3f})  max|sym-FFT| = {err:.2e}")
 
     max_err = max(errors)
     ok      = max_err < 1e-8
     runtime = time.time() - t0
-    print(f"\n  Max error: {max_err:.2e}  →  {'PASSED ✓' if ok else 'FAILED ✗'}")
+    print(f"\n  Max error: {max_err:.2e}  → {'PASSED ✓' if ok else 'FAILED ✗'}")
 
     return ok, {
         'name'       : 'single_H_step',
@@ -292,32 +418,51 @@ def test_single_H_step():
     }
 
 
-# ---------------------------------------------------------------------------
+# ============================================================
 # Test 2 – filter diagonalisation
-# ---------------------------------------------------------------------------
+# ============================================================
 
-def test_filter_diag(N_cheby=4, E_lo=0.5, E_hi=6.5,
-                     n_waves=60, method='H_powers'):
+def test_filter_diag(m=6, E_lo=4.5, E_hi=None, L=5.5, Ng=22,
+                     n_waves=60, method='H_powers', cache_dir=None,
+                     filter_mode='explosion'):
     """Full Chebyshev pipeline: build, evaluate, diagonalise, compare.
+
+    filter_mode='explosion': target eigenvalues < E_lo (amplified region).
+    filter_mode='bandpass':  target eigenvalues in [E_lo, E_hi].
 
     Returns (ok, result_dict).
     """
+    if E_hi is None:
+        E_hi = estimate_E_hi(L, Ng)
+
+    # Exact target eigenvalues depend on filter mode
+    if filter_mode == 'explosion':
+        exact = np.array(ho3d_spectrum(E_lo - 1e-10))   # E strictly < E_lo
+    else:
+        exact = np.array([
+            e for e in ho3d_spectrum(E_hi) if E_lo <= e <= E_hi
+        ])
+
     print("\n" + "="*60)
     print(f"Test 2: filter diagonalisation on 3D HO")
-    print(f"        N_cheby={N_cheby}  E=[{E_lo}, {E_hi}]  method={method}")
+    print(f"        m={m}  E_lo={E_lo}  E_hi={E_hi:.4f}  "
+          f"mode={filter_mode}  method={method}")
+    target_desc = f'E < {E_lo}' if filter_mode == 'explosion' else f'E ∈ [{E_lo}, {E_hi}]'
+    print(f"        target: {len(exact)} eigenvalue(s) with {target_desc}")
     print("="*60)
 
     t_total = time.time()
-    L, Ng = 5.5, 22
 
-    # ---- Step A: build f(H)*psi symbolically ----
-    print(f"  Building symbolic f(H)*psi (method={method}) ...")
+    # ---- build symbolic f(H)*psi ----
+    print("  Building symbolic f(H)*psi ...")
     t0 = time.time()
-    psi_fH, source_info = build_fH_psi_sympy(N_cheby, E_lo, E_hi, method=method)
+    psi_fH, source_info = build_fH_psi_sympy(
+        m, E_lo, E_hi, method=method, cache_dir=cache_dir
+    )
     build_time = time.time() - t0
     print(f"  Done in {build_time:.1f} s")
 
-    # ---- Step B: lambdify ----
+    # ---- lambdify ----
     expr_cos, expr_sin = extract_cos_sin_coeffs(psi_fH)
     xs, ys, zs = sp.symbols('x y z')
     kx_s, ky_s, kz_s, b_s = sp.symbols('kx ky kz b')
@@ -326,15 +471,14 @@ def test_filter_diag(N_cheby=4, E_lo=0.5, E_hi=6.5,
     f_cos = sp.lambdify(sym_args, expr_cos, 'numpy')
     f_sin = sp.lambdify(sym_args, expr_sin, 'numpy')
 
-    # ---- Step C: numerical grid ----
+    # ---- numerical grid ----
     x1, X, Y, Z = make_grid(L=L, N=Ng)
     V3d = 0.5 * (X**2 + Y**2 + Z**2)
 
-    # ---- Step D: evaluate f(H)*psi for n_waves plane waves ----
+    # ---- evaluate f(H)*psi for many plane waves ----
     rng    = np.random.default_rng(42)
     k_vals = rng.uniform(-1.5, 1.5, (n_waves, 3))
     b_vals = rng.uniform(0, 2 * np.pi, n_waves)
-
     print(f"  Evaluating for {n_waves} plane waves ...")
     C_f = np.zeros((n_waves, Ng, Ng, Ng), dtype=np.float64)
     for iw, (kv, bv) in enumerate(zip(k_vals, b_vals)):
@@ -344,54 +488,58 @@ def test_filter_diag(N_cheby=4, E_lo=0.5, E_hi=6.5,
         fs = np.asarray(f_sin(X, Y, Z, kx_v, ky_v, kz_v, bv), dtype=float)
         C_f[iw] = fc * np.cos(phase) + fs * np.sin(phase)
 
-    # ---- Step E: SVD filter diagonalisation ----
+    # ---- SVD filter diagonalisation ----
     print("  SVD filter diagonalisation ...")
     energies, _ = svd_H(
-        C_f, Ng, Ng, Ng,
-        x1, V3d, fft_apply_H,
-        rank_threshold=1e-4,
-        n_eigs=15,
+        C_f, Ng, Ng, Ng, x1, V3d, fft_apply_H,
+        rank_threshold=1e-4, n_eigs=max(len(exact) + 5, 15),
     )
 
-    # ---- Step F: compare to exact HO eigenvalues ----
-    exact_lo  = np.array([1.5, 2.5, 2.5, 2.5, 3.5, 3.5, 3.5, 3.5, 3.5, 3.5])
-    n_show    = min(len(energies), 10)
-    n_compare = min(len(energies), len(exact_lo))
-    errs      = np.abs(np.sort(energies[:n_compare]) - exact_lo[:n_compare])
+    # ---- compare recovered vs exact ----
+    n_show    = min(len(energies), max(len(exact), 10))
+    n_compare = min(len(energies), len(exact))
+    recovered = np.sort(energies[:n_show])
 
-    e0_err      = abs(float(energies[0]) - 1.5)
+    if n_compare > 0:
+        errs   = np.abs(recovered[:n_compare] - exact[:n_compare])
+        e0_err = abs(float(recovered[0]) - float(exact[0]))
+    else:
+        errs, e0_err = np.array([]), float('inf')
+
     ok_e0       = e0_err < 0.03
     n_good      = int(np.sum(errs < 0.1))
-    ok_spectrum = n_good >= 4
+    ok_spectrum = n_good >= min(4, len(exact))
     ok          = ok_e0 and ok_spectrum
     runtime     = time.time() - t_total
 
-    print(f"\n  Recovered eigenvalues : {np.round(energies[:n_show], 4)}")
-    print(f"  Exact HO eigenvalues  : {exact_lo[:n_show]}")
+    print(f"\n  Recovered eigenvalues : {np.round(recovered[:10], 4)}")
+    print(f"  Exact eigenvalues     : {np.round(exact[:10], 4)}")
     print(f"\n  E_0 error = {e0_err:.4f}  (threshold 0.03)  "
           f"→ {'OK' if ok_e0 else 'FAIL'}")
     print(f"  Eigenvalues within 0.1 of exact: "
-          f"{n_good}/{n_compare}  (need ≥4)  "
+          f"{n_good}/{n_compare}  (need ≥{min(4, len(exact))})  "
           f"→ {'OK' if ok_spectrum else 'FAIL'}")
     print(f"  {'PASSED ✓' if ok else 'FAILED ✗'}")
 
     return ok, {
-        'name'                : 'filter_diagonalisation',
-        'status'              : 'PASSED' if ok else 'FAILED',
-        'runtime_s'           : runtime,
-        'build_time_s'        : build_time,
+        'name'               : 'filter_diagonalisation',
+        'status'             : 'PASSED' if ok else 'FAILED',
+        'runtime_s'          : runtime,
+        'build_time_s'       : build_time,
+        'filter_mode'        : filter_mode,
+        'E_hi'               : E_hi,
         **source_info,
-        'energies_recovered'  : [float(e) for e in energies[:n_show]],
-        'energies_exact'      : exact_lo[:n_show].tolist(),
-        'e0_error'            : e0_err,
-        'n_within_0.1'        : n_good,
-        'n_compare'           : n_compare,
+        'energies_recovered' : [float(e) for e in recovered],
+        'energies_exact'     : [float(e) for e in exact],
+        'e0_error'           : e0_err,
+        'n_within_0.1'       : n_good,
+        'n_compare'          : n_compare,
     }
 
 
-# ---------------------------------------------------------------------------
+# ============================================================
 # Main
-# ---------------------------------------------------------------------------
+# ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -399,40 +547,73 @@ def main():
     )
     parser.add_argument('--quick', action='store_true',
                         help='Only run Test 1 (single H step, ~seconds)')
-    parser.add_argument('--N', type=int, default=4,
-                        help='Chebyshev expansion order (default 4)')
-    parser.add_argument('--E_lo', type=float, default=0.5,
-                        help='Lower energy bound (default 0.5)')
-    parser.add_argument('--E_hi', type=float, default=6.5,
-                        help='Upper energy bound (default 6.5)')
+    parser.add_argument('--m', type=int, default=6,
+                        help='Chebyshev order m (default 6)')
+    parser.add_argument('--E_lo', type=float, default=4.5,
+                        help='Energy threshold: amplify E < E_lo (default 4.5)')
+    parser.add_argument('--E_hi', type=float, default=None,
+                        help='Upper energy bound; auto-computed from grid if omitted')
+    parser.add_argument('--L', type=float, default=5.5,
+                        help='Half-box size for grid (default 5.5)')
+    parser.add_argument('--Ng', type=int, default=22,
+                        help='Grid points per axis (default 22)')
     parser.add_argument('--n_waves', type=int, default=60,
                         help='Number of random plane waves (default 60)')
     parser.add_argument('--method', default='H_powers',
                         choices=['H_powers', 'scaled'],
-                        help='H_powers=pure H^n (default), scaled=(aH+b)^n')
+                        help='H_powers=pure H^n (default); scaled=(aH+b)^n')
+    parser.add_argument('--filter_mode', default='explosion',
+                        choices=['explosion', 'bandpass'],
+                        help='explosion: find E<E_lo (default); '
+                             'bandpass: find E in [E_lo,E_hi]')
+    parser.add_argument('--cache_dir', default='ho3d_h_powers_cache',
+                        help='Persistent cache for H^n pkl files '
+                             '(default ho3d_h_powers_cache/)')
+    parser.add_argument('--no_cache', action='store_true',
+                        help='Disable H^n cache (always recompute, no saving)')
     parser.add_argument('--outdir', default='results',
-                        help='Root folder for timestamped run dirs (default: results/)')
+                        help='Root folder for timestamped run dirs (default results/)')
     args = parser.parse_args()
 
+    # Auto-compute E_hi if not provided
+    E_hi = args.E_hi
+    if E_hi is None:
+        E_hi = estimate_E_hi(args.L, args.Ng)
+        dx    = 2.0 * args.L / args.Ng
+        T_max = 0.5 * 3 * (np.pi / dx) ** 2
+        V_max = 0.5 * 3 * (args.L - dx) ** 2
+        print(f"Auto E_hi = {E_hi:.4f}  "
+              f"(T_max={T_max:.2f} + V_max={V_max:.2f}, "
+              f"grid {args.Ng}³, L={args.L})")
+
+    cache_dir = None if args.no_cache else args.cache_dir
+
     # ---- create run directory ----
-    run_dir = make_run_dir(args.outdir, args.N, args.E_lo, args.E_hi, args.method)
+    run_dir = make_run_dir(args.outdir, args.m, args.E_lo, E_hi, args.method)
     print(f"\nRun directory: {run_dir}\n")
 
-    # ---- plot filter immediately (no H^n computation needed) ----
+    # ---- plot filter immediately (no H^n computation required) ----
     print("Plotting Chebyshev filter ...")
-    filter_fname = save_filter_plot(run_dir, args.N, args.E_lo, args.E_hi)
+    filter_fname = save_filter_plot(
+        run_dir, args.m, args.E_lo, E_hi, args.filter_mode
+    )
 
     # ---- initialise JSON payload ----
     run_meta = {
-        'timestamp' : datetime.datetime.now().isoformat(),
-        'run_dir'   : str(run_dir),
-        'args'      : {
-            'N'       : args.N,
-            'E_lo'    : args.E_lo,
-            'E_hi'    : args.E_hi,
-            'n_waves' : args.n_waves,
-            'method'  : args.method,
-            'quick'   : args.quick,
+        'timestamp'   : datetime.datetime.now().isoformat(),
+        'run_dir'     : str(run_dir),
+        'args'        : {
+            'm'           : args.m,
+            'E_lo'        : args.E_lo,
+            'E_hi'        : E_hi,
+            'E_hi_auto'   : args.E_hi is None,
+            'L'           : args.L,
+            'Ng'          : args.Ng,
+            'n_waves'     : args.n_waves,
+            'method'      : args.method,
+            'filter_mode' : args.filter_mode,
+            'cache_dir'   : str(cache_dir) if cache_dir else None,
+            'quick'       : args.quick,
         },
         'filter_plot' : filter_fname,
     }
@@ -446,19 +627,23 @@ def main():
 
     if not args.quick:
         ok2, data2 = test_filter_diag(
-            N_cheby=args.N,
+            m=args.m,
             E_lo=args.E_lo,
-            E_hi=args.E_hi,
+            E_hi=E_hi,
+            L=args.L,
+            Ng=args.Ng,
             n_waves=args.n_waves,
             method=args.method,
+            cache_dir=cache_dir,
+            filter_mode=args.filter_mode,
         )
         all_ok['Test2_filter_diag'] = ok2
         run_meta['test2'] = data2
 
-        # second plot: overlay recovered eigenvalues
+        # Second plot: overlay recovered eigenvalues
         print("\nSaving filter plot with recovered eigenvalues ...")
         save_filter_plot(
-            run_dir, args.N, args.E_lo, args.E_hi,
+            run_dir, args.m, args.E_lo, E_hi, args.filter_mode,
             recovered_eigs=data2.get('energies_recovered'),
         )
 
@@ -475,6 +660,8 @@ def main():
     for name, ok in all_ok.items():
         print(f"  {name:<30} {'PASSED ✓' if ok else 'FAILED ✗'}")
     print(f"\n  Results saved in: {run_dir}")
+    if cache_dir:
+        print(f"  H^n cache:        {Path(cache_dir).resolve()}")
 
     sys.exit(0 if all(all_ok.values()) else 1)
 
