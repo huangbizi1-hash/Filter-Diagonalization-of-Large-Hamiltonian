@@ -2,36 +2,34 @@
 """benchmark_cse_threshold.py
 Test CSE occurrence-count thresholds to find the optimal register-pressure / FLOP tradeoff.
 
-Background
-----------
-sp.cse() creates a replacement temp _si = expr_i whenever expr_i appears
-more than once in the input polynomials.  The "occurrence count" of _si is
-how many times it appears in subsequent expressions (later temps + reduced
-expressions).  All temps have count >= 1.
+Two CSE strategies are compared
+--------------------------------
+flat_cse   (existing)
+    sp.cse() is applied to the raw flat-expanded polynomial groups returned by
+    group_by_exp_combined.  The 2037 shared sub-expressions are mostly low-level
+    monomials (x^2, x^2*y^2, ...) — dense-but-small, causing register pressure
+    when all kept.
 
-Keeping ALL 2330 temps produces register pressure (CPU has ~16-32 float
-registers) → stack spills → factor-350x slowdown vs Horner.
-
-A threshold T keeps only temps with count >= T, inlining the rest.
-This trades fewer local variables (less register pressure) against some
-repeated computations (the inlined expressions are evaluated wherever they
-were used).
+horner_cse (new, "baseline + CSE")
+    apply_horner() is called first (same as the Horner baseline), then sp.cse()
+    is applied to the resulting compact nested expressions.  The hope is that
+    Horner already factors out r2 = x^2+y^2+z^2 and k2 = kx^2+ky^2+kz^2 as
+    natural repeated structures, so CSE finds only a handful of high-level temps.
+    If n_kept drops to << 30, all temps fit in registers → performance comparable
+    to or better than baseline.
 
 Expected outcome
 ----------------
-  T = 1     : keep everything → same as cse_inlined, ~220ms/wave
-  T = 2-5   : inline "chain" temps (used once) → fewer vars, still large
-  T = ~20+  : keep only genuinely shared sub-monomials → O(100) vars
-  T = large : almost nothing kept → degenerates toward no_horner / flat poly
-
-The sweet spot is where n_kept drops below ~30-50 so all temps fit in
-registers without spilling.
+  flat_cse T=20   : ~116 kept → 100 ms/wave (register pressure)
+  horner_cse T=1  : few kept (r2, k2, H?) → close to 0.642 ms/wave?
 
 Usage
 -----
   python benchmark_cse_threshold.py --m 8 --n_waves 20
-  python benchmark_cse_threshold.py --m 8 --n_waves 20 --thresholds 2,5,10,30,100
-  python benchmark_cse_threshold.py --m 8 --distribution_only   # just show histogram
+  python benchmark_cse_threshold.py --m 8 --distribution_only   # fast: just histograms
+  python benchmark_cse_threshold.py --m 8 --n_waves 20 --thresholds 1,5,20,50
+  python benchmark_cse_threshold.py --m 8 --n_waves 20 --mode flat   # skip horner_cse
+  python benchmark_cse_threshold.py --m 8 --n_waves 20 --mode horner # skip flat_cse
 """
 
 import argparse
@@ -51,6 +49,7 @@ from benchmark_strategies import (
     _EVAL_SIG, _TRIG_BLOCK, run_julia, prepare_expressions,
     build_baseline,
 )
+from symbolic_code.chebyshev_filter import apply_horner
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +78,7 @@ def count_cse_occurrences(repl, reduced):
     return counts
 
 
-def show_count_distribution(counts, thresholds=None):
+def show_count_distribution(counts, thresholds=None, title='CSE occurrence-count distribution'):
     """Print a text histogram of CSE occurrence counts and a threshold table."""
     vals = list(counts.values())
     hist = Counter(vals)
@@ -89,7 +88,7 @@ def show_count_distribution(counts, thresholds=None):
         thresholds = [1, 2, 3, 4, 5, 8, 10, 15, 20, 30, 50, 100, 200, 500, 1000]
 
     print(f"\n{'─'*55}")
-    print(f"CSE occurrence-count distribution  ({total} total temps)")
+    print(f"{title}  ({total} total temps)")
     print(f"{'─'*55}")
     print(f"{'count':>7}  {'n_temps':>7}  {'cumul%':>7}  histogram")
     print(f"{'─'*55}")
@@ -101,7 +100,6 @@ def show_count_distribution(counts, thresholds=None):
         n = hist[c]
         cumulative += n
         pct_cum = cumulative / total * 100
-        # bar width proportional to n/total
         bar = '█' * max(1, int(n / total * 60))
         print(f"  {c:>5}  {n:>7}  {pct_cum:>6.1f}%  {bar}")
         shown += 1
@@ -122,9 +120,6 @@ def show_count_distribution(counts, thresholds=None):
     for t in thresholds:
         n_kept   = sum(1 for v in vals if v >= t)
         n_inline = total - n_kept
-        # Rough savings estimate: each inlined temp is computed
-        # (count) times instead of 1 → extra ops = (count - 1) * cost
-        # We don't have cost here, so just show count sum
         saved_count = sum(v for v in vals if v >= t)
         print(f"  {t:>4}  {n_kept:>6}  {n_kept/total*100:>6.1f}%  "
               f"{n_inline:>8}  {saved_count:>12} (count sum)")
@@ -155,19 +150,15 @@ def selective_cse_build(terms_cos, terms_sin, min_count, repl, reduced, counts,
     kept = []
 
     for sym, expr in repl:
-        # Resolve any previously inlined syms that appear in this expression
         expr_resolved = expr.xreplace(inline_map) if inline_map else expr
-
         if counts.get(sym, 0) < min_count:
-            inline_map[sym] = expr_resolved   # inline: substitute everywhere it's used
+            inline_map[sym] = expr_resolved
         else:
-            kept.append((sym, expr_resolved))  # keep: emit as Julia local variable
+            kept.append((sym, expr_resolved))
 
-    # Apply inline substitutions to the final output expressions
     final_reduced = ([r.xreplace(inline_map) for r in reduced]
                      if inline_map else list(reduced))
 
-    # Post-CSE op count: ops in kept-temp assignments + ops in final exprs
     ops_kept    = sum(int(sp.count_ops(expr)) for _, expr in kept)
     ops_reduced = sum(int(sp.count_ops(r)) for r in final_reduced)
     ops_post    = ops_kept + ops_reduced
@@ -204,6 +195,69 @@ def selective_cse_build(terms_cos, terms_sin, min_count, repl, reduced, counts,
 
 
 # ---------------------------------------------------------------------------
+# One threshold sweep
+# ---------------------------------------------------------------------------
+
+def run_threshold_sweep(terms_cos, terms_sin, thresholds, repl, reduced, counts,
+                        label_prefix, work_dir, X, Y, Z, k_vals, b_vals,
+                        outdir, julia_exe, n_reps, save_jl, reference_out):
+    """Time selective_cse_build for each threshold; return results dict."""
+    results = {}
+    for min_count in thresholds:
+        print(f'\n{"="*60}')
+        print(f'[{label_prefix}] min_count={min_count}', flush=True)
+
+        t_build = time.time()
+        jl_src, n_kept, ops_post = selective_cse_build(
+            terms_cos, terms_sin, min_count, repl, reduced, counts,
+            strategy_label=f'{label_prefix}(min_count={min_count})')
+        t_build = time.time() - t_build
+
+        jl_file = outdir / f'eval_{label_prefix}_t{min_count}_m8.jl'
+        jl_file.write_text(jl_src)
+        print(f'  n_kept={n_kept}  ops_post={ops_post}  '
+              f'.jl={len(jl_src):,} bytes  build={t_build:.1f}s')
+
+        try:
+            timing, raw_out = run_julia(
+                jl_file, X, Y, Z, k_vals, b_vals, work_dir, julia_exe,
+                n_reps=n_reps)
+        except RuntimeError as exc:
+            print(f'  JULIA FAILED: {exc}')
+            results[f'{label_prefix}_t{min_count}'] = {
+                'error': str(exc), 'min_count': min_count,
+                'label': f'{label_prefix}_t{min_count}',
+            }
+            if not save_jl:
+                jl_file.unlink(missing_ok=True)
+            continue
+
+        mspw = timing['ms_per_wave']
+        print(f'  warmup={timing["warmup_s"]*1000:.1f}ms  '
+              f'eval={mspw:.3f}ms/wave')
+
+        max_err = None
+        if reference_out is not None and raw_out is not None:
+            max_err = float(np.abs(raw_out - reference_out).max())
+            status = 'OK' if max_err < 1e-6 else 'WARNING'
+            print(f'  vs baseline: max|diff|={max_err:.2e}  [{status}]')
+
+        results[f'{label_prefix}_t{min_count}'] = {
+            'label': f'{label_prefix}_t{min_count}',
+            'min_count': min_count,
+            'n_kept': n_kept, 'ops_post': ops_post,
+            'ms_per_wave': mspw,
+            'warmup_ms': timing['warmup_s'] * 1000,
+            'max_err': max_err, 'build_time_s': t_build,
+        }
+
+        if not save_jl:
+            jl_file.unlink(missing_ok=True)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -223,10 +277,16 @@ def main():
     parser.add_argument('--thresholds', default='1,2,3,5,8,10,15,20,30,50,100,200',
                         help='Comma-separated min_count thresholds to test '
                              '(default: 1,2,3,5,8,10,15,20,30,50,100,200)')
+    parser.add_argument('--mode', default='both',
+                        choices=['flat', 'horner', 'both'],
+                        help='Which CSE strategy to sweep: '
+                             'flat=CSE on flat poly (existing), '
+                             'horner=CSE on Horner poly (new, "baseline+CSE"), '
+                             'both=run both (default)')
     parser.add_argument('--cache_dir', default='ho3d_h_powers_cache')
     parser.add_argument('--julia_exe', default='julia')
     parser.add_argument('--distribution_only', action='store_true',
-                        help='Only print CSE count distribution; skip Julia runs')
+                        help='Only print CSE count distributions; skip Julia runs')
     parser.add_argument('--save_jl', action='store_true',
                         help='Keep generated .jl files in outdir')
     parser.add_argument('--outdir', default='benchmark_results',
@@ -245,38 +305,80 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
 
     thresholds = sorted(int(t) for t in args.thresholds.split(','))
+    do_flat   = args.mode in ('flat', 'both')
+    do_horner = args.mode in ('horner', 'both')
 
     # ---- Build symbolic expressions ----
     terms_cos, terms_sin, _ = prepare_expressions(
         args.m, args.E_lo, E_hi, args.cache_dir, expand=True)
 
-    all_polys = [pp for _, pp in terms_cos] + [pp for _, pp in terms_sin]
+    # ---- Flat-poly CSE ----
+    repl = reduced = counts = None
+    if do_flat:
+        all_polys = [pp for _, pp in terms_cos] + [pp for _, pp in terms_sin]
+        print('Running sp.cse() on flat poly ...', flush=True)
+        t0 = time.time()
+        repl, reduced = sp.cse(all_polys, symbols=sp.numbered_symbols('_s'))
+        print(f'  done in {time.time()-t0:.1f}s  ({len(repl)} replacements)')
 
-    print('Running sp.cse() on flat poly ...', flush=True)
-    t0 = time.time()
-    repl, reduced = sp.cse(all_polys, symbols=sp.numbered_symbols('_s'))
-    print(f'  done in {time.time()-t0:.1f}s  ({len(repl)} replacements)', flush=True)
+        print('Counting occurrences per flat-CSE temp ...', flush=True)
+        t0 = time.time()
+        counts = count_cse_occurrences(repl, reduced)
+        print(f'  done in {time.time()-t0:.1f}s')
 
-    print('Counting occurrences per temp (may take ~30-60s) ...', flush=True)
-    t0 = time.time()
-    counts = count_cse_occurrences(repl, reduced)
-    print(f'  done in {time.time()-t0:.1f}s', flush=True)
+        show_count_distribution(counts, thresholds,
+                                title='Flat-poly CSE  (CSE on pre-Horner poly)')
 
-    show_count_distribution(counts, thresholds)
+    # ---- Horner-first CSE ----
+    repl_h = reduced_h = counts_h = None
+    terms_cos_h = terms_sin_h = None
+    if do_horner:
+        print('\nApplying Horner to all groups (same as baseline) ...', flush=True)
+        t0 = time.time()
+        terms_cos_h = apply_horner(terms_cos)
+        terms_sin_h = apply_horner(terms_sin)
+        print(f'  done in {time.time()-t0:.1f}s  '
+              f'({len(terms_cos_h)} cos groups, {len(terms_sin_h)} sin groups)')
+
+        all_horner_polys = ([pp for _, pp in terms_cos_h]
+                            + [pp for _, pp in terms_sin_h])
+        print(f'Running sp.cse() on Horner polys ({len(all_horner_polys)} polys) ...',
+              flush=True)
+        t0 = time.time()
+        repl_h, reduced_h = sp.cse(all_horner_polys,
+                                    symbols=sp.numbered_symbols('_h'))
+        print(f'  done in {time.time()-t0:.1f}s  ({len(repl_h)} replacements)')
+
+        print('Counting occurrences per Horner-CSE temp ...', flush=True)
+        t0 = time.time()
+        counts_h = count_cse_occurrences(repl_h, reduced_h)
+        print(f'  done in {time.time()-t0:.1f}s')
+
+        show_count_distribution(counts_h, thresholds,
+                                title='Horner-first CSE  (CSE on Horner poly = "baseline+CSE")')
 
     if args.distribution_only:
-        # Save distribution JSON even when not running Julia
-        dist_vals = list(counts.values())
         dist_file = outdir / f'cse_distribution_m{args.m}.json'
+        payload = {'args': {'m': args.m, 'E_lo': args.E_lo, 'E_hi': E_hi,
+                            'thresholds': thresholds, 'mode': args.mode}}
+        if do_flat and counts is not None:
+            flat_vals = list(counts.values())
+            payload['flat_cse'] = {
+                'total_temps': len(flat_vals),
+                'count_histogram': dict(Counter(flat_vals)),
+                'threshold_n_kept': {str(t): sum(1 for v in flat_vals if v >= t)
+                                     for t in thresholds},
+            }
+        if do_horner and counts_h is not None:
+            h_vals = list(counts_h.values())
+            payload['horner_cse'] = {
+                'total_temps': len(h_vals),
+                'count_histogram': dict(Counter(h_vals)),
+                'threshold_n_kept': {str(t): sum(1 for v in h_vals if v >= t)
+                                     for t in thresholds},
+            }
         with open(dist_file, 'w') as f:
-            json.dump({
-                'total_temps': len(dist_vals),
-                'count_histogram': dict(Counter(dist_vals)),
-                'threshold_analysis': {
-                    str(t): sum(1 for v in dist_vals if v >= t)
-                    for t in thresholds
-                },
-            }, f, indent=2)
+            json.dump(payload, f, indent=2)
         print(f'\nDistribution → {dist_file}')
         return
 
@@ -292,9 +394,9 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix='bench_thresh_') as work_dir:
 
-        # ---- Baseline (Horner) ----
+        # ---- Baseline (Horner, no CSE) ----
         print(f'\n{"="*60}')
-        print('Baseline: Horner')
+        print('Baseline: Horner (no explicit CSE)')
         jl_src, _, _, extra = build_baseline(terms_cos, terms_sin)
         jl_file = outdir / f'eval_baseline_m{args.m}.jl'
         jl_file.write_text(jl_src)
@@ -310,106 +412,115 @@ def main():
             'n_kept': None, 'ops_post': extra['ops_post'],
             'ms_per_wave': mspw,
             'warmup_ms': timing['warmup_s'] * 1000,
-            'max_err': 0.0
+            'max_err': 0.0,
         }
         if not args.save_jl:
             jl_file.unlink(missing_ok=True)
 
-        # ---- Each threshold ----
-        for min_count in thresholds:
-            print(f'\n{"="*60}')
-            print(f'min_count={min_count}', flush=True)
+        # ---- Flat-CSE threshold sweep ----
+        if do_flat:
+            print(f'\n{"─"*60}')
+            print('Flat-poly CSE threshold sweep  (CSE on pre-Horner poly)')
+            flat_results = run_threshold_sweep(
+                terms_cos, terms_sin, thresholds,
+                repl, reduced, counts,
+                label_prefix='cse_t',
+                work_dir=work_dir,
+                X=X, Y=Y, Z=Z, k_vals=k_vals, b_vals=b_vals,
+                outdir=outdir, julia_exe=args.julia_exe,
+                n_reps=args.n_reps, save_jl=args.save_jl,
+                reference_out=reference_out)
+            results.update(flat_results)
 
-            t_build = time.time()
-            jl_src, n_kept, ops_post = selective_cse_build(
-                terms_cos, terms_sin, min_count, repl, reduced, counts)
-            t_build = time.time() - t_build
-
-            jl_file = outdir / f'eval_cse_t{min_count}_m{args.m}.jl'
-            jl_file.write_text(jl_src)
-            print(f'  n_kept={n_kept}  ops_post={ops_post}  '
-                  f'.jl={len(jl_src):,} bytes  build={t_build:.1f}s')
-
-            try:
-                timing, raw_out = run_julia(
-                    jl_file, X, Y, Z, k_vals, b_vals, work_dir,
-                    args.julia_exe, n_reps=args.n_reps)
-            except RuntimeError as exc:
-                print(f'  JULIA FAILED: {exc}')
-                results[f'cse_t{min_count}'] = {'error': str(exc), 'min_count': min_count}
-                if not args.save_jl:
-                    jl_file.unlink(missing_ok=True)
-                continue
-
-            mspw = timing['ms_per_wave']
-            print(f'  warmup={timing["warmup_s"]*1000:.1f}ms  '
-                  f'eval={mspw:.3f}ms/wave')
-
-            max_err = None
-            if reference_out is not None and raw_out is not None:
-                max_err = float(np.abs(raw_out - reference_out).max())
-                status = 'OK' if max_err < 1e-6 else 'WARNING'
-                print(f'  vs baseline: max|diff|={max_err:.2e}  [{status}]')
-
-            results[f'cse_t{min_count}'] = {
-                'label': f'cse_t{min_count}', 'min_count': min_count,
-                'n_kept': n_kept, 'ops_post': ops_post,
-                'ms_per_wave': mspw,
-                'warmup_ms': timing['warmup_s'] * 1000,
-                'max_err': max_err, 'build_time_s': t_build,
-            }
-
-            if not args.save_jl:
-                jl_file.unlink(missing_ok=True)
+        # ---- Horner-CSE threshold sweep ----
+        if do_horner:
+            print(f'\n{"─"*60}')
+            print('Horner-first CSE threshold sweep  ("baseline + CSE")')
+            horner_results = run_threshold_sweep(
+                terms_cos, terms_sin, thresholds,
+                repl_h, reduced_h, counts_h,
+                label_prefix='hcse_t',
+                work_dir=work_dir,
+                X=X, Y=Y, Z=Z, k_vals=k_vals, b_vals=b_vals,
+                outdir=outdir, julia_exe=args.julia_exe,
+                n_reps=args.n_reps, save_jl=args.save_jl,
+                reference_out=reference_out)
+            results.update(horner_results)
 
     # ---- Summary table ----
     ref_ms = results.get('baseline_horner', {}).get('ms_per_wave')
 
-    print(f'\n{"="*72}')
+    print(f'\n{"="*76}')
     print(f'SUMMARY  m={args.m}  E_lo={args.E_lo}  E_hi={E_hi:.2f}  '
-          f'Ng={args.Ng}  n_waves={args.n_waves}')
-    print(f'{"="*72}')
+          f'Ng={args.Ng}  n_waves={args.n_waves}  mode={args.mode}')
+    print(f'{"="*76}')
 
-    header = (f'{"strategy":<20} {"min_cnt":>8} {"n_kept":>7} {"ops_post":>9} '
-              f'{"ms/wave":>9} {"vs_ref":>10} {"warmup_ms":>10}')
+    header = (f'{"strategy":<22} {"type":<10} {"min_cnt":>8} {"n_kept":>7} '
+              f'{"ops_post":>9} {"ms/wave":>9} {"vs_ref":>10} {"warmup_ms":>10}')
     print(header)
     print('-' * len(header))
 
-    for r in results.values():
+    def _row(r, type_label):
         if 'error' in r:
-            print(f'{r.get("label","?"):<20}  ERROR: {r["error"][:30]}')
-            continue
-        mspw    = r.get('ms_per_wave')
-        n_kept  = r.get('n_kept', '-')
-        min_c   = r.get('min_count', '-')
-        ops_p   = r.get('ops_post', '-')
-        wmup    = f'{r["warmup_ms"]:.0f}' if r.get('warmup_ms') else '-'
+            print(f'{r.get("label","?"):<22}  ERROR: {r["error"][:30]}')
+            return
+        mspw   = r.get('ms_per_wave')
+        n_kept = r.get('n_kept', '-')
+        min_c  = r.get('min_count', '-')
+        ops_p  = r.get('ops_post', '-')
+        wmup   = f'{r["warmup_ms"]:.0f}' if r.get('warmup_ms') else '-'
         if ref_ms and mspw:
             ratio  = ref_ms / mspw
             vs_ref = f'{ratio:.2f}x' if ratio >= 0.1 else f'1/{1/ratio:.0f}x'
         else:
             vs_ref = '-'
-        print(f'{r["label"]:<20} {str(min_c):>8} {str(n_kept):>7} {str(ops_p):>9} '
-              f'{(mspw or 0):>9.3f} {vs_ref:>10} {wmup:>10}')
+        print(f'{r["label"]:<22} {type_label:<10} {str(min_c):>8} {str(n_kept):>7} '
+              f'{str(ops_p):>9} {(mspw or 0):>9.3f} {vs_ref:>10} {wmup:>10}')
+
+    _row(results['baseline_horner'], 'baseline')
+
+    if do_flat:
+        print(f'{"─── flat-CSE (pre-Horner) ─"*2}')
+        for key in results:
+            if key.startswith('cse_t'):
+                _row(results[key], 'flat_cse')
+
+    if do_horner:
+        print(f'{"─── horner-CSE (post-Horner) ─"*2}')
+        for key in results:
+            if key.startswith('hcse_t'):
+                _row(results[key], 'horner_cse')
 
     # ---- Save JSON ----
-    dist_vals = list(counts.values())
     result_file = outdir / f'cse_threshold_m{args.m}.json'
+    payload = {
+        'args': {
+            'M': args.m, 'E_lo': args.E_lo, 'E_hi': E_hi,
+            'Ng': args.Ng, 'n_waves': args.n_waves, 'n_reps': args.n_reps,
+            'thresholds': thresholds, 'mode': args.mode,
+        },
+        'results': {k: {kk: vv for kk, vv in v.items() if kk != 'error'}
+                    for k, v in results.items() if 'error' not in v},
+    }
+    if do_flat and counts is not None:
+        flat_vals = list(counts.values())
+        payload['flat_cse_info'] = {
+            'total_temps': len(repl),
+            'count_histogram': dict(sorted(Counter(flat_vals).items())),
+            'threshold_n_kept': {str(t): sum(1 for v in flat_vals if v >= t)
+                                 for t in thresholds},
+        }
+    if do_horner and counts_h is not None:
+        h_vals = list(counts_h.values())
+        payload['horner_cse_info'] = {
+            'total_temps': len(repl_h),
+            'count_histogram': dict(sorted(Counter(h_vals).items())),
+            'threshold_n_kept': {str(t): sum(1 for v in h_vals if v >= t)
+                                 for t in thresholds},
+        }
+
     with open(result_file, 'w') as f:
-        json.dump({
-            'args': {
-                'M': args.m, 'E_lo': args.E_lo, 'E_hi': E_hi,
-                'Ng': args.Ng, 'n_waves': args.n_waves, 'n_reps': args.n_reps,
-                'thresholds': thresholds,
-            },
-            'cse_total_temps': len(repl),
-            'count_histogram': dict(sorted(Counter(dist_vals).items())),
-            'threshold_n_kept': {
-                str(t): sum(1 for v in dist_vals if v >= t) for t in thresholds
-            },
-            'results': {k: {kk: vv for kk, vv in v.items() if kk != 'error'}
-                        for k, v in results.items() if 'error' not in v},
-        }, f, indent=2, default=str)
+        json.dump(payload, f, indent=2, default=str)
     print(f'\nResults → {result_file}')
     if args.save_jl:
         print(f'.jl files → {outdir}/')
