@@ -307,9 +307,26 @@ def run_julia_on_cube(jl_path, Xf, Yf, Zf, k_vals, b_vals, work_dir,
 # Mode 1 – sweep:  n = 1..m_max  for sampled cubes
 # ---------------------------------------------------------------------------
 
+
+def _pick_cubes_by_atom_counts(candidates, atom_counts, rng):
+    """Pick one cube for each requested atom count.
+
+    Returns (chosen, missing_counts).
+    """
+    chosen = []
+    missing = []
+    for count in atom_counts:
+        matched = [c for c in candidates if c['n_atoms'] == count]
+        if not matched:
+            missing.append(count)
+            continue
+        pick = matched[int(rng.integers(0, len(matched)))]
+        chosen.append(pick)
+    return chosen, missing
+
 def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                    sample, seed, julia_exe, outdir, a, b,
-                   expand=False, do_timing=True):
+                   select_atoms=None, expand=False, do_timing=True):
     """For --sample cubes sweep n=1..m_max; count ops and optionally time."""
     rng = np.random.default_rng(seed)
     _, X, Y, Z = build_full_grid(L_s, d_grid)
@@ -339,10 +356,17 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
         })
 
     print(f"  Candidate cubes (n_atoms>0, have pkl/jl): {len(candidates)}")
-    n_pick = min(sample, len(candidates))
-    chosen_idx = rng.choice(len(candidates), size=n_pick, replace=False)
-    chosen = [candidates[i] for i in sorted(chosen_idx)]
-    print(f"  Sampled: {n_pick} cubes  (seed={seed})")
+    if select_atoms:
+        chosen, missing = _pick_cubes_by_atom_counts(candidates, select_atoms, rng)
+        if missing:
+            print(f"  WARNING: no candidate cubes found for atom counts: {missing}")
+        n_pick = len(chosen)
+        print(f"  Selected by atoms: requested={select_atoms}  picked={n_pick} cubes  (seed={seed})")
+    else:
+        n_pick = min(sample, len(candidates))
+        chosen_idx = rng.choice(len(candidates), size=n_pick, replace=False)
+        chosen = [candidates[i] for i in sorted(chosen_idx)]
+        print(f"  Sampled: {n_pick} cubes  (seed={seed})")
     print(f"  Sweep n = 1 .. {m_max}  "
           f"{'with timing (' + str(n_waves) + ' waves)' if do_timing else 'N_op only'}\n")
 
@@ -716,6 +740,9 @@ def main():
                         help='Cubes to sample in sweep mode (default 20)')
     parser.add_argument('--seed', type=int, default=0,
                         help='Random seed (default 0)')
+    parser.add_argument('--select_atoms', type=str, default=None,
+                        help='Comma-separated atom counts (e.g. 1,2,3,8,10,19). '
+                             'If set, sweep picks one cube per requested atom count and ignores --sample.')
     parser.add_argument('--mode', choices=['sweep', 'full', 'both'],
                         default='sweep',
                         help='sweep: n-sweep for sampled cubes; '
@@ -774,6 +801,18 @@ def main():
                   f"→ a={a:.8g}  b={b:.8g}")
     print()
 
+
+    select_atoms = None
+    if args.select_atoms:
+        try:
+            select_atoms = [int(x.strip()) for x in args.select_atoms.split(',') if x.strip()]
+        except ValueError:
+            print('ERROR: --select_atoms must be comma-separated integers, e.g. 1,2,3,8,10,19')
+            sys.exit(1)
+        if not select_atoms:
+            print('ERROR: --select_atoms was provided but no valid integers were found.')
+            sys.exit(1)
+
     if args.mode in ('sweep', 'both'):
         print(f"{'='*60}")
         print(f"Sweep mode  (m={args.m}, sample={args.sample})")
@@ -784,7 +823,7 @@ def main():
             args.L_s, args.d_grid,
             args.sample, args.seed,
             args.julia_exe, args.outdir,
-            a=a, b=b, expand=args.expand,
+            a=a, b=b, select_atoms=select_atoms, expand=args.expand,
             do_timing=not args.no_timing)
 
     if args.mode in ('full', 'both'):
