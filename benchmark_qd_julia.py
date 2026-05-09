@@ -303,6 +303,33 @@ def run_julia_on_cube(jl_path, Xf, Yf, Zf, k_vals, b_vals, work_dir,
     return timing
 
 
+def run_sympy_on_cube(cube_dir, n, Xf, Yf, Zf, k_vals, b_vals, a, b, expand=False):
+    """Evaluate SymPy expression numerically on interior points; return timing dict."""
+    if not expand:
+        expr_cos_raw, expr_sin_raw = apply_f_of_H_from_raw_powers(
+            str(cube_dir), n, a=a, b=b, file_type='pkl', return_envelopes=True)
+        expr_cos = sp.expand(expr_cos_raw)
+        expr_sin = sp.expand(expr_sin_raw)
+    else:
+        psi_fH = apply_f_of_H_from_raw_powers(str(cube_dir), n, a=a, b=b, file_type='pkl')
+        expr_cos, expr_sin = extract_cos_sin_coeffs(psi_fH)
+
+    x, y, z, kx, ky, kz = sp.symbols('x y z kx ky kz')
+    f_cos = sp.lambdify((x, y, z, kx, ky, kz), expr_cos, 'numpy')
+    f_sin = sp.lambdify((x, y, z, kx, ky, kz), expr_sin, 'numpy')
+
+    _ = f_cos(Xf, Yf, Zf, *k_vals[0])
+    _ = f_sin(Xf, Yf, Zf, *k_vals[0])
+    t0 = time.time()
+    for iw in range(1, len(k_vals)):
+        phase = k_vals[iw, 0] * Xf + k_vals[iw, 1] * Yf + k_vals[iw, 2] * Zf + b_vals[iw]
+        out = f_cos(Xf, Yf, Zf, *k_vals[iw]) * np.cos(phase) + \
+              f_sin(Xf, Yf, Zf, *k_vals[iw]) * np.sin(phase)
+        _ = out
+    eval_s = time.time() - t0
+    return {'eval_s': eval_s, 'n_eval_waves': max(len(k_vals) - 1, 1)}
+
+
 # ---------------------------------------------------------------------------
 # Mode 1 – sweep:  n = 1..m_max  for sampled cubes
 # ---------------------------------------------------------------------------
@@ -326,7 +353,8 @@ def _pick_cubes_by_atom_counts(candidates, atom_counts, rng):
 
 def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                    sample, seed, julia_exe, outdir, a, b,
-                   select_atoms=None, expand=False, do_timing=True):
+                   select_atoms=None, expand=False, do_timing=True,
+                   do_sympy_timing=False):
     """For --sample cubes sweep n=1..m_max; count ops and optionally time."""
     rng = np.random.default_rng(seed)
     _, X, Y, Z = build_full_grid(L_s, d_grid)
@@ -368,7 +396,8 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
         chosen = [candidates[i] for i in sorted(chosen_idx)]
         print(f"  Sampled: {n_pick} cubes  (seed={seed})")
     print(f"  Sweep n = 1 .. {m_max}  "
-          f"{'with timing (' + str(n_waves) + ' waves)' if do_timing else 'N_op only'}\n")
+          f"{'with timing (' + str(n_waves) + ' waves)' if do_timing else 'N_op only'}"
+          f"{' + SymPy timing' if do_sympy_timing else ''}\n")
 
     k_vals = rng.uniform(-k_max, k_max, (n_waves, 3))
     b_vals = rng.uniform(0, 2 * np.pi, n_waves)
@@ -398,6 +427,7 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
 
                 # --- optional timing ---
                 ms_wave = ns_pt = 0.0
+                sympy_ms_wave = sympy_ns_pt = 0.0
                 if do_timing:
                     try:
                         timing = run_julia_on_cube(
@@ -409,12 +439,25 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                         ns_pt   = ms_wave / rec['n_pts'] * 1e6 if rec['n_pts'] else 0.0
                     except RuntimeError as exc:
                         print(f"    n={n}: Julia error: {str(exc)[:60]}")
+                if do_sympy_timing:
+                    try:
+                        sympy_timing = run_sympy_on_cube(
+                            Path(expr_dir) / rec['dirname'], n,
+                            rec['Xf'], rec['Yf'], rec['Zf'],
+                            k_vals, b_vals, a, b, expand=expand)
+                        sympy_eval_s = sympy_timing.get('eval_s') or 0.0
+                        sympy_n_eval = sympy_timing.get('n_eval_waves') or max(n_waves - 1, 1)
+                        sympy_ms_wave = sympy_eval_s / sympy_n_eval * 1000
+                        sympy_ns_pt = sympy_ms_wave / rec['n_pts'] * 1e6 if rec['n_pts'] else 0.0
+                    except Exception as exc:
+                        print(f"    n={n}: SymPy error: {str(exc)[:60]}")
 
                 print(f"    n={n}  "
                       f"Nop_cos={ops['total_cos']:5d}  "
                       f"Nop_sin={ops['total_sin']:5d}  "
                       f"Nop_tot={ops['total_cos']+ops['total_sin']:5d}"
-                      + (f"  {ms_wave:.3f}ms/wave" if do_timing else ""))
+                      + (f"  julia={ms_wave:.3f}ms/wave" if do_timing else "")
+                      + (f"  sympy={sympy_ms_wave:.3f}ms/wave" if do_sympy_timing else ""))
 
                 cube_id = rec['dirname']
                 base = {
@@ -424,6 +467,8 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                     'n_pts' : rec['n_pts'],
                     'ms_per_wave'         : round(ms_wave, 4),
                     'ns_per_pt_per_wave'  : round(ns_pt, 4),
+                    'sympy_ms_per_wave'   : round(sympy_ms_wave, 4),
+                    'sympy_ns_per_pt_per_wave': round(sympy_ns_pt, 4),
                 }
                 rows.append({**base, 'part': 'Pc',
                              'plus': ops['plus_cos'], 'mul': ops['mul_cos'],
@@ -442,7 +487,8 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
     csv_path = outdir / f'cube_complexity_m{m_max}.csv'
     fieldnames = ['cube', 'atoms', 'n', 'part',
                   'plus', 'mul', 'total',
-                  'n_pts', 'ms_per_wave', 'ns_per_pt_per_wave']
+                  'n_pts', 'ms_per_wave', 'ns_per_pt_per_wave',
+                  'sympy_ms_per_wave', 'sympy_ns_per_pt_per_wave']
     with open(csv_path, 'w', newline='') as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -736,6 +782,8 @@ def main():
                         help='Max k-vector magnitude (default 1.0)')
     parser.add_argument('--no_timing', action='store_true', default=False,
                         help='Skip Julia timing; only count N_op (fast)')
+    parser.add_argument('--sympy_timing', action='store_true', default=False,
+                        help='Also benchmark direct SymPy/numpy expression evaluation time')
     parser.add_argument('--sample', type=int, default=20,
                         help='Cubes to sample in sweep mode (default 20)')
     parser.add_argument('--seed', type=int, default=0,
@@ -824,7 +872,8 @@ def main():
             args.sample, args.seed,
             args.julia_exe, args.outdir,
             a=a, b=b, select_atoms=select_atoms, expand=args.expand,
-            do_timing=not args.no_timing)
+            do_timing=not args.no_timing,
+            do_sympy_timing=args.sympy_timing)
 
     if args.mode in ('full', 'both'):
         print(f"\n{'='*60}")
