@@ -654,8 +654,10 @@ def main():
     # Auto-select expr_dir based on expand flag if not explicitly set
     if args.expr_dir is not None:
         expr_dir_path = args.expr_dir
+    elif expand:
+        expr_dir_path = 'QD_R11_expressions_cell' if args.partition_mode == 'cell' else 'QD_R11_expressions'
     else:
-        expr_dir_path = auto_expr_dir
+        expr_dir_path = 'QD_R11_Julia_exp/no_expansion_cell' if args.partition_mode == 'cell' else 'QD_R11_Julia_exp/no_expansion'
 
     # Auto E_hi from grid parameters (use ceil to match build_qd_cube)
     Ng = int(np.ceil(2 * BOX_HALF / D_GRID))
