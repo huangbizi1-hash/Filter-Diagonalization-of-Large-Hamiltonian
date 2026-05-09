@@ -638,7 +638,7 @@ def main():
             print(f'\n{"─"*60}')
             print('Horner-first CSE threshold sweep  ("baseline + CSE")')
             horner_results = run_threshold_sweep(
-                terms_cos, terms_sin, thresholds,
+                terms_cos_h, terms_sin_h, thresholds,
                 repl_h, reduced_h, counts_h,
                 label_prefix='hcse_t',
                 work_dir=work_dir,
