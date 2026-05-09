@@ -800,8 +800,9 @@ def main():
     parser.add_argument('--expr_dir', required=True,
                         help='H^n pkl / Julia script directory (Stage 3/4 output)')
     parser.add_argument('--m', type=int, default=8,
-                        help='Max Chebyshev order (default 8). '
-                             'Generates .jl for n=1..m.')
+                        help='Max Chebyshev order used by full mode and default sweep upper bound (default 8).')
+    parser.add_argument('--m_sweep_max', type=int, default=None,
+                        help='Optional sweep-only upper bound for n. Example: --m 8 --m_sweep_max 5 sweeps n=1..5')
     parser.add_argument('--E_lo', type=float, default=0.0,
                         help='Lower energy bound for filter (default 0.0 Hartree)')
     parser.add_argument('--E_hi', type=float, default=None,
@@ -848,6 +849,13 @@ def main():
 
     if args.n_waves < 2 and not args.no_timing:
         print('WARNING: n_waves < 2 gives no timed iterations. Use --n_waves 20+.\n')
+
+    if args.m < 1:
+        print('ERROR: --m must be >= 1')
+        sys.exit(1)
+    if args.m_sweep_max is not None and args.m_sweep_max < 1:
+        print('ERROR: --m_sweep_max must be >= 1')
+        sys.exit(1)
 
     print(f"Loading cube manager from {args.vexpr_dir} ...")
     manager = CubicExpressionManager(args.vexpr_dir)
@@ -907,8 +915,11 @@ def main():
         print(f"{'='*60}")
         print(f"Sweep mode  (m={args.m}, sample={args.sample})")
         print(f"{'='*60}")
+        sweep_m_max = args.m if args.m_sweep_max is None else min(args.m, args.m_sweep_max)
+        if args.m_sweep_max is not None and args.m_sweep_max > args.m:
+            print(f"  NOTE: --m_sweep_max={args.m_sweep_max} > --m={args.m}; using n<= {sweep_m_max}.")
         run_sweep_mode(
-            manager, args.expr_dir, args.m,
+            manager, args.expr_dir, sweep_m_max,
             args.n_waves, args.k_max,
             args.L_s, args.d_grid,
             args.sample, args.seed,
