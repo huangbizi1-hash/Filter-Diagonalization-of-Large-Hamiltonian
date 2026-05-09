@@ -42,12 +42,20 @@ import time
 from pathlib import Path
 
 import numpy as np
+import sympy as sp
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent))
 from symbolic_code.expr_loader import CubicExpressionManager
+from symbolic_code.chebyshev_filter import (
+    apply_f_of_H_from_raw_powers,
+    extract_cos_sin_coeffs,
+    group_by_exp_combined,
+    apply_horner,
+)
+from symbolic_code.julia_codegen import build_julia_batch_script
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +76,96 @@ def find_jl_file(expr_dir, cube_dir_name, m):
         return None
     matches = sorted(cube_path.glob(f'eval_filter_m{m}_*.jl'))
     return matches[0] if matches else None
+
+
+def _parse_ab_from_jl_name(jl_path):
+    """Parse (a, b) from eval_filter_m{m}_{a_key}_{b_key}.jl filename.
+
+    Encoding used by run_qd_r11.py Stage 4:
+        a_key = f"{a:.8g}".replace('.','p').replace('-','m')
+    Reverse: replace 'p'→'.' and 'm'→'-'.
+    """
+    parts = Path(jl_path).stem.split('_')
+    # parts: ['eval', 'filter', 'm<N>', '<a_key>', '<b_key>']
+    m_idx = next(i for i, p in enumerate(parts) if re.match(r'^m\d+$', p))
+    a_key = parts[m_idx + 1]
+    b_key = parts[m_idx + 2]
+    a = float(a_key.replace('p', '.').replace('m', '-'))
+    b = float(b_key.replace('p', '.').replace('m', '-'))
+    return a, b
+
+
+def _find_any_jl_in_dir(expr_dir, m):
+    """Search all cube subdirs for any eval_filter_m{m}_*.jl; return first found."""
+    for cube_path in sorted(Path(expr_dir).iterdir()):
+        if cube_path.is_dir():
+            matches = sorted(cube_path.glob(f'eval_filter_m{m}_*.jl'))
+            if matches:
+                return matches[0]
+    return None
+
+
+def _estimate_E_hi(L_s, Ng, pref=0.5, V_peak=12.0):
+    """Rough E_hi from Nyquist kinetic energy + potential peak."""
+    dx = 2.0 * L_s / Ng
+    k_max = np.pi / dx
+    return pref * 3.0 * k_max**2 + V_peak
+
+
+def _jl_name_for(m, a, b):
+    a_key = f"{a:.8g}".replace('.', 'p').replace('-', 'm')
+    b_key = f"{b:.8g}".replace('.', 'p').replace('-', 'm')
+    return f"eval_filter_m{m}_{a_key}_{b_key}.jl"
+
+
+def generate_jl_for_cube(cube_dir, m, a, b, expand=False):
+    """Build the Julia eval script from H^n pkl files in cube_dir.
+
+    Uses the same codegen path as run_qd_r11.py Stage 4.
+    Returns the jl_path on success, or None if pkl files are missing.
+    """
+    cube_dir = Path(cube_dir)
+    if not (cube_dir / f'H_power_{m}.pkl').exists():
+        return None
+
+    jl_name = _jl_name_for(m, a, b)
+    jl_path = cube_dir / jl_name
+    if jl_path.exists():
+        return jl_path
+
+    try:
+        if not expand:
+            expr_cos_raw, expr_sin_raw = apply_f_of_H_from_raw_powers(
+                str(cube_dir), m, a=a, b=b,
+                file_type='pkl', return_envelopes=True)
+            expr_cos = sp.expand(expr_cos_raw)
+            expr_sin = sp.expand(expr_sin_raw)
+        else:
+            psi_fH = apply_f_of_H_from_raw_powers(
+                str(cube_dir), m, a=a, b=b, file_type='pkl')
+            expr_cos, expr_sin = extract_cos_sin_coeffs(psi_fH)
+
+        terms_cos = apply_horner(group_by_exp_combined(expr_cos))
+        terms_sin = apply_horner(group_by_exp_combined(expr_sin))
+        jl_src = build_julia_batch_script(terms_cos, terms_sin)
+        jl_path.write_text(jl_src, encoding='utf-8')
+        return jl_path
+    except Exception as exc:
+        print(f"\n    [codegen error] {cube_dir.name}: {exc}")
+        return None
+
+
+def find_or_generate_jl_file(expr_dir, cube_dir_name, m, a, b, expand=False):
+    """Return .jl path for a cube, auto-generating from pkl files if absent."""
+    jl_path = find_jl_file(expr_dir, cube_dir_name, m)
+    if jl_path is not None:
+        return jl_path
+
+    cube_dir = Path(expr_dir) / cube_dir_name
+    if not cube_dir.exists():
+        return None
+
+    return generate_jl_for_cube(cube_dir, m, a, b, expand=expand)
 
 
 def count_julia_ops(jl_path):
@@ -204,9 +302,16 @@ def run_julia_on_cube(jl_path, Xf, Yf, Zf, k_vals, b_vals, work_dir,
 # ---------------------------------------------------------------------------
 
 def collect_cube_records(manager, expr_dir, m, Ng, N_DIVISIONS, X, Y, Z,
-                         require_atoms=False):
-    """Return list of dicts describing valid cubes (have .jl + interior pts)."""
+                         require_atoms=False, a=None, b=None, expand=False):
+    """Return list of dicts describing valid cubes (have .jl + interior pts).
+
+    When a and b are provided, missing .jl files are auto-generated from
+    the H^n pkl files in the same cube directory (same codegen as Stage 4).
+    """
+    can_generate = (a is not None and b is not None)
+    generated = skipped_gen = 0
     records = []
+
     for idx in sorted(manager.cube_info.keys()):
         info   = manager.cube_info[idx]
         cx, cy, cz = info['center']
@@ -215,9 +320,19 @@ def collect_cube_records(manager, expr_dir, m, Ng, N_DIVISIONS, X, Y, Z,
         if require_atoms and n_atoms == 0:
             continue
 
-        dirname  = _cube_dirname(cx, cy, cz)
-        jl_path  = find_jl_file(expr_dir, dirname, m)
+        dirname = _cube_dirname(cx, cy, cz)
+
+        if can_generate:
+            pre_existing = find_jl_file(expr_dir, dirname, m)
+            jl_path = find_or_generate_jl_file(
+                expr_dir, dirname, m, a, b, expand=expand)
+            if jl_path is not None and pre_existing is None:
+                generated += 1
+        else:
+            jl_path = find_jl_file(expr_dir, dirname, m)
+
         if jl_path is None:
+            skipped_gen += 1
             continue
 
         Xf, Yf, Zf, flat_idx = cube_interior_points(idx, Ng, N_DIVISIONS, X, Y, Z)
@@ -232,6 +347,11 @@ def collect_cube_records(manager, expr_dir, m, Ng, N_DIVISIONS, X, Y, Z,
             'jl_path' : jl_path,
             'Xf'      : Xf, 'Yf': Yf, 'Zf': Zf,
         })
+
+    if can_generate and generated:
+        print(f"  Auto-generated {generated} missing .jl files from pkl")
+    if skipped_gen:
+        print(f"  Skipped {skipped_gen} cubes (no .jl and no pkl for m={m})")
     return records
 
 
@@ -240,7 +360,7 @@ def collect_cube_records(manager, expr_dir, m, Ng, N_DIVISIONS, X, Y, Z,
 # ---------------------------------------------------------------------------
 
 def run_sample_mode(manager, expr_dir, m, n_waves, k_max, L_s, d_grid,
-                    sample, seed, julia_exe, outdir):
+                    sample, seed, julia_exe, outdir, a=None, b=None, expand=False):
     rng = np.random.default_rng(seed)
     _, X, Y, Z = build_full_grid(L_s, d_grid)
     Ng, N_DIVISIONS, cube_size = infer_grid_params(manager, L_s, d_grid)
@@ -248,7 +368,8 @@ def run_sample_mode(manager, expr_dir, m, n_waves, k_max, L_s, d_grid,
           f"cube_size={cube_size:.3f} Bohr  d_grid={d_grid}")
 
     all_records = collect_cube_records(
-        manager, expr_dir, m, Ng, N_DIVISIONS, X, Y, Z, require_atoms=True)
+        manager, expr_dir, m, Ng, N_DIVISIONS, X, Y, Z,
+        require_atoms=True, a=a, b=b, expand=expand)
     print(f"  Valid cubes (n_atoms>0, have jl): {len(all_records)}")
 
     chosen_idx = rng.choice(len(all_records),
@@ -379,7 +500,7 @@ def _plot_sample(rows, outdir, m):
 # ---------------------------------------------------------------------------
 
 def run_full_mode(manager, expr_dir, m, n_waves, k_max, L_s, d_grid,
-                  julia_exe, outdir, max_cubes=None):
+                  julia_exe, outdir, max_cubes=None, a=None, b=None, expand=False):
     rng = np.random.default_rng(42)
     _, X, Y, Z = build_full_grid(L_s, d_grid)
     Ng, N_DIVISIONS, cube_size = infer_grid_params(manager, L_s, d_grid)
@@ -387,7 +508,8 @@ def run_full_mode(manager, expr_dir, m, n_waves, k_max, L_s, d_grid,
           f"N_DIVISIONS={N_DIVISIONS}  cube_size={cube_size:.3f} Bohr")
 
     all_records = collect_cube_records(
-        manager, expr_dir, m, Ng, N_DIVISIONS, X, Y, Z, require_atoms=False)
+        manager, expr_dir, m, Ng, N_DIVISIONS, X, Y, Z,
+        require_atoms=False, a=a, b=b, expand=expand)
     if max_cubes:
         all_records = all_records[:max_cubes]
     print(f"  Cubes to run: {len(all_records)}")
@@ -559,6 +681,14 @@ def main():
                         help='Julia script directory (from Stage 4)')
     parser.add_argument('--m', type=int, default=8,
                         help='Chebyshev order to look for (default 8)')
+    parser.add_argument('--E_lo', type=float, default=0.0,
+                        help='Lower energy bound for filter (default 0.0 Hartree)')
+    parser.add_argument('--E_hi', type=float, default=None,
+                        help='Upper energy bound for filter. If omitted: parsed '
+                             'from existing .jl filenames, or auto-estimated from grid.')
+    parser.add_argument('--expand', action='store_true', default=False,
+                        help='Use expanded (non-Horner) pkl path for codegen '
+                             '(default False = same as Stage 4 default)')
     parser.add_argument('--L_s', type=float, default=22.0,
                         help='Half-box size in Bohr (default 22.0 for QD R=17)')
     parser.add_argument('--d_grid', type=float, default=0.625,
@@ -593,12 +723,40 @@ def main():
         sys.exit(1)
     print(f"  {len(manager.cube_info)} cubes loaded")
 
-    # Quick sanity-check: infer grid params and show them
+    # Infer grid params
     try:
         Ng, N_DIV, csz = infer_grid_params(manager, args.L_s, args.d_grid)
-        print(f"  Inferred: Ng={Ng}  N_DIVISIONS={N_DIV}  cube_size={csz:.3f} Bohr\n")
+        print(f"  Inferred: Ng={Ng}  N_DIVISIONS={N_DIV}  cube_size={csz:.3f} Bohr")
     except Exception as exc:
         print(f"  Warning: could not infer grid params: {exc}")
+        Ng = int(np.ceil(2 * args.L_s / args.d_grid))
+
+    # Determine a, b for the filter (needed to auto-generate missing .jl files)
+    a = b = None
+    if args.E_hi is not None:
+        # User supplied both bounds explicitly
+        a = 2.0 / (args.E_hi - args.E_lo)
+        b = -(args.E_hi + args.E_lo) / (args.E_hi - args.E_lo)
+        print(f"  Filter: E_lo={args.E_lo}  E_hi={args.E_hi:.4f} "
+              f"→ a={a:.8g}  b={b:.8g}")
+    else:
+        # Try to parse a/b from any existing .jl file
+        sample_jl = _find_any_jl_in_dir(args.expr_dir, args.m)
+        if sample_jl is not None:
+            try:
+                a, b = _parse_ab_from_jl_name(sample_jl)
+                E_hi_inferred = 2.0 / a + args.E_lo
+                print(f"  Filter a/b parsed from {sample_jl.name}: "
+                      f"a={a:.8g}  b={b:.8g}  (E_hi≈{E_hi_inferred:.3f})")
+            except Exception as exc:
+                print(f"  Warning: could not parse a/b from {sample_jl.name}: {exc}")
+        if a is None:
+            E_hi_est = _estimate_E_hi(args.L_s, Ng)
+            a = 2.0 / (E_hi_est - args.E_lo)
+            b = -(E_hi_est + args.E_lo) / (E_hi_est - args.E_lo)
+            print(f"  Filter: E_hi auto-estimated={E_hi_est:.3f} Hartree "
+                  f"→ a={a:.8g}  b={b:.8g}")
+    print()
 
     if args.mode in ('sample', 'both'):
         print(f"{'='*60}")
@@ -610,7 +768,8 @@ def main():
             args.n_waves, args.k_max,
             args.L_s, args.d_grid,
             args.sample, args.seed,
-            args.julia_exe, args.outdir)
+            args.julia_exe, args.outdir,
+            a=a, b=b, expand=args.expand)
 
     if args.mode in ('full', 'both'):
         print(f"\n{'='*60}")
@@ -622,7 +781,8 @@ def main():
             args.n_waves, args.k_max,
             args.L_s, args.d_grid,
             args.julia_exe, args.outdir,
-            max_cubes=args.max_cubes)
+            max_cubes=args.max_cubes,
+            a=a, b=b, expand=args.expand)
 
     print('\nDone.')
 
