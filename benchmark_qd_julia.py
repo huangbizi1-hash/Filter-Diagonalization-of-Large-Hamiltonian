@@ -354,7 +354,7 @@ def _pick_cubes_by_atom_counts(candidates, atom_counts, rng):
 def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                    sample, seed, julia_exe, outdir, a, b,
                    select_atoms=None, expand=False, do_timing=True,
-                   do_sympy_timing=False):
+                   do_sympy_timing=False, nop_json_path=None):
     """For --sample cubes sweep n=1..m_max; count ops and optionally time."""
     rng = np.random.default_rng(seed)
     _, X, Y, Z = build_full_grid(L_s, d_grid)
@@ -496,6 +496,39 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
     print(f"\n  CSV  → {csv_path}")
 
     _plot_sweep(rows, outdir, m_max, do_timing)
+
+    if nop_json_path:
+        _write_nop_summary_json(rows, nop_json_path)
+
+
+def _write_nop_summary_json(rows, json_path):
+    """Write JSON: atoms -> n -> Nop_tot, plus cube metadata."""
+    summary = {}
+    for row in rows:
+        if row['part'] != 'Ps':
+            continue
+        cube = row['cube']
+        atoms = int(row['atoms'])
+        n = int(row['n'])
+
+        cos_row = next((r for r in rows
+                        if r['cube'] == cube and r['n'] == n and r['part'] == 'Pc'), None)
+        if cos_row is None:
+            continue
+        nop_tot = int(row['total']) + int(cos_row['total'])
+
+        atoms_key = str(atoms)
+        summary.setdefault(atoms_key, {'cube': cube, 'n_to_nop_tot': {}})
+        summary[atoms_key]['n_to_nop_tot'][str(n)] = nop_tot
+
+    json_path = Path(json_path)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        'description': 'Nop_tot per selected atom-count cube across Chebyshev order n',
+        'atoms_to_cube_and_nop_tot': summary,
+    }
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
+    print(f"  JSON → {json_path}")
 
 
 def _plot_sweep(rows, outdir, m_max, do_timing):
@@ -763,8 +796,9 @@ def main():
     parser.add_argument('--expr_dir', required=True,
                         help='H^n pkl / Julia script directory (Stage 3/4 output)')
     parser.add_argument('--m', type=int, default=8,
-                        help='Max Chebyshev order (default 8). '
-                             'Generates .jl for n=1..m.')
+                        help='Max Chebyshev order used by full mode and default sweep upper bound (default 8).')
+    parser.add_argument('--m_sweep_max', type=int, default=None,
+                        help='Optional sweep-only upper bound for n. Example: --m 8 --m_sweep_max 5 sweeps n=1..5')
     parser.add_argument('--E_lo', type=float, default=0.0,
                         help='Lower energy bound for filter (default 0.0 Hartree)')
     parser.add_argument('--E_hi', type=float, default=None,
@@ -802,10 +836,19 @@ def main():
                         help='Julia executable (default julia)')
     parser.add_argument('--outdir', default='figs_qd_timing',
                         help='Output directory (default figs_qd_timing/)')
+    parser.add_argument('--nop_json', default=None,
+                        help='Optional JSON path to save atoms->n->Nop_tot summary in sweep mode')
     args = parser.parse_args()
 
     if args.n_waves < 2 and not args.no_timing:
         print('WARNING: n_waves < 2 gives no timed iterations. Use --n_waves 20+.\n')
+
+    if args.m < 1:
+        print('ERROR: --m must be >= 1')
+        sys.exit(1)
+    if args.m_sweep_max is not None and args.m_sweep_max < 1:
+        print('ERROR: --m_sweep_max must be >= 1')
+        sys.exit(1)
 
     print(f"Loading cube manager from {args.vexpr_dir} ...")
     manager = CubicExpressionManager(args.vexpr_dir)
@@ -865,15 +908,19 @@ def main():
         print(f"{'='*60}")
         print(f"Sweep mode  (m={args.m}, sample={args.sample})")
         print(f"{'='*60}")
+        sweep_m_max = args.m if args.m_sweep_max is None else min(args.m, args.m_sweep_max)
+        if args.m_sweep_max is not None and args.m_sweep_max > args.m:
+            print(f"  NOTE: --m_sweep_max={args.m_sweep_max} > --m={args.m}; using n<= {sweep_m_max}.")
         run_sweep_mode(
-            manager, args.expr_dir, args.m,
+            manager, args.expr_dir, sweep_m_max,
             args.n_waves, args.k_max,
             args.L_s, args.d_grid,
             args.sample, args.seed,
             args.julia_exe, args.outdir,
             a=a, b=b, select_atoms=select_atoms, expand=args.expand,
             do_timing=not args.no_timing,
-            do_sympy_timing=args.sympy_timing)
+            do_sympy_timing=args.sympy_timing,
+            nop_json_path=args.nop_json)
 
     if args.mode in ('full', 'both'):
         print(f"\n{'='*60}")
