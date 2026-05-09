@@ -588,6 +588,17 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
     return energies
 
 
+
+def _auto_output_dirs(radius_bohr, partition_mode, expand):
+    radius_tag = f"R{int(round(radius_bohr))}"
+    mode_tag = f"partition_{partition_mode}"
+    vexpr_dir = f"QD_{radius_tag}_Vexpr_{mode_tag}"
+    if expand:
+        expr_dir = f"QD_{radius_tag}_expressions_{mode_tag}"
+    else:
+        expr_dir = f"QD_{radius_tag}_Julia_exp/{mode_tag}_no_expansion"
+    return vexpr_dir, expr_dir
+
 # ===========================================================================
 # Main
 # ===========================================================================
@@ -618,8 +629,9 @@ def main():
                         help='QD cube file path')
     parser.add_argument('--params_file', default='gaussian_fit_params.json',
                         help='Gaussian fit parameters JSON')
-    parser.add_argument('--vexpr_dir', default='QD_R11_Vexpr',
-                        help='Output dir for V_expr pkl files (stage 2)')
+    parser.add_argument('--vexpr_dir', default=None,
+                        help='Output dir for V_expr pkl files (stage 2). '
+                             'Default auto-includes radius and partition mode.')
     parser.add_argument('--partition_mode', choices=['uniform', 'cell'], default='uniform',
                         help='Stage-2 partition mode: uniform (original) or cell (晶胞, edge default a/2).')
     parser.add_argument('--cell_edge', type=float, default=None,
@@ -636,6 +648,9 @@ def main():
     stages = set(int(s.strip()) for s in args.stages.split(','))
     expand = args.expand
 
+    auto_vexpr_dir, auto_expr_dir = _auto_output_dirs(QD_RADIUS, args.partition_mode, expand)
+    vexpr_dir_path = args.vexpr_dir if args.vexpr_dir is not None else auto_vexpr_dir
+
     # Auto-select expr_dir based on expand flag if not explicitly set
     if args.expr_dir is not None:
         expr_dir_path = args.expr_dir
@@ -650,7 +665,7 @@ def main():
     print(f"QD R=11 pipeline  |  grid {Ng}^3  |  E_hi_ref={E_hi_ref:.2f} Hartree")
     E_hi = args.E_hi if args.E_hi is not None else E_hi_ref
     print(f"Using E_hi={E_hi:.4f}  E_lo={args.E_lo}  m={args.m}  "
-          f"expand={expand}  expr_dir={expr_dir_path}\n")
+          f"expand={expand}  vexpr_dir={vexpr_dir_path}  expr_dir={expr_dir_path}\n")
 
     t_start = time.time()
 
@@ -665,7 +680,7 @@ def main():
         print("Stage 2: Space partition → V_expr pkl files")
         print("=" * 60)
         run_space_partition(
-            args.cube_file, args.params_file, args.vexpr_dir,
+            args.cube_file, args.params_file, vexpr_dir_path,
             L_s=BOX_HALF, n_divisions=N_DIVISIONS, r_cut=R_CUT,
             partition_mode=args.partition_mode, cell_edge=args.cell_edge,
         )
@@ -674,14 +689,14 @@ def main():
         print("\n" + "=" * 60)
         print("Stage 3: H^n expressions")
         print("=" * 60)
-        run_h_powers(args.vexpr_dir, expr_dir_path, args.m, expand=expand)
+        run_h_powers(vexpr_dir_path, expr_dir_path, args.m, expand=expand)
 
     if 4 in stages:
         print("\n" + "=" * 60)
         print("Stage 4: Julia eval scripts")
         print("=" * 60)
         run_julia_codegen(
-            args.vexpr_dir, expr_dir_path, args.m, args.E_lo, E_hi, expand=expand
+            vexpr_dir_path, expr_dir_path, args.m, args.E_lo, E_hi, expand=expand
         )
 
     if 5 in stages:
@@ -689,7 +704,7 @@ def main():
         print("Stage 5: Filter diagonalisation")
         print("=" * 60)
         energies = run_filter_diag(
-            vexpr_dir=args.vexpr_dir,
+            vexpr_dir=vexpr_dir_path,
             expr_dir=expr_dir_path,
             m=args.m,
             E_lo=args.E_lo,
