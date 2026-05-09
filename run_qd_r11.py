@@ -430,6 +430,22 @@ def _run_julia_batch(jl_file, Xf, Yf, Zf, k_vals, b_vals, work_dir, julia_exe='j
     return out, timing
 
 
+def _run_sympy_batch(cube_dir, m, a, b, Xf, Yf, Zf, k_vals, b_vals, cache):
+    """Evaluate f(H)*psi directly from SymPy H^n pkl for one cube."""
+    key = str(cube_dir)
+    if key not in cache:
+        expr = apply_f_of_H_from_raw_powers(str(cube_dir), m, a=a, b=b, file_type='pkl')
+        x, y, z, kx, ky, kz, phase = sp.symbols('x y z kx ky kz b')
+        cache[key] = sp.lambdify((x, y, z, kx, ky, kz, phase), expr, modules='numpy')
+    f_eval = cache[key]
+    n_waves = len(k_vals)
+    out = np.empty((n_waves, len(Xf)), dtype=np.float64)
+    for i in range(n_waves):
+        kxv, kyv, kzv = k_vals[i]
+        out[i, :] = np.asarray(f_eval(Xf, Yf, Zf, kxv, kyv, kzv, b_vals[i]), dtype=np.float64)
+    return out
+
+
 def _estimate_E_hi(L_s, N_grid, pref=0.5, V_peak=12.0):
     """Rough E_hi from grid Nyquist kinetic + potential peak.
 
@@ -447,7 +463,8 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
                     params_file='gaussian_fit_params.json',
                     cube_file='QD_Outputs/QD_R11.cube',
                     L_s=BOX_HALF,
-                    n_divisions=N_DIVISIONS):
+                    n_divisions=N_DIVISIONS,
+                    eval_backend='julia'):
     """Evaluate f(H)*psi on full QD grid using per-cube Julia scripts, then SVD.
 
     For each cube:
@@ -465,7 +482,7 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
     b_key = f"{b:.8g}".replace('.', 'p').replace('-', 'm')
     jl_name = f"eval_filter_m{m}_{a_key}_{b_key}.jl"
 
-    print(f"\n  Stage 5: filter diagonalisation")
+    print(f"\n  Stage 5: filter diagonalisation ({eval_backend})")
     print(f"    m={m}  E_lo={E_lo}  E_hi={E_hi:.4f}  n_waves={n_waves}  k_max={k_max}")
 
     # ---- build grid ----
@@ -507,6 +524,7 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
     total_eval_s = 0.0
     cubes_done = 0
     cubes_skip = 0
+    sympy_cache = {}
 
     t_eval_all = time.time()
     for idx in sorted(manager.cube_info.keys()):
@@ -515,8 +533,7 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
         cx, cy, cz = info['center']
         cube_dir = expr_dir / _cube_dirname(cx, cy, cz)
         jl_path  = cube_dir / jl_name
-
-        if not jl_path.exists():
+        if eval_backend == 'julia' and not jl_path.exists():
             cubes_skip += 1
             continue
 
@@ -542,8 +559,13 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
             continue
 
         try:
-            out, timing = _run_julia_batch(
-                jl_path, Xf, Yf, Zf, k_vals, b_vals, work_dir, julia_exe)
+            if eval_backend == 'julia':
+                out, timing = _run_julia_batch(
+                    jl_path, Xf, Yf, Zf, k_vals, b_vals, work_dir, julia_exe)
+            else:
+                t_sym = time.time()
+                out = _run_sympy_batch(cube_dir, m, a, b, Xf, Yf, Zf, k_vals, b_vals, sympy_cache)
+                timing = {'eval_s': time.time() - t_sym}
             # out shape: (n_waves, N_pts_cube)
             C_f_flat[:, flat_idx] = out
             cubes_done += 1
@@ -554,7 +576,7 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
                 print(f"    {cubes_done} cubes done  "
                       f"({len(Xf)} pts/cube)  total_eval_s={total_eval_s:.1f}s")
         except Exception as exc:
-            print(f"    Cube {idx}: Julia error – {exc}")
+            print(f"    Cube {idx}: {eval_backend} error – {exc}")
             cubes_skip += 1
 
     import shutil
@@ -563,7 +585,7 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
 
     print(f"\n    Evaluation complete: {cubes_done} cubes  |  "
           f"{cubes_skip} skipped  |  wall={wall_total:.1f}s  "
-          f"Julia eval_s={total_eval_s:.1f}s")
+          f"{eval_backend} eval_s={total_eval_s:.1f}s")
 
     # ---- reshape to (n_waves, Ng, Ng, Ng) ----
     C_f = C_f_flat.reshape(n_waves, Ng, Ng, Ng)
@@ -651,6 +673,8 @@ def main():
     parser.add_argument('--expand', action='store_true', default=False,
                         help='Use sp.expand() at each H^n step (legacy; default: off). '
                              'Off = faster generation, smaller pkl, identical Julia output.')
+    parser.add_argument('--eval_backend', choices=['julia', 'sympy'], default='julia',
+                        help='Stage-5 cube evaluation backend: julia (default) or sympy.')
     args = parser.parse_args()
 
     stages = set(int(s.strip()) for s in args.stages.split(','))
@@ -697,7 +721,7 @@ def main():
         print("=" * 60)
         run_h_powers(vexpr_dir_path, expr_dir_path, args.m, expand=expand)
 
-    if 4 in stages:
+    if 4 in stages and args.eval_backend == 'julia':
         print("\n" + "=" * 60)
         print("Stage 4: Julia eval scripts")
         print("=" * 60)
@@ -724,6 +748,7 @@ def main():
             cube_file=cube_file_path,
             L_s=box_half,
             n_divisions=N_DIVISIONS,
+            eval_backend=args.eval_backend,
         )
 
         # Save eigenvalues to JSON
