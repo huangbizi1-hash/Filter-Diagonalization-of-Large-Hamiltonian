@@ -159,7 +159,8 @@ def build_qd_cube(radius_bohr, output_path, d=0.625):
 # ===========================================================================
 
 def run_space_partition(cube_file, params_file, vexpr_dir,
-                        L_s=BOX_HALF, n_divisions=N_DIVISIONS, r_cut=R_CUT):
+                        L_s=BOX_HALF, n_divisions=N_DIVISIONS, r_cut=R_CUT,
+                        partition_mode="uniform", cell_edge=None, anchor_atom=True):
     """Build per-cube V_expr pkl files into *vexpr_dir*.
 
     Skip if the directory already contains .pkl files.
@@ -173,15 +174,35 @@ def run_space_partition(cube_file, params_file, vexpr_dir,
     atoms = read_cube_atoms(str(cube_file))
     print(f"  Stage 2: read {len(atoms)} atoms from {cube_file}")
 
-    partition = CubicSpacePartition(
-        params_file=str(params_file),
-        atoms=atoms,
-        L_s=L_s,
-        n_divisions=n_divisions,
-        r_cut=r_cut,
-    )
+    if partition_mode == "cell":
+        if cell_edge is None:
+            cell_edge = _A_INAS / 2.0
+        anchor = None
+        if anchor_atom and atoms:
+            arr = np.array([[a["x"], a["y"], a["z"]] for a in atoms], dtype=float)
+            anchor = arr[np.argmin(arr.sum(axis=1))]
+            print(f"  Stage 2: cell partition anchor atom at ({anchor[0]:.3f}, {anchor[1]:.3f}, {anchor[2]:.3f})")
+        print(f"  Stage 2: using crystal-cell partition, cube edge={cell_edge:.6f} Bohr")
+        partition = CubicSpacePartition(
+            params_file=str(params_file), atoms=atoms, L_s=L_s,
+            n_divisions=n_divisions, r_cut=r_cut, cube_size=cell_edge, anchor_corner=anchor,
+        )
+    else:
+        partition = CubicSpacePartition(
+            params_file=str(params_file),
+            atoms=atoms,
+            L_s=L_s,
+            n_divisions=n_divisions,
+            r_cut=r_cut,
+        )
     n_with = partition.process_all_cubes(str(vexpr_dir))
+    summary_path = Path(vexpr_dir) / "partition_summary.txt"
+    summary_path.write_text(
+        f"mode={partition_mode}\nL_s={L_s}\nr_cut={r_cut}\ncube_edge={partition.l0}\ntotal_cubes={len(partition.cube_centers)}\nnon_empty={n_with}\n",
+        encoding="utf-8",
+    )
     print(f"  Stage 2: generated {n_with} non-empty cube expressions → {vexpr_dir}")
+    print(f"  Stage 2: summary saved → {summary_path}")
 
 
 # ===========================================================================
@@ -599,6 +620,10 @@ def main():
                         help='Gaussian fit parameters JSON')
     parser.add_argument('--vexpr_dir', default='QD_R11_Vexpr',
                         help='Output dir for V_expr pkl files (stage 2)')
+    parser.add_argument('--partition_mode', choices=['uniform', 'cell'], default='uniform',
+                        help='Stage-2 partition mode: uniform (original) or cell (晶胞, edge default a/2).')
+    parser.add_argument('--cell_edge', type=float, default=None,
+                        help='Cube edge length for --partition_mode cell (Bohr). Default a/2.')
     parser.add_argument('--expr_dir', default=None,
                         help='Output dir for H^n + Julia scripts (stages 3-4). '
                              'Default: QD_R11_Julia_exp/no_expansion (no-expand) '
@@ -615,9 +640,9 @@ def main():
     if args.expr_dir is not None:
         expr_dir_path = args.expr_dir
     elif expand:
-        expr_dir_path = 'QD_R11_expressions'
+        expr_dir_path = 'QD_R11_expressions_cell' if args.partition_mode == 'cell' else 'QD_R11_expressions'
     else:
-        expr_dir_path = 'QD_R11_Julia_exp/no_expansion'
+        expr_dir_path = 'QD_R11_Julia_exp/no_expansion_cell' if args.partition_mode == 'cell' else 'QD_R11_Julia_exp/no_expansion'
 
     # Auto E_hi from grid parameters (use ceil to match build_qd_cube)
     Ng = int(np.ceil(2 * BOX_HALF / D_GRID))
@@ -642,6 +667,7 @@ def main():
         run_space_partition(
             args.cube_file, args.params_file, args.vexpr_dir,
             L_s=BOX_HALF, n_divisions=N_DIVISIONS, r_cut=R_CUT,
+            partition_mode=args.partition_mode, cell_edge=args.cell_edge,
         )
 
     if 3 in stages:
