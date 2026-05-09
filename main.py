@@ -93,6 +93,7 @@ from fft_code.params       import IstParams, PhysParams
 from fft_code.grid         import build_k_diagonal
 from fft_code.wavefunction import random_sine_psi, random_pm1_psi, normalize_psi
 from fft_code.hamiltonian  import apply_H
+from fft_code.hamiltonian  import apply_chebyshev_explosion
 from fft_code.filter_coeff import build_filter_coefficients, make_filter_func
 from fft_code.potentials   import build_potential_from_config
 from fft_code.plotting     import (
@@ -147,6 +148,9 @@ CONFIG: Dict[str, Any] = {
     "n0": 4,
     "beta": 45.0,
     "E1": 0.1,
+    "cheb_m": 20,
+    "cheb_E_lo": -0.60,
+    "cheb_E_hi": 50.0,
 
     # ---------- Newton 插值节点选取方式 ----------
     "samp_method": "ashkenazy",
@@ -303,8 +307,11 @@ def run(cfg: Dict[str, Any]) -> None:
     samp_method = cfg.get("samp_method", "ashkenazy")
     par         = PhysParams(dE=cfg["dE"], Vmin=cfg["Vmin"], dt=dt)
 
-    filter_func = make_filter_func(
-        filter_type, dt=dt, alpha_f=alpha_f, k_f=k_f, n0=n0, beta=beta, E1=E1)
+    if filter_type != "chebyshev_explosion":
+        filter_func = make_filter_func(
+            filter_type, dt=dt, alpha_f=alpha_f, k_f=k_f, n0=n0, beta=beta, E1=E1)
+    else:
+        filter_func = None
 
     print(f"   nc (initial)={nc},  dE={par.dE},  Vmin={par.Vmin},  dt={dt:.4f}")
     print(f"   Filter type : {filter_type}")
@@ -320,6 +327,12 @@ def run(cfg: Dict[str, Any]) -> None:
             filter_label = f"SplitBandpass hi×lo (beta={beta}, E1={E1})"
         else:
             filter_label = f"Bandpass (beta={beta}, E1={E1})"
+    elif filter_type == "chebyshev_explosion":
+        cheb_m = int(cfg.get("cheb_m", nc))
+        cheb_E_lo = float(cfg.get("cheb_E_lo", cfg.get("Vmin", -1.0)))
+        cheb_E_hi = float(cfg.get("cheb_E_hi", float(V.max()) + kinetic_cut))
+        print(f"   cheb_m = {cheb_m},  E_lo = {cheb_E_lo},  E_hi = {cheb_E_hi}")
+        filter_label = f"ChebyshevExplosion (m={cheb_m}, E_lo={cheb_E_lo}, E_hi={cheb_E_hi})"
     else:
         filter_label = filter_type
     print(f"   Sampling method : {samp_method}")
@@ -359,6 +372,9 @@ def run(cfg: Dict[str, Any]) -> None:
         an_lo = compute_newton_an(filter_func_lo, El_list, samp, par)
         an    = compute_newton_an(filter_func,    El_list, samp, par)
         print(f"   split_bandpass: hi + lo 各 nc={len(samp)} 节点，共享同一套 samp")
+    elif filter_type == "chebyshev_explosion":
+        samp = np.array([], dtype=float)
+        an = np.zeros((len(El_list), 1), dtype=float)
     else:
         an, samp = build_filter_coefficients(
             El_list, par, nc,
@@ -393,11 +409,12 @@ def run(cfg: Dict[str, Any]) -> None:
             (an_lo, make_filter_func("lowpass",  beta=beta, E1=E1), "Lowpass"),
         ]
 
-    plot_filter_interpolation(El_list, an, samp, par, interval, out_dir,
-                              filter_func=filter_func, filter_label=filter_label,
-                              samp_ref=samp_ref_nodes,
-                              samp_ref_label=f"plain Chebyshev (nc={nc_true})",
-                              extra_components=extra_comps)
+    if filter_type != "chebyshev_explosion":
+        plot_filter_interpolation(El_list, an, samp, par, interval, out_dir,
+                                  filter_func=filter_func, filter_label=filter_label,
+                                  samp_ref=samp_ref_nodes,
+                                  samp_ref_label=f"plain Chebyshev (nc={nc_true})",
+                                  extra_components=extra_comps)
 
     bands  = cfg.get("plot_window_bands", {})
     target = bands.get("target", None)
@@ -422,10 +439,11 @@ def run(cfg: Dict[str, Any]) -> None:
                 lambda x, El: _filt_func_highpass_band(x, El, beta, E1))
             cmp_funcs[f"Lowpass (beta={beta}, E1={E1})"] = (
                 lambda x, El: _filt_func_lowpass_band(x, El, beta, E1))
-    plot_window_comparison(El_list, par, interval, out_dir,
-                           window_funcs=cmp_funcs,
-                           highlight_band=target,
-                           gap_band=gap)
+    if filter_type != "chebyshev_explosion":
+        plot_window_comparison(El_list, par, interval, out_dir,
+                               window_funcs=cmp_funcs,
+                               highlight_band=target,
+                               gap_band=gap)
 
     # ================================================================
     # 4. 滤波随机态（filter_core.apply_filter_H_all_op）
@@ -456,6 +474,14 @@ def run(cfg: Dict[str, Any]) -> None:
             for ie in range(ist.ms):
                 psi_filt_all[ie] = apply_filter_H_op(
                     H_apply_fft, psi_hi_all[ie], samp, an_lo[ie], par)
+        elif filter_type == "chebyshev_explosion":
+            cheb_m = int(cfg.get("cheb_m", nc))
+            cheb_E_lo = float(cfg.get("cheb_E_lo", cfg.get("Vmin", -1.0)))
+            cheb_E_hi = float(cfg.get("cheb_E_hi", float(V.max()) + kinetic_cut))
+            psi_f = apply_chebyshev_explosion(
+                psi_rand, V, T_k_diagonal, cheb_m, cheb_E_lo, cheb_E_hi
+            )
+            psi_filt_all = np.stack([psi_f for _ in range(ist.ms)], axis=0)
         else:
             psi_filt_all = apply_filter_H_all_op(
                 H_apply_fft, psi_rand, samp, an, par)           # (ms, Nx, Ny, Nz)
