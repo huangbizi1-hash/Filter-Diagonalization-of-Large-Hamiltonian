@@ -18,7 +18,7 @@ from sympy import symbols, exp
 class CubicSpacePartition:
     """将 3-D 空间分割为等大小的立方体，为每个非空立方体构建势能符号表达式。"""
 
-    def __init__(self, params_file, atoms, L_s=8.0, n_divisions=4, r_cut=5.0):
+    def __init__(self, params_file, atoms, L_s=8.0, n_divisions=4, r_cut=5.0, cube_size=None, anchor_corner=None):
         """
         Parameters
         ----------
@@ -41,14 +41,20 @@ class CubicSpacePartition:
         self.L_s = L_s
         self.n_divisions = n_divisions
         self.r_cut = r_cut
-        self.l0 = 2 * L_s / n_divisions  # side length of one cube
+        self.anchor_corner = np.array(anchor_corner, dtype=float) if anchor_corner is not None else None
+        self.l0 = float(cube_size) if cube_size is not None else 2 * L_s / n_divisions  # side length of one cube
 
         print(f"\n{'='*70}")
         print("CUBIC SPACE PARTITION SETUP")
         print(f"{'='*70}")
         print(f"  Atom types loaded : {list(self.atom_params.keys())}")
         print(f"  Space             : [{-L_s:.1f}, {L_s:.1f}]^3 Bohr")
-        print(f"  Divisions/dim     : {n_divisions}  →  {n_divisions**3} cubes")
+        if cube_size is None:
+            print(f"  Divisions/dim     : {n_divisions}  →  {n_divisions**3} cubes")
+        else:
+            print(f"  Partition mode    : crystal-cell cubes (auto-count)")
+            if self.anchor_corner is not None:
+                print(f"  Anchor corner     : ({self.anchor_corner[0]:.3f}, {self.anchor_corner[1]:.3f}, {self.anchor_corner[2]:.3f})")
         print(f"  Cube side length  : {self.l0:.3f} Bohr")
         print(f"  Cutoff radius     : {r_cut:.2f} Bohr")
         print(f"  Total atoms       : {len(atoms)}")
@@ -65,10 +71,23 @@ class CubicSpacePartition:
     def _generate_cube_centers(self):
         centers = []
         half = self.l0 / 2.0
-        coords = np.linspace(-self.L_s + half, self.L_s - half, self.n_divisions)
-        for i, cx in enumerate(coords):
-            for j, cy in enumerate(coords):
-                for k, cz in enumerate(coords):
+        if self.anchor_corner is None:
+            coords = np.linspace(-self.L_s + half, self.L_s - half, self.n_divisions)
+        else:
+            lo, hi = -self.L_s, self.L_s
+            nmin = np.floor((lo - self.anchor_corner) / self.l0).astype(int)
+            nmax = np.ceil((hi - self.anchor_corner) / self.l0).astype(int) - 1
+            coords_xyz = [self.anchor_corner[d] + (np.arange(nmin[d], nmax[d] + 1) + 0.5) * self.l0 for d in range(3)]
+            coords = None
+        if coords is not None:
+            iter_x = list(enumerate(coords)); iter_y = list(enumerate(coords)); iter_z = list(enumerate(coords))
+        else:
+            iter_x = [(int(ii), cx) for ii, cx in zip(range(len(coords_xyz[0])), coords_xyz[0])]
+            iter_y = [(int(jj), cy) for jj, cy in zip(range(len(coords_xyz[1])), coords_xyz[1])]
+            iter_z = [(int(kk), cz) for kk, cz in zip(range(len(coords_xyz[2])), coords_xyz[2])]
+        for i, cx in iter_x:
+            for j, cy in iter_y:
+                for k, cz in iter_z:
                     centers.append({
                         'index': (i, j, k),
                         'center': np.array([cx, cy, cz]),
