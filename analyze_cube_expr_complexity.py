@@ -11,8 +11,7 @@ except Exception as e:  # noqa
     raise SystemExit("sympy is required. Please install with: pip install sympy") from e
 
 ATOM_RE = re.compile(r"_total_(\d+)_inside_")
-CENTER_RE = re.compile(r"cube_center_([-\d\.]+)_([-\d\.]+)_([-\d\.]+)")
-
+CENTER_RE = re.compile(r"cube(?:_center)?_([^_]+)_([^_]+)_([^_]+)")
 
 def parse_atom_count(name: str) -> int | None:
     m = ATOM_RE.search(name)
