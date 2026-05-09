@@ -177,14 +177,18 @@ def build_julia_batch_script(terms_cos, terms_sin):
     # --- eval_one_wave! ---
     # Uses pre-allocated phase/cos_p/sin_p buffers to avoid per-wave allocation.
     # Vectorised trig via Julia's @. (SLEEF SIMD) then scalar poly loop.
-    cos_terms = ' + '.join(
-        f'exp_cos[i,{i+1}] * _poly_cos_{i}(X[i], Y[i], Z[i], kx, ky, kz)'
+    # IMPORTANT: use sequential += accumulation (not a single joined expression)
+    # so that Julia's JIT can optimise each statement independently.
+    cos_accum = '\n'.join(
+        f'        _sum_cos += exp_cos[i,{i+1}]'
+        f' * _poly_cos_{i}(X[i], Y[i], Z[i], kx, ky, kz)'
         for i in range(n_cos)
-    ) if n_cos else '0.0'
-    sin_terms = ' + '.join(
-        f'exp_sin[i,{i+1}] * _poly_sin_{i}(X[i], Y[i], Z[i], kx, ky, kz)'
+    )
+    sin_accum = '\n'.join(
+        f'        _sum_sin += exp_sin[i,{i+1}]'
+        f' * _poly_sin_{i}(X[i], Y[i], Z[i], kx, ky, kz)'
         for i in range(n_sin)
-    ) if n_sin else '0.0'
+    )
 
     L += ['function eval_one_wave!(out::AbstractVector{Float64},',
           '                        X::Vector{Float64}, Y::Vector{Float64}, Z::Vector{Float64},',
@@ -198,7 +202,11 @@ def build_julia_batch_script(terms_cos, terms_sin):
           '    @. sin_p = sin(phase)',
           '    N = length(X)',
           '    @inbounds for i in 1:N',
-          f'        out[i] = ({cos_terms}) * cos_p[i] + ({sin_terms}) * sin_p[i]',
+          '        _sum_cos = 0.0',
+          (cos_accum if cos_accum else '        # no cos terms'),
+          '        _sum_sin = 0.0',
+          (sin_accum if sin_accum else '        # no sin terms'),
+          '        out[i] = cos_p[i] * _sum_cos + sin_p[i] * _sum_sin',
           '    end',
           'end', '']
 

@@ -132,18 +132,19 @@ def find_jl_file(expr_dir, cube_dir_name, n):
     return matches[0] if matches else None
 
 
-def generate_jl_for_cube(cube_dir, n, a, b, expand=False):
+def generate_jl_for_cube(cube_dir, n, a, b, expand=False, regen=False):
     """Generate eval_filter_m{n}_*.jl from H^n pkl files.
 
     Uses the same codegen as run_qd_r11.py Stage 4.
     Returns jl_path on success, None if H_power_{n}.pkl is missing.
+    When regen=True, overwrites any existing .jl file.
     """
     cube_dir = Path(cube_dir)
     if not (cube_dir / f'H_power_{n}.pkl').exists():
         return None
 
     jl_path = cube_dir / _jl_name_for(n, a, b)
-    if jl_path.exists():
+    if jl_path.exists() and not regen:
         return jl_path
 
     try:
@@ -168,14 +169,15 @@ def generate_jl_for_cube(cube_dir, n, a, b, expand=False):
         return None
 
 
-def find_or_generate_jl(expr_dir, cube_dir_name, n, a, b, expand=False):
-    jl_path = find_jl_file(expr_dir, cube_dir_name, n)
-    if jl_path is not None:
-        return jl_path
+def find_or_generate_jl(expr_dir, cube_dir_name, n, a, b, expand=False, regen=False):
+    if not regen:
+        jl_path = find_jl_file(expr_dir, cube_dir_name, n)
+        if jl_path is not None:
+            return jl_path
     cube_dir = Path(expr_dir) / cube_dir_name
     if not cube_dir.exists():
         return None
-    return generate_jl_for_cube(cube_dir, n, a, b, expand=expand)
+    return generate_jl_for_cube(cube_dir, n, a, b, expand=expand, regen=regen)
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +356,7 @@ def _pick_cubes_by_atom_counts(candidates, atom_counts, rng):
 def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                    sample, seed, julia_exe, outdir, a, b,
                    select_atoms=None, expand=False, do_timing=True,
-                   do_sympy_timing=False, nop_json_path=None):
+                   do_sympy_timing=False, nop_json_path=None, regen=False):
     """For --sample cubes sweep n=1..m_max; count ops and optionally time."""
     rng = np.random.default_rng(seed)
     _, X, Y, Z = build_full_grid(L_s, d_grid)
@@ -413,7 +415,7 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
             for n in range(1, m_max + 1):
                 # --- find or generate .jl for order n ---
                 jl_path = find_or_generate_jl(
-                    expr_dir, rec['dirname'], n, a, b, expand=expand)
+                    expr_dir, rec['dirname'], n, a, b, expand=expand, regen=regen)
                 if jl_path is None:
                     print(f"    n={n}: no pkl/jl – skipped")
                     continue
@@ -609,13 +611,13 @@ def _plot_sweep(rows, outdir, m_max, do_timing):
 # ---------------------------------------------------------------------------
 
 def _collect_full_records(manager, expr_dir, m, Ng, N_DIVISIONS, X, Y, Z,
-                           a, b, expand, max_cubes):
+                           a, b, expand, max_cubes, regen=False):
     records = []
     for idx in sorted(manager.cube_info.keys()):
         info = manager.cube_info[idx]
         cx, cy, cz = info['center']
         dirname = _cube_dirname(cx, cy, cz)
-        jl_path = find_or_generate_jl(expr_dir, dirname, m, a, b, expand=expand)
+        jl_path = find_or_generate_jl(expr_dir, dirname, m, a, b, expand=expand, regen=regen)
         if jl_path is None:
             continue
         Xf, Yf, Zf, _ = cube_interior_points(idx, Ng, N_DIVISIONS, X, Y, Z)
@@ -632,7 +634,8 @@ def _collect_full_records(manager, expr_dir, m, Ng, N_DIVISIONS, X, Y, Z,
 
 
 def run_full_mode(manager, expr_dir, m, n_waves, k_max, L_s, d_grid,
-                  julia_exe, outdir, max_cubes=None, a=None, b=None, expand=False):
+                  julia_exe, outdir, max_cubes=None, a=None, b=None, expand=False,
+                  regen=False):
     rng = np.random.default_rng(42)
     _, X, Y, Z = build_full_grid(L_s, d_grid)
     Ng, N_DIVISIONS, cube_size = infer_grid_params(manager, L_s, d_grid)
@@ -640,7 +643,8 @@ def run_full_mode(manager, expr_dir, m, n_waves, k_max, L_s, d_grid,
           f"N_DIVISIONS={N_DIVISIONS}  cube_size={cube_size:.3f} Bohr")
 
     all_records = _collect_full_records(
-        manager, expr_dir, m, Ng, N_DIVISIONS, X, Y, Z, a, b, expand, max_cubes)
+        manager, expr_dir, m, Ng, N_DIVISIONS, X, Y, Z, a, b, expand, max_cubes,
+        regen=regen)
     print(f"  Cubes to run: {len(all_records)}")
 
     k_vals = rng.uniform(-k_max, k_max, (n_waves, 3))
@@ -838,6 +842,9 @@ def main():
                         help='Output directory (default figs_qd_timing/)')
     parser.add_argument('--nop_json', default=None,
                         help='Optional JSON path to save atoms->n->Nop_tot summary in sweep mode')
+    parser.add_argument('--regen', action='store_true', default=False,
+                        help='Force re-generation of all .jl files even if they exist on disk '
+                             '(needed after julia_codegen.py is updated)')
     args = parser.parse_args()
 
     if args.n_waves < 2 and not args.no_timing:
@@ -920,7 +927,8 @@ def main():
             a=a, b=b, select_atoms=select_atoms, expand=args.expand,
             do_timing=not args.no_timing,
             do_sympy_timing=args.sympy_timing,
-            nop_json_path=args.nop_json)
+            nop_json_path=args.nop_json,
+            regen=args.regen)
 
     if args.mode in ('full', 'both'):
         print(f"\n{'='*60}")
@@ -932,7 +940,7 @@ def main():
             args.L_s, args.d_grid,
             args.julia_exe, args.outdir,
             max_cubes=args.max_cubes,
-            a=a, b=b, expand=args.expand)
+            a=a, b=b, expand=args.expand, regen=args.regen)
 
     print('\nDone.')
 

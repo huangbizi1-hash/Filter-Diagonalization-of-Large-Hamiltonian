@@ -50,6 +50,7 @@ from benchmark_strategies import (
     _EVAL_SIG, _TRIG_BLOCK, run_julia, prepare_expressions,
     build_baseline,
 )
+from symbolic_code.julia_codegen import build_julia_batch_script
 from symbolic_code.chebyshev_filter import (
     apply_horner,
     apply_f_of_H_from_raw_powers,
@@ -244,9 +245,13 @@ def run_threshold_sweep(terms_cos, terms_sin, thresholds, repl, reduced, counts,
 
         max_err = None
         if reference_out is not None and raw_out is not None:
-            max_err = float(np.abs(raw_out - reference_out).max())
-            status = 'OK' if max_err < 1e-6 else 'WARNING'
-            print(f'  vs baseline: max|diff|={max_err:.2e}  [{status}]')
+            diff = np.abs(raw_out - reference_out)
+            n_nan = int(np.isnan(diff).sum())
+            valid = ~np.isnan(diff)
+            max_err = float(diff[valid].max()) if valid.any() else float('nan')
+            status = 'OK' if (not np.isnan(max_err) and max_err < 1e-6) else 'WARNING'
+            nan_str = f'  nan_pts={n_nan}/{diff.size}' if n_nan > 0 else ''
+            print(f'  vs baseline: max|diff|={max_err:.2e}  [{status}]{nan_str}')
 
         results[f'{label_prefix}_t{min_count}'] = {
             'label': f'{label_prefix}_t{min_count}',
@@ -571,27 +576,51 @@ def main():
     with tempfile.TemporaryDirectory(prefix='bench_thresh_') as work_dir:
 
         # ---- Baseline (Horner, no CSE) ----
+        # Generate a fresh .jl via build_julia_batch_script so that the
+        # sequential-+= accumulation style (JIT-friendly) is guaranteed.
+        # Uses the same Horner-applied terms as the CSE sweep (terms_cos_h /
+        # terms_sin_h), so the comparison is apples-to-apples.
+        # Fall back to pre-Horner terms only if Horner was not computed.
         print(f'\n{"="*60}')
-        print('Baseline: Horner (no explicit CSE)')
-        jl_src, _, _, extra = build_baseline(terms_cos, terms_sin)
-        jl_file = outdir / f'eval_baseline_m{args.m}.jl'
-        jl_file.write_text(jl_src)
-        print(f'  ops_post={extra["ops_post"]}  '
-              f'.jl size={len(jl_src):,} bytes')
-        timing, raw_out = run_julia(jl_file, X, Y, Z, k_vals, b_vals, work_dir,
-                                    args.julia_exe, n_reps=args.n_reps)
-        mspw = timing['ms_per_wave']
-        print(f'  warmup={timing["warmup_s"]*1000:.1f}ms  eval={mspw:.3f}ms/wave')
-        reference_out = raw_out.copy() if raw_out is not None else None
-        results['baseline_horner'] = {
-            'label': 'baseline_horner', 'min_count': None,
-            'n_kept': None, 'ops_post': extra['ops_post'],
-            'ms_per_wave': mspw,
-            'warmup_ms': timing['warmup_s'] * 1000,
-            'max_err': 0.0,
-        }
-        if not args.save_jl:
-            jl_file.unlink(missing_ok=True)
+        if qd_mode and terms_cos_h is not None:
+            print('Baseline: Horner (no CSE, sequential += via build_julia_batch_script)')
+            jl_src = build_julia_batch_script(terms_cos_h, terms_sin_h)
+            jl_file = Path(work_dir) / f'eval_baseline_stage4_m{args.m}.jl'
+            jl_file.write_text(jl_src)
+            print(f'  .jl size={len(jl_src):,} bytes')
+            timing, raw_out = run_julia(jl_file, X, Y, Z, k_vals, b_vals, work_dir,
+                                        args.julia_exe, n_reps=args.n_reps)
+            mspw = timing['ms_per_wave']
+            print(f'  warmup={timing["warmup_s"]*1000:.1f}ms  eval={mspw:.3f}ms/wave')
+            reference_out = raw_out.copy() if raw_out is not None else None
+            results['baseline_horner'] = {
+                'label': 'baseline_horner_stage4', 'min_count': None,
+                'n_kept': None, 'ops_post': None,
+                'ms_per_wave': mspw,
+                'warmup_ms': timing['warmup_s'] * 1000,
+                'max_err': 0.0,
+            }
+        else:
+            print('Baseline: Horner (no explicit CSE, build_baseline)')
+            jl_src, _, _, extra = build_baseline(terms_cos, terms_sin)
+            jl_file = outdir / f'eval_baseline_m{args.m}.jl'
+            jl_file.write_text(jl_src)
+            print(f'  ops_post={extra["ops_post"]}  '
+                  f'.jl size={len(jl_src):,} bytes')
+            timing, raw_out = run_julia(jl_file, X, Y, Z, k_vals, b_vals, work_dir,
+                                        args.julia_exe, n_reps=args.n_reps)
+            mspw = timing['ms_per_wave']
+            print(f'  warmup={timing["warmup_s"]*1000:.1f}ms  eval={mspw:.3f}ms/wave')
+            reference_out = raw_out.copy() if raw_out is not None else None
+            results['baseline_horner'] = {
+                'label': 'baseline_horner', 'min_count': None,
+                'n_kept': None, 'ops_post': extra['ops_post'],
+                'ms_per_wave': mspw,
+                'warmup_ms': timing['warmup_s'] * 1000,
+                'max_err': 0.0,
+            }
+            if not args.save_jl:
+                jl_file.unlink(missing_ok=True)
 
         # ---- Flat-CSE threshold sweep ----
         if do_flat:
@@ -613,7 +642,7 @@ def main():
             print(f'\n{"─"*60}')
             print('Horner-first CSE threshold sweep  ("baseline + CSE")')
             horner_results = run_threshold_sweep(
-                terms_cos, terms_sin, thresholds,
+                terms_cos_h, terms_sin_h, thresholds,
                 repl_h, reduced_h, counts_h,
                 label_prefix='hcse_t',
                 work_dir=work_dir,
@@ -642,9 +671,9 @@ def main():
             print(f'{r.get("label","?"):<22}  ERROR: {r["error"][:30]}')
             return
         mspw   = r.get('ms_per_wave')
-        n_kept = r.get('n_kept', '-')
-        min_c  = r.get('min_count', '-')
-        ops_p  = r.get('ops_post', '-')
+        n_kept = r.get('n_kept') if r.get('n_kept') is not None else '-'
+        min_c  = r.get('min_count') if r.get('min_count') is not None else '-'
+        ops_p  = r.get('ops_post') if r.get('ops_post') is not None else '-'
         wmup   = f'{r["warmup_ms"]:.0f}' if r.get('warmup_ms') else '-'
         if ref_ms and mspw:
             ratio  = ref_ms / mspw
