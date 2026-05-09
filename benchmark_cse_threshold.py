@@ -50,6 +50,7 @@ from benchmark_strategies import (
     _EVAL_SIG, _TRIG_BLOCK, run_julia, prepare_expressions,
     build_baseline,
 )
+from symbolic_code.julia_codegen import build_julia_batch_script
 from symbolic_code.chebyshev_filter import (
     apply_horner,
     apply_f_of_H_from_raw_powers,
@@ -574,30 +575,33 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix='bench_thresh_') as work_dir:
 
-        # ---- Baseline ----
-        # QD mode: prefer Stage 4 .jl (loop-structured, JIT-friendly) over
-        # build_baseline (giant inline expression, JIT-unfriendly for 495+ groups).
+        # ---- Baseline (Horner, no CSE) ----
+        # Generate a fresh .jl via build_julia_batch_script so that the
+        # sequential-+= accumulation style (JIT-friendly) is guaranteed.
+        # Uses the same Horner-applied terms as the CSE sweep (terms_cos_h /
+        # terms_sin_h), so the comparison is apples-to-apples.
+        # Fall back to pre-Horner terms only if Horner was not computed.
         print(f'\n{"="*60}')
-        stage4_jl = (next(cube_dir.glob(f'eval_filter_m{args.m}_*.jl'), None)
-                     if qd_mode else None)
-
-        if stage4_jl is not None:
-            print(f'Baseline: Stage 4 .jl  ({stage4_jl.name})')
-            timing, raw_out = run_julia(
-                stage4_jl, X, Y, Z, k_vals, b_vals, work_dir,
-                args.julia_exe, n_reps=args.n_reps)
+        if qd_mode and terms_cos_h is not None:
+            print('Baseline: Horner (no CSE, sequential += via build_julia_batch_script)')
+            jl_src = build_julia_batch_script(terms_cos_h, terms_sin_h)
+            jl_file = Path(work_dir) / f'eval_baseline_stage4_m{args.m}.jl'
+            jl_file.write_text(jl_src)
+            print(f'  .jl size={len(jl_src):,} bytes')
+            timing, raw_out = run_julia(jl_file, X, Y, Z, k_vals, b_vals, work_dir,
+                                        args.julia_exe, n_reps=args.n_reps)
             mspw = timing['ms_per_wave']
             print(f'  warmup={timing["warmup_s"]*1000:.1f}ms  eval={mspw:.3f}ms/wave')
             reference_out = raw_out.copy() if raw_out is not None else None
             results['baseline_horner'] = {
-                'label': 'baseline_stage4', 'min_count': None,
+                'label': 'baseline_horner_stage4', 'min_count': None,
                 'n_kept': None, 'ops_post': None,
                 'ms_per_wave': mspw,
                 'warmup_ms': timing['warmup_s'] * 1000,
                 'max_err': 0.0,
             }
         else:
-            print('Baseline: Horner (no explicit CSE)')
+            print('Baseline: Horner (no explicit CSE, build_baseline)')
             jl_src, _, _, extra = build_baseline(terms_cos, terms_sin)
             jl_file = outdir / f'eval_baseline_m{args.m}.jl'
             jl_file.write_text(jl_src)
