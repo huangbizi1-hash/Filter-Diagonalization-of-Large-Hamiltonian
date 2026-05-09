@@ -220,6 +220,7 @@ def process_all_cubes(
     base_outdir='H_powers_basis_partitioned',
     file_format='sym.gz',
     method='raw',
+    expand=True,
 ):
     """Generate H^n or (aH+b)^n * psi for every cube in *manager*.
 
@@ -234,6 +235,10 @@ def process_all_cubes(
     method : 'raw' | 'scaled'
         'raw'    – pure H^n; files reusable for any energy window (default).
         'scaled' – (aH+b)^n with a,b baked in.
+    expand : bool
+        Passed to generate_H_powers.  True (default) flattens expressions at
+        each step; False preserves the product-tree structure (smaller pkl,
+        faster generation, better for sp.cse() later).
     """
     if method == 'scaled' and (a is None or b is None):
         raise ValueError("method='scaled' requires a and b (from E_lo, E_hi)")
@@ -251,7 +256,7 @@ def process_all_cubes(
     done = skipped = 0
 
     print(f"\n{'='*70}")
-    print(f"PROCESSING ALL CUBES  method={method}  N={N}", end='')
+    print(f"PROCESSING ALL CUBES  method={method}  N={N}  expand={expand}", end='')
     if method == 'scaled':
         print(f"  a={a:.4f}  b={b:.4f}")
     else:
@@ -286,6 +291,7 @@ def process_all_cubes(
             else:
                 generate_H_powers(
                     N, outdir=cube_dir, file_format=file_format,
+                    expand=expand,
                     V=V_expr, kvec=kvec, k2=k2, pref=pref, x=x, y=y, z=z,
                 )
             print(f"  ✓ powers 0…{N} in {cube_dir.name}/")
@@ -302,6 +308,7 @@ def process_specific_cubes(
     base_outdir='H_powers_basis_partitioned',
     file_format='sym.gz',
     method='raw',
+    expand=True,
 ):
     """Like process_all_cubes but for a subset of cube indices."""
     if method == 'scaled' and (a is None or b is None):
@@ -316,7 +323,7 @@ def process_specific_cubes(
     k2   = kx**2 + ky**2 + kz**2
     pref = 0.5
 
-    print(f"Processing {len(cube_indices)} specific cubes (method={method}) ...")
+    print(f"Processing {len(cube_indices)} specific cubes (method={method} expand={expand}) ...")
 
     for idx in cube_indices:
         i, j, k = idx
@@ -342,6 +349,7 @@ def process_specific_cubes(
             else:
                 generate_H_powers(
                     N, outdir=cube_dir, file_format=file_format,
+                    expand=expand,
                     V=V_expr, kvec=kvec, k2=k2, pref=pref, x=x, y=y, z=z,
                 )
             print(f"    ✓ complete")

@@ -188,9 +188,17 @@ def run_space_partition(cube_file, params_file, vexpr_dir,
 # Stage 3 – H^n expressions
 # ===========================================================================
 
-def run_h_powers(vexpr_dir, expr_dir, m_max, file_format='pkl'):
-    """Generate H^n pkl files for every cube in *vexpr_dir*."""
-    print(f"\n  Stage 3: generating H^0…{m_max} for each cube → {expr_dir}")
+def run_h_powers(vexpr_dir, expr_dir, m_max, file_format='pkl', expand=False):
+    """Generate H^n pkl files for every cube in *vexpr_dir*.
+
+    expand=False (default) preserves the product-tree structure of each H^n
+    expression — smaller pkl files, faster generation, and the trees carry
+    factored sub-expressions that sp.cse() can exploit when building Julia code.
+    The assembly step in Stage 4 still calls sp.expand() to flatten before
+    group_by_exp_combined, so the final Julia code is identical either way.
+    """
+    print(f"\n  Stage 3: generating H^0…{m_max} for each cube "
+          f"(expand={expand}) → {expr_dir}")
     manager = CubicExpressionManager(str(vexpr_dir))
     if not manager.expressions:
         raise RuntimeError(f"No cube expressions found in {vexpr_dir}")
@@ -200,6 +208,7 @@ def run_h_powers(vexpr_dir, expr_dir, m_max, file_format='pkl'):
         base_outdir=str(expr_dir),
         file_format=file_format,
         method='raw',
+        expand=expand,
     )
 
 
@@ -214,15 +223,22 @@ def _cube_dirname(cx, cy, cz):
     return f"cube_{fmt(cx)}_{fmt(cy)}_{fmt(cz)}"
 
 
-def run_julia_codegen(vexpr_dir, expr_dir, m, E_lo, E_hi):
-    """Build and cache eval_filter_m{m}_*.jl in every cube subdir of expr_dir."""
+def run_julia_codegen(vexpr_dir, expr_dir, m, E_lo, E_hi, expand=False):
+    """Build and cache eval_filter_m{m}_*.jl in every cube subdir of expr_dir.
+
+    When expand=False (default), the H^n pkl files were generated without
+    sp.expand().  Assembly uses return_envelopes=True to avoid the sin/cos
+    wrapping, then sp.expand() is called on the envelopes directly — this is
+    faster than wrapping+extracting and yields identical Julia code.
+    """
     a = 2.0 / (E_hi - E_lo)
     b = -(E_hi + E_lo) / (E_hi - E_lo)
     a_key = f"{a:.8g}".replace('.', 'p').replace('-', 'm')
     b_key = f"{b:.8g}".replace('.', 'p').replace('-', 'm')
     jl_name = f"eval_filter_m{m}_{a_key}_{b_key}.jl"
 
-    print(f"\n  Stage 4: Julia codegen for m={m}, E_lo={E_lo}, E_hi={E_hi:.4f}")
+    print(f"\n  Stage 4: Julia codegen for m={m}, E_lo={E_lo}, E_hi={E_hi:.4f} "
+          f"(expand={expand})")
     print(f"    a={a:.6f}  b={b:.6f}  → {jl_name}")
 
     expr_dir  = Path(expr_dir)
@@ -250,9 +266,19 @@ def run_julia_codegen(vexpr_dir, expr_dir, m, E_lo, E_hi):
         # Assemble f(H)*psi and build Julia script
         try:
             t0 = time.time()
-            psi_fH = apply_f_of_H_from_raw_powers(str(cube_dir), m, a=a, b=b,
-                                                   file_type='pkl')
-            expr_cos, expr_sin = extract_cos_sin_coeffs(psi_fH)
+            if not expand:
+                # Faster path: get envelopes directly (no sin/cos wrapping),
+                # then expand them here so group_by_exp_combined can decompose
+                # the Gaussian factors correctly.
+                expr_cos_raw, expr_sin_raw = apply_f_of_H_from_raw_powers(
+                    str(cube_dir), m, a=a, b=b,
+                    file_type='pkl', return_envelopes=True)
+                expr_cos = sp.expand(expr_cos_raw)
+                expr_sin = sp.expand(expr_sin_raw)
+            else:
+                psi_fH = apply_f_of_H_from_raw_powers(str(cube_dir), m, a=a, b=b,
+                                                       file_type='pkl')
+                expr_cos, expr_sin = extract_cos_sin_coeffs(psi_fH)
             terms_cos = apply_horner(group_by_exp_combined(expr_cos))
             terms_sin = apply_horner(group_by_exp_combined(expr_sin))
             jl_src = build_julia_batch_script(terms_cos, terms_sin)
@@ -573,18 +599,33 @@ def main():
                         help='Gaussian fit parameters JSON')
     parser.add_argument('--vexpr_dir', default='QD_R11_Vexpr',
                         help='Output dir for V_expr pkl files (stage 2)')
-    parser.add_argument('--expr_dir', default='QD_R11_expressions',
-                        help='Output dir for H^n + Julia scripts (stages 3-4)')
+    parser.add_argument('--expr_dir', default=None,
+                        help='Output dir for H^n + Julia scripts (stages 3-4). '
+                             'Default: QD_R11_Julia_exp/no_expansion (no-expand) '
+                             'or QD_R11_expressions (--expand)')
+    parser.add_argument('--expand', action='store_true', default=False,
+                        help='Use sp.expand() at each H^n step (legacy; default: off). '
+                             'Off = faster generation, smaller pkl, identical Julia output.')
     args = parser.parse_args()
 
     stages = set(int(s.strip()) for s in args.stages.split(','))
+    expand = args.expand
+
+    # Auto-select expr_dir based on expand flag if not explicitly set
+    if args.expr_dir is not None:
+        expr_dir_path = args.expr_dir
+    elif expand:
+        expr_dir_path = 'QD_R11_expressions'
+    else:
+        expr_dir_path = 'QD_R11_Julia_exp/no_expansion'
 
     # Auto E_hi from grid parameters (use ceil to match build_qd_cube)
     Ng = int(np.ceil(2 * BOX_HALF / D_GRID))
     E_hi_ref = _estimate_E_hi(BOX_HALF, Ng)
     print(f"QD R=11 pipeline  |  grid {Ng}^3  |  E_hi_ref={E_hi_ref:.2f} Hartree")
     E_hi = args.E_hi if args.E_hi is not None else E_hi_ref
-    print(f"Using E_hi={E_hi:.4f}  E_lo={args.E_lo}  m={args.m}\n")
+    print(f"Using E_hi={E_hi:.4f}  E_lo={args.E_lo}  m={args.m}  "
+          f"expand={expand}  expr_dir={expr_dir_path}\n")
 
     t_start = time.time()
 
@@ -607,14 +648,14 @@ def main():
         print("\n" + "=" * 60)
         print("Stage 3: H^n expressions")
         print("=" * 60)
-        run_h_powers(args.vexpr_dir, args.expr_dir, args.m)
+        run_h_powers(args.vexpr_dir, expr_dir_path, args.m, expand=expand)
 
     if 4 in stages:
         print("\n" + "=" * 60)
         print("Stage 4: Julia eval scripts")
         print("=" * 60)
         run_julia_codegen(
-            args.vexpr_dir, args.expr_dir, args.m, args.E_lo, E_hi
+            args.vexpr_dir, expr_dir_path, args.m, args.E_lo, E_hi, expand=expand
         )
 
     if 5 in stages:
@@ -623,7 +664,7 @@ def main():
         print("=" * 60)
         energies = run_filter_diag(
             vexpr_dir=args.vexpr_dir,
-            expr_dir=args.expr_dir,
+            expr_dir=expr_dir_path,
             m=args.m,
             E_lo=args.E_lo,
             E_hi=E_hi,
@@ -637,7 +678,7 @@ def main():
         )
 
         # Save eigenvalues to JSON
-        out_json = Path(args.expr_dir) / f'eigenvalues_m{args.m}_Elo{args.E_lo}.json'
+        out_json = Path(expr_dir_path) / f'eigenvalues_m{args.m}_Elo{args.E_lo}.json'
         out_json.parent.mkdir(parents=True, exist_ok=True)
         with open(out_json, 'w') as f:
             json.dump({
