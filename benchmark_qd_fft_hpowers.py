@@ -31,7 +31,7 @@ def build_qd17_potential(cube_file: str, params_file: str, r_cut: float, N: int 
 
 
 def benchmark_hpowers(V: np.ndarray, x_grid, n_max: int, n_waves: int, seed: int):
-    """Apply H repeatedly and measure per-order cost."""
+    """Apply H repeatedly and measure per-order / cumulative cost."""
     rng = np.random.default_rng(seed)
     N = V.shape[0]
     T_k = build_k_diagonal(x_grid)
@@ -41,6 +41,7 @@ def benchmark_hpowers(V: np.ndarray, x_grid, n_max: int, n_waves: int, seed: int
 
     rows = []
     current = psis
+    cumulative_ms = 0.0
 
     for n in range(1, n_max + 1):
         t0 = time.perf_counter()
@@ -52,8 +53,11 @@ def benchmark_hpowers(V: np.ndarray, x_grid, n_max: int, n_waves: int, seed: int
         pts = N**3
         h_applies = n_waves
         ms_total = dt * 1000.0
+        cumulative_ms += ms_total
         ms_per_wave = ms_total / n_waves
         ns_per_pt_per_wave = ms_per_wave / pts * 1e6
+        cumulative_ms_per_wave = cumulative_ms / n_waves
+        predicted_linear_ms = rows[0]["total_ms"] * n if rows else ms_total
 
         rows.append({
             "n": n,
@@ -63,12 +67,16 @@ def benchmark_hpowers(V: np.ndarray, x_grid, n_max: int, n_waves: int, seed: int
             "total_ms": round(ms_total, 3),
             "ms_per_wave": round(ms_per_wave, 6),
             "ns_per_pt_per_wave": round(ns_per_pt_per_wave, 6),
+            "cumulative_ms": round(cumulative_ms, 3),
+            "cumulative_ms_per_wave": round(cumulative_ms_per_wave, 6),
+            "pred_linear_ms_from_n1": round(predicted_linear_ms, 3),
             "h_applies": h_applies,
         })
 
         print(
             f"n={n:2d} | total={ms_total:9.3f} ms | "
             f"per_wave={ms_per_wave:9.4f} ms | "
+            f"cum={cumulative_ms:9.3f} ms | "
             f"{ns_per_pt_per_wave:9.3f} ns/pt/wave"
         )
 
@@ -89,6 +97,8 @@ def main():
     parser.add_argument("--n_waves", type=int, default=20, help="Number of trial waves")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     parser.add_argument("--outdir", default="figs_qd_timing", help="Output directory")
+    parser.add_argument("--warmup", type=int, default=1,
+                        help="Warmup H applies per wave before timing (default 1)")
     args = parser.parse_args()
 
     print("Building QD potential from files...")
@@ -96,6 +106,16 @@ def main():
     N = V.shape[0]
     print(f"  Grid: N={N}, points={N**3:,}")
     print(f"  V range: [{V.min():.6f}, {V.max():.6f}]")
+
+    # warmup removes first-call FFTW planning overhead from measured rows
+    if args.warmup > 0:
+        print(f"Warmup: {args.warmup} H-apply per wave (not counted)")
+        T_k = build_k_diagonal(x_grid)
+        rng = np.random.default_rng(args.seed + 999)
+        psi_w = rng.normal(size=(N, N, N)) + 1j * rng.normal(size=(N, N, N))
+        psi_w = psi_w.astype(np.complex128, copy=False)
+        for _ in range(args.warmup):
+            _ = apply_H(psi_w, V, T_k)
 
     print(f"\nBenchmark FFT H^n with n_max={args.n_max}, n_waves={args.n_waves}")
     rows = benchmark_hpowers(V, x_grid, args.n_max, args.n_waves, args.seed)
