@@ -456,9 +456,12 @@ def build_k_separate(terms_cos, terms_sin):
 # ---------------------------------------------------------------------------
 
 def run_julia(jl_path, X, Y, Z, k_vals, b_vals, work_dir, julia_exe, n_reps=3):
-    """Run a pre-built .jl file, average over n_reps; return timing dict + output."""
-    Ng = X.shape[0]
-    N = Ng ** 3
+    """Run a pre-built .jl file, average over n_reps; return timing dict + output.
+
+    X, Y, Z may be 3-D (shape Ng×Ng×Ng) or 1-D (n_pts flat interior points).
+    N is always X.size so both cases are handled correctly.
+    """
+    N = X.size
     n_waves = len(k_vals)
 
     grid_bin  = Path(work_dir) / '_g.bin'
