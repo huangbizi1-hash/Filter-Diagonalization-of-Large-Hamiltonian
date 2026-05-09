@@ -354,7 +354,7 @@ def _pick_cubes_by_atom_counts(candidates, atom_counts, rng):
 def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                    sample, seed, julia_exe, outdir, a, b,
                    select_atoms=None, expand=False, do_timing=True,
-                   do_sympy_timing=False):
+                   do_sympy_timing=False, nop_json_path=None):
     """For --sample cubes sweep n=1..m_max; count ops and optionally time."""
     rng = np.random.default_rng(seed)
     _, X, Y, Z = build_full_grid(L_s, d_grid)
@@ -496,6 +496,39 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
     print(f"\n  CSV  → {csv_path}")
 
     _plot_sweep(rows, outdir, m_max, do_timing)
+
+    if nop_json_path:
+        _write_nop_summary_json(rows, nop_json_path)
+
+
+def _write_nop_summary_json(rows, json_path):
+    """Write JSON: atoms -> n -> Nop_tot, plus cube metadata."""
+    summary = {}
+    for row in rows:
+        if row['part'] != 'Ps':
+            continue
+        cube = row['cube']
+        atoms = int(row['atoms'])
+        n = int(row['n'])
+
+        cos_row = next((r for r in rows
+                        if r['cube'] == cube and r['n'] == n and r['part'] == 'Pc'), None)
+        if cos_row is None:
+            continue
+        nop_tot = int(row['total']) + int(cos_row['total'])
+
+        atoms_key = str(atoms)
+        summary.setdefault(atoms_key, {'cube': cube, 'n_to_nop_tot': {}})
+        summary[atoms_key]['n_to_nop_tot'][str(n)] = nop_tot
+
+    json_path = Path(json_path)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        'description': 'Nop_tot per selected atom-count cube across Chebyshev order n',
+        'atoms_to_cube_and_nop_tot': summary,
+    }
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
+    print(f"  JSON → {json_path}")
 
 
 def _plot_sweep(rows, outdir, m_max, do_timing):
@@ -802,6 +835,8 @@ def main():
                         help='Julia executable (default julia)')
     parser.add_argument('--outdir', default='figs_qd_timing',
                         help='Output directory (default figs_qd_timing/)')
+    parser.add_argument('--nop_json', default=None,
+                        help='Optional JSON path to save atoms->n->Nop_tot summary in sweep mode')
     args = parser.parse_args()
 
     if args.n_waves < 2 and not args.no_timing:
@@ -873,7 +908,8 @@ def main():
             args.julia_exe, args.outdir,
             a=a, b=b, select_atoms=select_atoms, expand=args.expand,
             do_timing=not args.no_timing,
-            do_sympy_timing=args.sympy_timing)
+            do_sympy_timing=args.sympy_timing,
+            nop_json_path=args.nop_json)
 
     if args.mode in ('full', 'both'):
         print(f"\n{'='*60}")
