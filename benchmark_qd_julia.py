@@ -165,7 +165,7 @@ def generate_hn_jl_for_cube(cube_dir, n, regen=False):
         return None
 
 
-
+def generate_jl_for_cube(cube_dir, n, a, b, expand=False, regen=False):
     """Generate eval_filter_m{n}_*.jl from H^n pkl files.
 
     Uses the same codegen as run_qd_r11.py Stage 4.
