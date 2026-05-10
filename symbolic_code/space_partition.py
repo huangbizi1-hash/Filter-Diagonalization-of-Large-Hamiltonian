@@ -72,7 +72,13 @@ class CubicSpacePartition:
     def _generate_cube_centers(self):
         centers = []
         half = self.l0 / 2.0
-        if self.anchor_corner is None:
+        if self.anchor_corner is None and self.l0 != (2 * self.L_s / self.n_divisions):
+            lo, hi = -self.L_s, self.L_s
+            n = int(np.ceil((hi - lo) / self.l0))
+            start = lo + half
+            coords = start + np.arange(n) * self.l0
+            coords = coords[coords <= (hi - half + 1e-12)]
+        elif self.anchor_corner is None:
             coords = np.linspace(-self.L_s + half, self.L_s - half, self.n_divisions)
         else:
             lo, hi = -self.L_s, self.L_s
