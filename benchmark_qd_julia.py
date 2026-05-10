@@ -133,7 +133,39 @@ def find_jl_file(expr_dir, cube_dir_name, n):
     return matches[0] if matches else None
 
 
-def generate_jl_for_cube(cube_dir, n, a, b, expand=False, regen=False):
+def generate_hn_jl_for_cube(cube_dir, n, regen=False):
+    """Generate eval_Hn_m{n}.jl from H_power_{n}.pkl (single power, not filter).
+
+    Unlike generate_jl_for_cube, this does NOT call apply_f_of_H_from_raw_powers
+    and does NOT combine multiple powers.  It loads H^n·ψ directly from pkl,
+    groups by Gaussian factor, applies Horner, and writes Julia code.
+    Fast and cannot OOM.  Returns jl_path, or None if pkl missing.
+    """
+    cube_dir = Path(cube_dir)
+    pkl_path = cube_dir / f'H_power_{n}.pkl'
+    if not pkl_path.exists():
+        return None
+
+    jl_path = cube_dir / f'eval_Hn_m{n}.jl'
+    if jl_path.exists() and not regen:
+        return jl_path
+
+    try:
+        with open(pkl_path, 'rb') as fh:
+            data = pickle.load(fh)
+        expr_cos = sp.expand(data.get('Pc', sp.Integer(0)))
+        expr_sin = sp.expand(data.get('Ps', sp.Integer(0)))
+        terms_cos = apply_horner(group_by_exp_combined(expr_cos))
+        terms_sin = apply_horner(group_by_exp_combined(expr_sin))
+        jl_src = build_julia_batch_script(terms_cos, terms_sin)
+        jl_path.write_text(jl_src, encoding='utf-8')
+        return jl_path
+    except Exception as exc:
+        print(f"\n    [Hn codegen error] {cube_dir.name} n={n}: {exc}")
+        return None
+
+
+
     """Generate eval_filter_m{n}_*.jl from H^n pkl files.
 
     Uses the same codegen as run_qd_r11.py Stage 4.
@@ -386,7 +418,7 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                    sample, seed, julia_exe, outdir, a, b,
                    select_atoms=None, expand=False, do_timing=True,
                    do_sympy_timing=False, nop_json_path=None, regen=False,
-                   count_pkl=False):
+                   count_pkl=False, hn_julia=False):
     """For --sample cubes sweep n=1..m_max; count ops and optionally time."""
     rng = np.random.default_rng(seed)
     _, X, Y, Z = build_full_grid(L_s, d_grid)
@@ -455,8 +487,20 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                         print(f"    n={n}: H_power_{n}.pkl missing – skipped")
                         continue
                     jl_path = None
+                elif hn_julia:
+                    # --- generate eval_Hn_m{n}.jl from H^n pkl directly ---
+                    cube_dir_path = Path(expr_dir) / rec['dirname']
+                    jl_path = generate_hn_jl_for_cube(cube_dir_path, n, regen=regen)
+                    if jl_path is None:
+                        print(f"    n={n}: H_power_{n}.pkl missing – skipped")
+                        continue
+                    try:
+                        ops = count_ops_per_part(jl_path)
+                    except Exception as exc:
+                        print(f"    n={n}: op-count error: {exc}")
+                        continue
                 else:
-                    # --- find or generate .jl for order n ---
+                    # --- find or generate eval_filter .jl for order n ---
                     jl_path = find_or_generate_jl(
                         expr_dir, rec['dirname'], n, a, b, expand=expand, regen=regen)
                     if jl_path is None:
@@ -934,6 +978,10 @@ def main():
                         help='Sweep mode: count ops from H_power_n.pkl directly '
                              '(measures H^n complexity, fast, no OOM risk). '
                              'Skips .jl generation and Julia timing.')
+    parser.add_argument('--hn_julia', action='store_true', default=False,
+                        help='Sweep mode: generate eval_Hn_m{n}.jl from H_power_n.pkl '
+                             'and time Julia eval of H^n (single power, not filter). '
+                             'Fast: loads pkl directly, no Chebyshev combination.')
     args = parser.parse_args()
 
     if args.n_waves < 2 and not args.no_timing:
@@ -1018,7 +1066,8 @@ def main():
             do_sympy_timing=args.sympy_timing,
             nop_json_path=args.nop_json,
             regen=args.regen,
-            count_pkl=args.count_pkl)
+            count_pkl=args.count_pkl,
+            hn_julia=args.hn_julia)
 
     if args.mode in ('full', 'both'):
         print(f"\n{'='*60}")
