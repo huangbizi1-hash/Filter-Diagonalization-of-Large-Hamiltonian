@@ -9,6 +9,7 @@ import json
 import os
 import pickle
 from collections import Counter
+from typing import Optional
 
 import numpy as np
 import sympy as sp
@@ -177,11 +178,12 @@ class CubicSpacePartition:
     # Bulk processing
     # ------------------------------------------------------------------
 
-    def process_all_cubes(self, output_base_dir, verbose=True):
+    def process_all_cubes(self, output_base_dir, verbose=True, stats_filename: Optional[str] = 'cube_atom_count_histogram.json'):
         """Process every cube and save per-cube potential pickle + info text."""
         os.makedirs(output_base_dir, exist_ok=True)
         total = len(self.cube_centers)
         with_atoms = 0
+        atom_count_hist = Counter()
 
         for cube_info in self.cube_centers:
             cube_center = cube_info['center']
@@ -195,6 +197,7 @@ class CubicSpacePartition:
                 continue
 
             with_atoms += 1
+            atom_count_hist[len(relevant)] += 1
             type_count = Counter(r['atom']['type'] for r in relevant)
             in_n = sum(1 for r in relevant if r['in_cube'])
             cx, cy, cz = cube_center
@@ -222,6 +225,21 @@ class CubicSpacePartition:
                 output_base_dir, fname,
                 cube_center, cube_idx, relevant,
             )
+
+
+        stats = {
+            'total_cubes': total,
+            'cubes_with_atoms': with_atoms,
+            'empty_cubes': total - with_atoms,
+            'cube_size': self.l0,
+            'r_cut': self.r_cut,
+            'atom_count_histogram': {str(k): v for k, v in sorted(atom_count_hist.items())},
+        }
+        if stats_filename:
+            stats_path = os.path.join(output_base_dir, stats_filename)
+            with open(stats_path, 'w', encoding='utf-8') as f:
+                json.dump(stats, f, ensure_ascii=False, indent=2)
+            print(f"Saved cube atom-count histogram to: {stats_path}")
 
         print(f"\nDone. Cubes total={total}, with_atoms={with_atoms}, "
               f"empty={total - with_atoms}")
