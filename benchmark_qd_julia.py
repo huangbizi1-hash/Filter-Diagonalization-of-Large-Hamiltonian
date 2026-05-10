@@ -70,6 +70,7 @@ from symbolic_code.chebyshev_filter import (
     apply_horner,
 )
 from symbolic_code.julia_codegen import build_julia_batch_script, build_julia_hn_cse_script
+from symbolic_code.h_powers import generate_H_powers
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +247,32 @@ def find_or_generate_jl(expr_dir, cube_dir_name, n, a, b, expand=False, regen=Fa
     if not cube_dir.exists():
         return None
     return generate_jl_for_cube(cube_dir, n, a, b, expand=expand, regen=regen)
+
+
+def ensure_h_power_pkl(manager, expr_dir, cube_rec, n, expand=True):
+    """Ensure H_power_{n}.pkl exists for one cube; generate on demand if missing."""
+    cube_dir = Path(expr_dir) / cube_rec['dirname']
+    pkl_path = cube_dir / f'H_power_{n}.pkl'
+    if pkl_path.exists():
+        return True
+
+    V_expr = manager.get_expression(*cube_rec['idx'])
+    if V_expr is None:
+        return False
+
+    x, y, z, kx, ky, kz = sp.symbols('x y z kx ky kz')
+    kvec = (kx, ky, kz)
+    k2 = kx**2 + ky**2 + kz**2
+    try:
+        print(f"    n={n}: H_power_{n}.pkl missing – generating ...")
+        generate_H_powers(
+            N=n, outdir=cube_dir, file_format='pkl', expand=expand,
+            V=V_expr, kvec=kvec, k2=k2, pref=0.5, x=x, y=y, z=z,
+        )
+    except Exception as exc:
+        print(f"    n={n}: pkl generation failed: {exc}")
+        return False
+    return pkl_path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -510,9 +537,10 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                   f"n_atoms={rec['n_atoms']}  n_pts={rec['n_pts']}")
 
             for n in range(1, m_max + 1):
+                cube_dir_path = Path(expr_dir) / rec['dirname']
+                ensure_h_power_pkl(manager, expr_dir, rec, n, expand=(not hn_cse))
                 if count_pkl:
                     # --- count ops directly from H^n pkl (fast, no OOM risk) ---
-                    cube_dir_path = Path(expr_dir) / rec['dirname']
                     try:
                         ops = count_pkl_ops(cube_dir_path, n)
                     except Exception as exc:
@@ -524,7 +552,6 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                     jl_path = None
                 elif hn_cse:
                     # --- generate eval_Hn_cse_m{n}.jl via sp.cse on raw pkl ---
-                    cube_dir_path = Path(expr_dir) / rec['dirname']
                     jl_path, total_ops_cse = generate_hn_cse_jl_for_cube(
                         cube_dir_path, n, regen=regen)
                     if jl_path is None:
@@ -539,7 +566,6 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                     }
                 elif hn_julia:
                     # --- generate eval_Hn_m{n}.jl from H^n pkl directly ---
-                    cube_dir_path = Path(expr_dir) / rec['dirname']
                     jl_path = generate_hn_jl_for_cube(cube_dir_path, n, regen=regen)
                     if jl_path is None:
                         print(f"    n={n}: H_power_{n}.pkl missing – skipped")
