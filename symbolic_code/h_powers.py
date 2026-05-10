@@ -105,6 +105,7 @@ def _save_power(outdir, n, data, file_format, prefix):
 def generate_H_powers(
     N, outdir,
     file_format='pkl',
+    expand=True,
     V=None, kvec=None, k2=None, pref=0.5,
     x=None, y=None, z=None,
 ):
@@ -114,10 +115,6 @@ def generate_H_powers(
     for any Chebyshev filter by calling
     ``chebyshev_filter.apply_f_of_H_from_raw_powers`` with the desired a, b.
 
-    sp.expand() is applied at each step so sympy works with compact polynomial
-    expressions (rational coefficients, combined like terms) rather than large
-    unevaluated trees.
-
     Parameters
     ----------
     N : int
@@ -126,6 +123,13 @@ def generate_H_powers(
         Output directory.
     file_format : 'pkl' | 'sym.gz'
         Binary pickle (faster I/O) or compressed text (human-readable).
+    expand : bool
+        If True (default), call sp.expand() at each step so sympy works with
+        compact flat-polynomial form (combined like terms, rational coefficients).
+        If False, skip sp.expand() to preserve the product/sum tree structure —
+        e.g. ``V * Ps`` stays as-is instead of being distributed.  The
+        unexpanded trees are larger in sympy but carry factored structure that
+        sp.cse() can exploit when generating Julia code.
     V, kvec, k2, pref, x, y, z
         Symbolic Hamiltonian ingredients (see apply_H_on_pair).
 
@@ -144,8 +148,12 @@ def generate_H_powers(
     for n in range(1, N + 1):
         print(f"    H^{n} ...", end=' ', flush=True)
         Ps_H, Pc_H = apply_H_on_pair(Ps, Pc, V, kvec, k2, pref, x, y, z)
-        Ps = sp.expand(Ps_H)
-        Pc = sp.expand(Pc_H)
+        if expand:
+            Ps = sp.expand(Ps_H)
+            Pc = sp.expand(Pc_H)
+        else:
+            Ps = Ps_H
+            Pc = Pc_H
         results[n] = {'Ps': Ps, 'Pc': Pc}
         _save_power(outdir, n, results[n], file_format, prefix='H_power')
         print('✓')
@@ -212,6 +220,7 @@ def process_all_cubes(
     base_outdir='H_powers_basis_partitioned',
     file_format='sym.gz',
     method='raw',
+    expand=True,
 ):
     """Generate H^n or (aH+b)^n * psi for every cube in *manager*.
 
@@ -226,6 +235,10 @@ def process_all_cubes(
     method : 'raw' | 'scaled'
         'raw'    – pure H^n; files reusable for any energy window (default).
         'scaled' – (aH+b)^n with a,b baked in.
+    expand : bool
+        Passed to generate_H_powers.  True (default) flattens expressions at
+        each step; False preserves the product-tree structure (smaller pkl,
+        faster generation, better for sp.cse() later).
     """
     if method == 'scaled' and (a is None or b is None):
         raise ValueError("method='scaled' requires a and b (from E_lo, E_hi)")
@@ -243,7 +256,7 @@ def process_all_cubes(
     done = skipped = 0
 
     print(f"\n{'='*70}")
-    print(f"PROCESSING ALL CUBES  method={method}  N={N}", end='')
+    print(f"PROCESSING ALL CUBES  method={method}  N={N}  expand={expand}", end='')
     if method == 'scaled':
         print(f"  a={a:.4f}  b={b:.4f}")
     else:
@@ -278,6 +291,7 @@ def process_all_cubes(
             else:
                 generate_H_powers(
                     N, outdir=cube_dir, file_format=file_format,
+                    expand=expand,
                     V=V_expr, kvec=kvec, k2=k2, pref=pref, x=x, y=y, z=z,
                 )
             print(f"  ✓ powers 0…{N} in {cube_dir.name}/")
@@ -294,6 +308,7 @@ def process_specific_cubes(
     base_outdir='H_powers_basis_partitioned',
     file_format='sym.gz',
     method='raw',
+    expand=True,
 ):
     """Like process_all_cubes but for a subset of cube indices."""
     if method == 'scaled' and (a is None or b is None):
@@ -308,7 +323,7 @@ def process_specific_cubes(
     k2   = kx**2 + ky**2 + kz**2
     pref = 0.5
 
-    print(f"Processing {len(cube_indices)} specific cubes (method={method}) ...")
+    print(f"Processing {len(cube_indices)} specific cubes (method={method} expand={expand}) ...")
 
     for idx in cube_indices:
         i, j, k = idx
@@ -334,6 +349,7 @@ def process_specific_cubes(
             else:
                 generate_H_powers(
                     N, outdir=cube_dir, file_format=file_format,
+                    expand=expand,
                     V=V_expr, kvec=kvec, k2=k2, pref=pref, x=x, y=y, z=z,
                 )
             print(f"    ✓ complete")

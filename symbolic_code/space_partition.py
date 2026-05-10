@@ -9,6 +9,7 @@ import json
 import os
 import pickle
 from collections import Counter
+from typing import Optional
 
 import numpy as np
 import sympy as sp
@@ -18,7 +19,7 @@ from sympy import symbols, exp
 class CubicSpacePartition:
     """将 3-D 空间分割为等大小的立方体，为每个非空立方体构建势能符号表达式。"""
 
-    def __init__(self, params_file, atoms, L_s=8.0, n_divisions=4, r_cut=5.0):
+    def __init__(self, params_file, atoms, L_s=8.0, n_divisions=4, r_cut=5.0, cube_size=None, anchor_corner=None):
         """
         Parameters
         ----------
@@ -41,14 +42,20 @@ class CubicSpacePartition:
         self.L_s = L_s
         self.n_divisions = n_divisions
         self.r_cut = r_cut
-        self.l0 = 2 * L_s / n_divisions  # side length of one cube
+        self.anchor_corner = np.array(anchor_corner, dtype=float) if anchor_corner is not None else None
+        self.l0 = float(cube_size) if cube_size is not None else 2 * L_s / n_divisions  # side length of one cube
 
         print(f"\n{'='*70}")
         print("CUBIC SPACE PARTITION SETUP")
         print(f"{'='*70}")
         print(f"  Atom types loaded : {list(self.atom_params.keys())}")
         print(f"  Space             : [{-L_s:.1f}, {L_s:.1f}]^3 Bohr")
-        print(f"  Divisions/dim     : {n_divisions}  →  {n_divisions**3} cubes")
+        if cube_size is None:
+            print(f"  Divisions/dim     : {n_divisions}  →  {n_divisions**3} cubes")
+        else:
+            print(f"  Partition mode    : crystal-cell cubes (auto-count)")
+            if self.anchor_corner is not None:
+                print(f"  Anchor corner     : ({self.anchor_corner[0]:.3f}, {self.anchor_corner[1]:.3f}, {self.anchor_corner[2]:.3f})")
         print(f"  Cube side length  : {self.l0:.3f} Bohr")
         print(f"  Cutoff radius     : {r_cut:.2f} Bohr")
         print(f"  Total atoms       : {len(atoms)}")
@@ -65,10 +72,29 @@ class CubicSpacePartition:
     def _generate_cube_centers(self):
         centers = []
         half = self.l0 / 2.0
-        coords = np.linspace(-self.L_s + half, self.L_s - half, self.n_divisions)
-        for i, cx in enumerate(coords):
-            for j, cy in enumerate(coords):
-                for k, cz in enumerate(coords):
+        if self.anchor_corner is None and self.l0 != (2 * self.L_s / self.n_divisions):
+            lo, hi = -self.L_s, self.L_s
+            n = int(np.ceil((hi - lo) / self.l0))
+            start = lo + half
+            coords = start + np.arange(n) * self.l0
+            coords = coords[coords <= (hi - half + 1e-12)]
+        elif self.anchor_corner is None:
+            coords = np.linspace(-self.L_s + half, self.L_s - half, self.n_divisions)
+        else:
+            lo, hi = -self.L_s, self.L_s
+            nmin = np.floor((lo - self.anchor_corner) / self.l0).astype(int)
+            nmax = np.ceil((hi - self.anchor_corner) / self.l0).astype(int) - 1
+            coords_xyz = [self.anchor_corner[d] + (np.arange(nmin[d], nmax[d] + 1) + 0.5) * self.l0 for d in range(3)]
+            coords = None
+        if coords is not None:
+            iter_x = list(enumerate(coords)); iter_y = list(enumerate(coords)); iter_z = list(enumerate(coords))
+        else:
+            iter_x = [(int(ii), cx) for ii, cx in zip(range(len(coords_xyz[0])), coords_xyz[0])]
+            iter_y = [(int(jj), cy) for jj, cy in zip(range(len(coords_xyz[1])), coords_xyz[1])]
+            iter_z = [(int(kk), cz) for kk, cz in zip(range(len(coords_xyz[2])), coords_xyz[2])]
+        for i, cx in iter_x:
+            for j, cy in iter_y:
+                for k, cz in iter_z:
                     centers.append({
                         'index': (i, j, k),
                         'center': np.array([cx, cy, cz]),
@@ -158,11 +184,12 @@ class CubicSpacePartition:
     # Bulk processing
     # ------------------------------------------------------------------
 
-    def process_all_cubes(self, output_base_dir, verbose=True):
+    def process_all_cubes(self, output_base_dir, verbose=True, stats_filename: Optional[str] = 'cube_atom_count_histogram.json'):
         """Process every cube and save per-cube potential pickle + info text."""
         os.makedirs(output_base_dir, exist_ok=True)
         total = len(self.cube_centers)
         with_atoms = 0
+        atom_count_hist = Counter()
 
         for cube_info in self.cube_centers:
             cube_center = cube_info['center']
@@ -176,6 +203,7 @@ class CubicSpacePartition:
                 continue
 
             with_atoms += 1
+            atom_count_hist[len(relevant)] += 1
             type_count = Counter(r['atom']['type'] for r in relevant)
             in_n = sum(1 for r in relevant if r['in_cube'])
             cx, cy, cz = cube_center
@@ -203,6 +231,21 @@ class CubicSpacePartition:
                 output_base_dir, fname,
                 cube_center, cube_idx, relevant,
             )
+
+
+        stats = {
+            'total_cubes': total,
+            'cubes_with_atoms': with_atoms,
+            'empty_cubes': total - with_atoms,
+            'cube_size': self.l0,
+            'r_cut': self.r_cut,
+            'atom_count_histogram': {str(k): v for k, v in sorted(atom_count_hist.items())},
+        }
+        if stats_filename:
+            stats_path = os.path.join(output_base_dir, stats_filename)
+            with open(stats_path, 'w', encoding='utf-8') as f:
+                json.dump(stats, f, ensure_ascii=False, indent=2)
+            print(f"Saved cube atom-count histogram to: {stats_path}")
 
         print(f"\nDone. Cubes total={total}, with_atoms={with_atoms}, "
               f"empty={total - with_atoms}")

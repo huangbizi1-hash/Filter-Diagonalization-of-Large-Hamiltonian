@@ -50,7 +50,7 @@ from symbolic_code.julia_codegen import build_julia_batch_script
 # ---------------------------------------------------------------------------
 # Fixed QD / grid parameters
 # ---------------------------------------------------------------------------
-QD_RADIUS   = 11.0      # Bohr
+DEFAULT_QD_RADIUS = 11.0  # Bohr
 BOX_HALF    = 16.0      # L_s = radius + 5 buffer (Bohr)
 D_GRID      = 0.625     # grid spacing (Bohr)
 N_DIVISIONS = 8         # cubes per axis  → cube side = 2*16/8 = 4 Bohr
@@ -159,7 +159,8 @@ def build_qd_cube(radius_bohr, output_path, d=0.625):
 # ===========================================================================
 
 def run_space_partition(cube_file, params_file, vexpr_dir,
-                        L_s=BOX_HALF, n_divisions=N_DIVISIONS, r_cut=R_CUT):
+                        L_s=BOX_HALF, n_divisions=N_DIVISIONS, r_cut=R_CUT,
+                        partition_mode="uniform", cell_edge=None, anchor_atom=True):
     """Build per-cube V_expr pkl files into *vexpr_dir*.
 
     Skip if the directory already contains .pkl files.
@@ -173,24 +174,52 @@ def run_space_partition(cube_file, params_file, vexpr_dir,
     atoms = read_cube_atoms(str(cube_file))
     print(f"  Stage 2: read {len(atoms)} atoms from {cube_file}")
 
-    partition = CubicSpacePartition(
-        params_file=str(params_file),
-        atoms=atoms,
-        L_s=L_s,
-        n_divisions=n_divisions,
-        r_cut=r_cut,
-    )
+    if partition_mode == "cell":
+        if cell_edge is None:
+            cell_edge = _A_INAS / 2.0
+        anchor = None
+        if anchor_atom and atoms:
+            arr = np.array([[a["x"], a["y"], a["z"]] for a in atoms], dtype=float)
+            anchor = arr[np.argmin(arr.sum(axis=1))]
+            print(f"  Stage 2: cell partition anchor atom at ({anchor[0]:.3f}, {anchor[1]:.3f}, {anchor[2]:.3f})")
+        print(f"  Stage 2: using crystal-cell partition, cube edge={cell_edge:.6f} Bohr")
+        partition = CubicSpacePartition(
+            params_file=str(params_file), atoms=atoms, L_s=L_s,
+            n_divisions=n_divisions, r_cut=r_cut, cube_size=cell_edge, anchor_corner=anchor,
+        )
+    else:
+        partition = CubicSpacePartition(
+            params_file=str(params_file),
+            atoms=atoms,
+            L_s=L_s,
+            n_divisions=n_divisions,
+            r_cut=r_cut,
+        )
     n_with = partition.process_all_cubes(str(vexpr_dir))
+    summary_path = Path(vexpr_dir) / "partition_summary.txt"
+    summary_path.write_text(
+        f"mode={partition_mode}\nL_s={L_s}\nr_cut={r_cut}\ncube_edge={partition.l0}\ntotal_cubes={len(partition.cube_centers)}\nnon_empty={n_with}\n",
+        encoding="utf-8",
+    )
     print(f"  Stage 2: generated {n_with} non-empty cube expressions → {vexpr_dir}")
+    print(f"  Stage 2: summary saved → {summary_path}")
 
 
 # ===========================================================================
 # Stage 3 – H^n expressions
 # ===========================================================================
 
-def run_h_powers(vexpr_dir, expr_dir, m_max, file_format='pkl'):
-    """Generate H^n pkl files for every cube in *vexpr_dir*."""
-    print(f"\n  Stage 3: generating H^0…{m_max} for each cube → {expr_dir}")
+def run_h_powers(vexpr_dir, expr_dir, m_max, file_format='pkl', expand=False):
+    """Generate H^n pkl files for every cube in *vexpr_dir*.
+
+    expand=False (default) preserves the product-tree structure of each H^n
+    expression — smaller pkl files, faster generation, and the trees carry
+    factored sub-expressions that sp.cse() can exploit when building Julia code.
+    The assembly step in Stage 4 still calls sp.expand() to flatten before
+    group_by_exp_combined, so the final Julia code is identical either way.
+    """
+    print(f"\n  Stage 3: generating H^0…{m_max} for each cube "
+          f"(expand={expand}) → {expr_dir}")
     manager = CubicExpressionManager(str(vexpr_dir))
     if not manager.expressions:
         raise RuntimeError(f"No cube expressions found in {vexpr_dir}")
@@ -200,6 +229,7 @@ def run_h_powers(vexpr_dir, expr_dir, m_max, file_format='pkl'):
         base_outdir=str(expr_dir),
         file_format=file_format,
         method='raw',
+        expand=expand,
     )
 
 
@@ -214,15 +244,22 @@ def _cube_dirname(cx, cy, cz):
     return f"cube_{fmt(cx)}_{fmt(cy)}_{fmt(cz)}"
 
 
-def run_julia_codegen(vexpr_dir, expr_dir, m, E_lo, E_hi):
-    """Build and cache eval_filter_m{m}_*.jl in every cube subdir of expr_dir."""
+def run_julia_codegen(vexpr_dir, expr_dir, m, E_lo, E_hi, expand=False):
+    """Build and cache eval_filter_m{m}_*.jl in every cube subdir of expr_dir.
+
+    When expand=False (default), the H^n pkl files were generated without
+    sp.expand().  Assembly uses return_envelopes=True to avoid the sin/cos
+    wrapping, then sp.expand() is called on the envelopes directly — this is
+    faster than wrapping+extracting and yields identical Julia code.
+    """
     a = 2.0 / (E_hi - E_lo)
     b = -(E_hi + E_lo) / (E_hi - E_lo)
     a_key = f"{a:.8g}".replace('.', 'p').replace('-', 'm')
     b_key = f"{b:.8g}".replace('.', 'p').replace('-', 'm')
     jl_name = f"eval_filter_m{m}_{a_key}_{b_key}.jl"
 
-    print(f"\n  Stage 4: Julia codegen for m={m}, E_lo={E_lo}, E_hi={E_hi:.4f}")
+    print(f"\n  Stage 4: Julia codegen for m={m}, E_lo={E_lo}, E_hi={E_hi:.4f} "
+          f"(expand={expand})")
     print(f"    a={a:.6f}  b={b:.6f}  → {jl_name}")
 
     expr_dir  = Path(expr_dir)
@@ -250,9 +287,19 @@ def run_julia_codegen(vexpr_dir, expr_dir, m, E_lo, E_hi):
         # Assemble f(H)*psi and build Julia script
         try:
             t0 = time.time()
-            psi_fH = apply_f_of_H_from_raw_powers(str(cube_dir), m, a=a, b=b,
-                                                   file_type='pkl')
-            expr_cos, expr_sin = extract_cos_sin_coeffs(psi_fH)
+            if not expand:
+                # Faster path: get envelopes directly (no sin/cos wrapping),
+                # then expand them here so group_by_exp_combined can decompose
+                # the Gaussian factors correctly.
+                expr_cos_raw, expr_sin_raw = apply_f_of_H_from_raw_powers(
+                    str(cube_dir), m, a=a, b=b,
+                    file_type='pkl', return_envelopes=True)
+                expr_cos = sp.expand(expr_cos_raw)
+                expr_sin = sp.expand(expr_sin_raw)
+            else:
+                psi_fH = apply_f_of_H_from_raw_powers(str(cube_dir), m, a=a, b=b,
+                                                       file_type='pkl')
+                expr_cos, expr_sin = extract_cos_sin_coeffs(psi_fH)
             terms_cos = apply_horner(group_by_exp_combined(expr_cos))
             terms_sin = apply_horner(group_by_exp_combined(expr_sin))
             jl_src = build_julia_batch_script(terms_cos, terms_sin)
@@ -383,6 +430,22 @@ def _run_julia_batch(jl_file, Xf, Yf, Zf, k_vals, b_vals, work_dir, julia_exe='j
     return out, timing
 
 
+def _run_sympy_batch(cube_dir, m, a, b, Xf, Yf, Zf, k_vals, b_vals, cache):
+    """Evaluate f(H)*psi directly from SymPy H^n pkl for one cube."""
+    key = str(cube_dir)
+    if key not in cache:
+        expr = apply_f_of_H_from_raw_powers(str(cube_dir), m, a=a, b=b, file_type='pkl')
+        x, y, z, kx, ky, kz, phase = sp.symbols('x y z kx ky kz b')
+        cache[key] = sp.lambdify((x, y, z, kx, ky, kz, phase), expr, modules='numpy')
+    f_eval = cache[key]
+    n_waves = len(k_vals)
+    out = np.empty((n_waves, len(Xf)), dtype=np.float64)
+    for i in range(n_waves):
+        kxv, kyv, kzv = k_vals[i]
+        out[i, :] = np.asarray(f_eval(Xf, Yf, Zf, kxv, kyv, kzv, b_vals[i]), dtype=np.float64)
+    return out
+
+
 def _estimate_E_hi(L_s, N_grid, pref=0.5, V_peak=12.0):
     """Rough E_hi from grid Nyquist kinetic + potential peak.
 
@@ -398,7 +461,10 @@ def _estimate_E_hi(L_s, N_grid, pref=0.5, V_peak=12.0):
 def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
                     julia_exe='julia', rank_threshold=1e-3, n_eigs=30,
                     params_file='gaussian_fit_params.json',
-                    cube_file='QD_Outputs/QD_R11.cube'):
+                    cube_file='QD_Outputs/QD_R11.cube',
+                    L_s=BOX_HALF,
+                    n_divisions=N_DIVISIONS,
+                    eval_backend='julia'):
     """Evaluate f(H)*psi on full QD grid using per-cube Julia scripts, then SVD.
 
     For each cube:
@@ -416,14 +482,14 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
     b_key = f"{b:.8g}".replace('.', 'p').replace('-', 'm')
     jl_name = f"eval_filter_m{m}_{a_key}_{b_key}.jl"
 
-    print(f"\n  Stage 5: filter diagonalisation")
+    print(f"\n  Stage 5: filter diagonalisation ({eval_backend})")
     print(f"    m={m}  E_lo={E_lo}  E_hi={E_hi:.4f}  n_waves={n_waves}  k_max={k_max}")
 
     # ---- build grid ----
-    x1, X, Y, Z = _build_grid(L_s=BOX_HALF, d=D_GRID)
+    x1, X, Y, Z = _build_grid(L_s=L_s, d=D_GRID)
     Ng = len(x1)
     dx = x1[1] - x1[0]
-    l0 = 2.0 * BOX_HALF / N_DIVISIONS     # cube side length
+    l0 = 2.0 * L_s / n_divisions     # cube side length
     print(f"    grid: {Ng}^3 = {Ng**3:,} pts   dx={dx:.4f} Bohr   cube side={l0:.3f} Bohr")
 
     # ---- build numerical V on grid ----
@@ -445,7 +511,7 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
     # Grid index ix belongs to cube ci where ci = floor(ix * N_DIVISIONS / Ng)
     # Flat grid assignment arrays
     ix_all = np.arange(Ng, dtype=np.int32)
-    cube_ax = np.minimum((ix_all * N_DIVISIONS) // Ng, N_DIVISIONS - 1)
+    cube_ax = np.minimum((ix_all * n_divisions) // Ng, n_divisions - 1)
 
     # ---- load cube metadata ----
     manager = CubicExpressionManager(str(vexpr_dir))
@@ -458,6 +524,7 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
     total_eval_s = 0.0
     cubes_done = 0
     cubes_skip = 0
+    sympy_cache = {}
 
     t_eval_all = time.time()
     for idx in sorted(manager.cube_info.keys()):
@@ -466,8 +533,7 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
         cx, cy, cz = info['center']
         cube_dir = expr_dir / _cube_dirname(cx, cy, cz)
         jl_path  = cube_dir / jl_name
-
-        if not jl_path.exists():
+        if eval_backend == 'julia' and not jl_path.exists():
             cubes_skip += 1
             continue
 
@@ -493,8 +559,13 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
             continue
 
         try:
-            out, timing = _run_julia_batch(
-                jl_path, Xf, Yf, Zf, k_vals, b_vals, work_dir, julia_exe)
+            if eval_backend == 'julia':
+                out, timing = _run_julia_batch(
+                    jl_path, Xf, Yf, Zf, k_vals, b_vals, work_dir, julia_exe)
+            else:
+                t_sym = time.time()
+                out = _run_sympy_batch(cube_dir, m, a, b, Xf, Yf, Zf, k_vals, b_vals, sympy_cache)
+                timing = {'eval_s': time.time() - t_sym}
             # out shape: (n_waves, N_pts_cube)
             C_f_flat[:, flat_idx] = out
             cubes_done += 1
@@ -505,7 +576,7 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
                 print(f"    {cubes_done} cubes done  "
                       f"({len(Xf)} pts/cube)  total_eval_s={total_eval_s:.1f}s")
         except Exception as exc:
-            print(f"    Cube {idx}: Julia error – {exc}")
+            print(f"    Cube {idx}: {eval_backend} error – {exc}")
             cubes_skip += 1
 
     import shutil
@@ -514,7 +585,7 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
 
     print(f"\n    Evaluation complete: {cubes_done} cubes  |  "
           f"{cubes_skip} skipped  |  wall={wall_total:.1f}s  "
-          f"Julia eval_s={total_eval_s:.1f}s")
+          f"{eval_backend} eval_s={total_eval_s:.1f}s")
 
     # ---- reshape to (n_waves, Ng, Ng, Ng) ----
     C_f = C_f_flat.reshape(n_waves, Ng, Ng, Ng)
@@ -541,6 +612,22 @@ def run_filter_diag(vexpr_dir, expr_dir, m, E_lo, E_hi, n_waves, k_max,
     return energies
 
 
+
+def _format_radius_tag(radius_bohr):
+    radius_str = f"{radius_bohr:g}".replace('-', 'm').replace('.', 'p')
+    return f"R{radius_str}"
+
+
+def _auto_output_dirs(radius_bohr, partition_mode, expand):
+    radius_tag = _format_radius_tag(radius_bohr)
+    mode_tag = f"partition_{partition_mode}"
+    vexpr_dir = f"QD_{radius_tag}_Vexpr_{mode_tag}"
+    if expand:
+        expr_dir = f"QD_{radius_tag}_expressions_{mode_tag}"
+    else:
+        expr_dir = f"QD_{radius_tag}_Julia_exp/{mode_tag}_no_expansion"
+    return vexpr_dir, expr_dir
+
 # ===========================================================================
 # Main
 # ===========================================================================
@@ -551,6 +638,8 @@ def main():
     )
     parser.add_argument('--stages', default='1,2,3,4,5',
                         help='Comma-separated stages to run (default 1,2,3,4,5)')
+    parser.add_argument('--qd_radius', type=float, default=DEFAULT_QD_RADIUS,
+                        help='QD radius in Bohr (default 11.0)')
     parser.add_argument('--m', type=int, default=8,
                         help='Chebyshev order (default 8)')
     parser.add_argument('--E_lo', type=float, default=0.0,
@@ -567,24 +656,46 @@ def main():
                         help='SVD rank cutoff (default 1e-3)')
     parser.add_argument('--julia_exe', default='julia',
                         help='Julia executable (default: julia)')
-    parser.add_argument('--cube_file', default='QD_Outputs/QD_R11.cube',
-                        help='QD cube file path')
+    parser.add_argument('--cube_file', default=None,
+                        help='QD cube file path. Default auto-includes qd_radius.')
     parser.add_argument('--params_file', default='gaussian_fit_params.json',
                         help='Gaussian fit parameters JSON')
-    parser.add_argument('--vexpr_dir', default='QD_R11_Vexpr',
-                        help='Output dir for V_expr pkl files (stage 2)')
-    parser.add_argument('--expr_dir', default='QD_R11_expressions',
-                        help='Output dir for H^n + Julia scripts (stages 3-4)')
+    parser.add_argument('--vexpr_dir', default=None,
+                        help='Output dir for V_expr pkl files (stage 2). '
+                             'Default auto-includes radius and partition mode.')
+    parser.add_argument('--partition_mode', choices=['uniform', 'cell'], default='uniform',
+                        help='Stage-2 partition mode: uniform (original) or cell (晶胞, edge default a/2).')
+    parser.add_argument('--cell_edge', type=float, default=None,
+                        help='Cube edge length for --partition_mode cell (Bohr). Default a/2.')
+    parser.add_argument('--expr_dir', default=None,
+                        help='Output dir for H^n + Julia scripts (stages 3-4). '
+                             'Default auto-includes qd_radius and partition mode.')
+    parser.add_argument('--expand', action='store_true', default=False,
+                        help='Use sp.expand() at each H^n step (legacy; default: off). '
+                             'Off = faster generation, smaller pkl, identical Julia output.')
+    parser.add_argument('--eval_backend', choices=['julia', 'sympy'], default='julia',
+                        help='Stage-5 cube evaluation backend: julia (default) or sympy.')
     args = parser.parse_args()
 
     stages = set(int(s.strip()) for s in args.stages.split(','))
+    expand = args.expand
+
+    qd_radius = args.qd_radius
+    box_half = qd_radius + 5.0
+    auto_vexpr_dir, auto_expr_dir = _auto_output_dirs(qd_radius, args.partition_mode, expand)
+    vexpr_dir_path = args.vexpr_dir if args.vexpr_dir is not None else auto_vexpr_dir
+    default_cube_file = f"QD_Outputs/QD_{_format_radius_tag(qd_radius)}.cube"
+    cube_file_path = args.cube_file if args.cube_file is not None else default_cube_file
+
+    expr_dir_path = args.expr_dir if args.expr_dir is not None else auto_expr_dir
 
     # Auto E_hi from grid parameters (use ceil to match build_qd_cube)
-    Ng = int(np.ceil(2 * BOX_HALF / D_GRID))
-    E_hi_ref = _estimate_E_hi(BOX_HALF, Ng)
-    print(f"QD R=11 pipeline  |  grid {Ng}^3  |  E_hi_ref={E_hi_ref:.2f} Hartree")
+    Ng = int(np.ceil(2 * box_half / D_GRID))
+    E_hi_ref = _estimate_E_hi(box_half, Ng)
+    print(f"QD radius={qd_radius:g} Bohr pipeline  |  grid {Ng}^3  |  E_hi_ref={E_hi_ref:.2f} Hartree")
     E_hi = args.E_hi if args.E_hi is not None else E_hi_ref
-    print(f"Using E_hi={E_hi:.4f}  E_lo={args.E_lo}  m={args.m}\n")
+    print(f"Using E_hi={E_hi:.4f}  E_lo={args.E_lo}  m={args.m}  "
+          f"expand={expand}  vexpr_dir={vexpr_dir_path}  expr_dir={expr_dir_path}\n")
 
     t_start = time.time()
 
@@ -592,29 +703,30 @@ def main():
         print("=" * 60)
         print("Stage 1: Build QD cube file")
         print("=" * 60)
-        build_qd_cube(QD_RADIUS, args.cube_file, d=D_GRID)
+        build_qd_cube(qd_radius, cube_file_path, d=D_GRID)
 
     if 2 in stages:
         print("\n" + "=" * 60)
         print("Stage 2: Space partition → V_expr pkl files")
         print("=" * 60)
         run_space_partition(
-            args.cube_file, args.params_file, args.vexpr_dir,
-            L_s=BOX_HALF, n_divisions=N_DIVISIONS, r_cut=R_CUT,
+            cube_file_path, args.params_file, vexpr_dir_path,
+            L_s=box_half, n_divisions=N_DIVISIONS, r_cut=R_CUT,
+            partition_mode=args.partition_mode, cell_edge=args.cell_edge,
         )
 
     if 3 in stages:
         print("\n" + "=" * 60)
         print("Stage 3: H^n expressions")
         print("=" * 60)
-        run_h_powers(args.vexpr_dir, args.expr_dir, args.m)
+        run_h_powers(vexpr_dir_path, expr_dir_path, args.m, expand=expand)
 
-    if 4 in stages:
+    if 4 in stages and args.eval_backend == 'julia':
         print("\n" + "=" * 60)
         print("Stage 4: Julia eval scripts")
         print("=" * 60)
         run_julia_codegen(
-            args.vexpr_dir, args.expr_dir, args.m, args.E_lo, E_hi
+            vexpr_dir_path, expr_dir_path, args.m, args.E_lo, E_hi, expand=expand
         )
 
     if 5 in stages:
@@ -622,8 +734,8 @@ def main():
         print("Stage 5: Filter diagonalisation")
         print("=" * 60)
         energies = run_filter_diag(
-            vexpr_dir=args.vexpr_dir,
-            expr_dir=args.expr_dir,
+            vexpr_dir=vexpr_dir_path,
+            expr_dir=expr_dir_path,
             m=args.m,
             E_lo=args.E_lo,
             E_hi=E_hi,
@@ -633,11 +745,14 @@ def main():
             rank_threshold=args.rank_threshold,
             n_eigs=args.n_eigs,
             params_file=args.params_file,
-            cube_file=args.cube_file,
+            cube_file=cube_file_path,
+            L_s=box_half,
+            n_divisions=N_DIVISIONS,
+            eval_backend=args.eval_backend,
         )
 
         # Save eigenvalues to JSON
-        out_json = Path(args.expr_dir) / f'eigenvalues_m{args.m}_Elo{args.E_lo}.json'
+        out_json = Path(expr_dir_path) / f'eigenvalues_m{args.m}_Elo{args.E_lo}.json'
         out_json.parent.mkdir(parents=True, exist_ok=True)
         with open(out_json, 'w') as f:
             json.dump({
