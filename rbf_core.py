@@ -6,11 +6,30 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from scipy.spatial import cKDTree
 from rbf.pde.fd import weight_matrix
 from rbf.pde.nodes import poisson_disc_nodes
 
 
 Array = np.ndarray
+
+
+def _raise_on_nonfinite(name: str, arr: Array, max_examples: int = 5) -> None:
+    """Raise ValueError with compact diagnostics when arr contains NaN/Inf."""
+    a = np.asarray(arr)
+    mask = ~np.isfinite(a)
+    if not np.any(mask):
+        return
+    bad_idx = np.argwhere(mask)
+    snippets = []
+    for idx in bad_idx[:max_examples]:
+        idx_t = tuple(int(i) for i in idx)
+        snippets.append(f"{idx_t}: {a[idx_t]!r}")
+    raise ValueError(
+        f"{name} contains non-finite values: "
+        f"{int(mask.sum())}/{int(a.size)} entries are NaN/Inf. "
+        f"Examples -> {'; '.join(snippets)}"
+    )
 
 
 def _periodic_delta_frac(x: Array, y: Array) -> Array:
@@ -416,11 +435,30 @@ def _make_icosphere(R: float, n_subdivide: int = 3) -> Tuple[Array, Array]:
 
 
 def generate_sphere_nodes(
-    spacing: float, R: float = 20.0, n_subdivide: int = 3
+    spacing: float, R: float = 20.0, n_subdivide: int = 3,
+    min_dist: float = 0.0,
 ):
     """Poisson disc nodes inside a sphere of radius R."""
     vert, smp = _make_icosphere(R, n_subdivide)
     nodes, groups, _ = poisson_disc_nodes(spacing, (vert, smp))
+    if min_dist > 0.0 and len(nodes) > 1:
+        from scipy.spatial import cKDTree
+        keep = []
+        tree = None
+        for i in range(len(nodes)):
+            x = nodes[i]
+            if tree is not None and tree.query_ball_point(x, min_dist):
+                continue
+            keep.append(i)
+            tree = cKDTree(nodes[np.array(keep, dtype=np.int64)])
+        keep = np.array(keep, dtype=np.int64)
+        remap = -np.ones(len(nodes), dtype=np.int64)
+        remap[keep] = np.arange(len(keep), dtype=np.int64)
+        groups = {
+            k: remap[np.asarray(v, dtype=np.int64)][remap[np.asarray(v, dtype=np.int64)] >= 0]
+            for k, v in groups.items()
+        }
+        nodes = nodes[keep]
     return nodes, groups
 
 
@@ -611,6 +649,25 @@ _FCC_OFFSETS_FRAC: Array = np.array(
     dtype=np.float64,
 )
 
+
+def _generate_shifted_refined_fcc_frac(
+    scale_factor: int,
+    origin_frac: Optional[Array] = None,
+) -> Array:
+    """Deterministic refined FCC nodes in one conventional cell, in [0,1)^3."""
+    if int(scale_factor) < 1:
+        raise ValueError(f"scale_factor must be >= 1, got {scale_factor}")
+    sf = int(scale_factor)
+    r0 = np.zeros(3, dtype=np.float64) if origin_frac is None else np.asarray(origin_frac, dtype=np.float64).reshape(3)
+    pts: list[Array] = []
+    for i in range(sf):
+        for j in range(sf):
+            for k in range(sf):
+                cell = np.array([i, j, k], dtype=np.float64) / sf
+                for off in _FCC_OFFSETS_FRAC:
+                    pts.append(r0 + cell + off / sf)
+    return _unique_rows_mod1(np.asarray(pts, dtype=np.float64))
+
 # level-3 "FCC high-symmetry" base points: the 8 corners of the sub-cube
 # spanned by fractional coordinates in {1/3, 2/3}.  Each base point is expanded
 # by the 4 FCC cosets → ≤32 cosets per cell (duplicates removed mod 1).
@@ -792,6 +849,11 @@ def generate_conv_cell_nodes(
     n_random_target: int = 120,
     seed: int = 42,
     include_parity: bool = True,
+    template_mode: str = "hybrid",
+    fcc_scale_factor: int = 8,
+    fcc_origin_frac: Optional[Array] = None,
+    fcc_atom_refine_factor: int = 0,
+    fcc_atom_radius_frac: float = 0.0,
     atom_frac: Optional[Array] = None,
     level3_base_frac: Optional[Array] = None,
     use_rbf_poisson: bool = True,
@@ -806,6 +868,10 @@ def generate_conv_cell_nodes(
     adaptive_lambda_lap: float = 0.0,
     adaptive_candidate_multiplier: float = 8.0,
     adaptive_gaussian_builder: Optional[Any] = None,
+    include_skeleton: bool = True,
+    include_interior: bool = True,
+    include_boundary: bool = True,
+    min_dist_cart: float = 0.0,
     verbose: bool = True,
 ) -> Tuple[Array, Dict[str, Array], Dict[str, Any]]:
     """
@@ -859,147 +925,278 @@ def generate_conv_cell_nodes(
               arrays for saving/inspection:
                   cell_template_nodes_frac : (N_cell, 3), [0,1)^3
                   cell_template_nodes_cart : (N_cell, 3), Bohr
-                  cell_template_roles      : (N_cell,), 0/1/2/3
+                  cell_template_roles      : (N_cell,), 0/1/2/3/4/5
     """
+    import time
+
+    t_start = time.perf_counter()
+    t_prev = t_start
+
     bbox_min = np.asarray(bbox_min, dtype=np.float64).reshape(3)
     bbox_max = np.asarray(bbox_max, dtype=np.float64).reshape(3)
 
-    if atom_frac is None:
-        atom_frac = np.vstack([_CONV_CELL_IN_FRAC_DEFAULT,
-                                _CONV_CELL_AS_FRAC_DEFAULT])
+    if not include_skeleton:
+        atom_frac = np.empty((0, 3), dtype=np.float64)
+        level3_base_frac = np.empty((0, 3), dtype=np.float64)
     else:
-        atom_frac = np.asarray(atom_frac, dtype=np.float64).reshape(-1, 3)
+        if atom_frac is None:
+            atom_frac = np.vstack([_CONV_CELL_IN_FRAC_DEFAULT,
+                                    _CONV_CELL_AS_FRAC_DEFAULT])
+        else:
+            atom_frac = np.asarray(atom_frac, dtype=np.float64).reshape(-1, 3)
 
-    if level3_base_frac is None:
-        level3_base_frac = _LEVEL3_BASE_FRAC_DEFAULT
-    else:
-        level3_base_frac = np.asarray(level3_base_frac, dtype=np.float64).reshape(-1, 3)
+        if level3_base_frac is None:
+            level3_base_frac = _LEVEL3_BASE_FRAC_DEFAULT
+        else:
+            level3_base_frac = np.asarray(level3_base_frac, dtype=np.float64).reshape(-1, 3)
 
     # level-3: expand each base by the 4 FCC cosets and reduce mod 1
-    level3_frac = np.vstack([
-        _wrap_frac(r0 + _FCC_OFFSETS_FRAC) for r0 in level3_base_frac
-    ])
-    level3_frac = _unique_rows_mod1(level3_frac)
-
-    # skeleton = atoms + level-3 (these are all pinned)
-    skeleton_frac = _unique_rows_mod1(np.vstack([atom_frac, level3_frac]))
-
-    # ── Poisson-like / adaptive random points in [0,1)^3 ─────────────────────
-    rng = np.random.default_rng(seed)
-    if adaptive_random:
-        if adaptive_gaussian_builder is None:
-            raise ValueError("adaptive_random=True requires adaptive_gaussian_builder")
-        n_grid = int(adaptive_grid_n)
-        cand_frac = _build_uniform_frac_grid(n_grid)
-        cand_cart = cand_frac * a
-        V_cand = np.asarray(adaptive_gaussian_builder.evaluate_at_points(cand_cart),
-                            dtype=np.float64)
-        gnorm, lap_abs = _estimate_grad_laplacian_uniform(V_cand, n_grid, a)
-        denom = 1.0 + float(adaptive_lambda_grad) * gnorm + float(adaptive_lambda_lap) * lap_abs
-        h_w = 1.0 / np.maximum(denom, 1e-12)
-        n_candidates = int(max(1, round(float(adaptive_candidate_multiplier) * n_random_target)))
-        # draw top-weight-biased subset first to reduce KDTree insert loops
-        take = np.argsort(-h_w)[: min(n_candidates, len(h_w))]
-        random_frac = _adaptive_accept_and_filter_periodic(
-            candidates_frac=cand_frac[take],
-            weights_h=h_w[take],
-            d_min_frac=d_min_frac,
-            n_target=n_random_target,
-            rng=rng,
-            pinned_frac=skeleton_frac,
-        )
-    elif use_rbf_poisson:
-        # Use the repo's Poisson-disc sampler on the unit cube [0,a]^3 with
-        # the skeleton pinned.  radius = d_min_frac*a (Cartesian).
-        vert, smp = _make_unit_cube_surface(a)
-        pinned_cart = skeleton_frac * a
-        try:
-            rbf_nodes_cart, _rbf_groups, _ = poisson_disc_nodes(
-                d_min_frac * a, (vert, smp), pinned_nodes=pinned_cart,
-            )
-            # Drop the pinned copies — we already have them in skeleton_frac
-            # (rbf places pinned first in the interior group)
-            n_pin = len(pinned_cart)
-            extra_cart = rbf_nodes_cart[n_pin:]
-            # Drop boundary nodes from the Poisson output — the cube faces'
-            # boundary nodes aren't the user's "random" points
-            # (filter anything within 1e-6*a of a face)
-            face_tol = 1e-6 * a
-            in_interior = np.all(
-                (extra_cart > face_tol) & (extra_cart < a - face_tol), axis=1)
-            extra_cart = extra_cart[in_interior]
-            random_frac = extra_cart / a
-
-            # Optionally truncate / seed-permute to match n_random_target
-            if len(random_frac) > n_random_target:
-                perm = rng.permutation(len(random_frac))[:n_random_target]
-                random_frac = random_frac[perm]
-        except TypeError:
-            # Old rbf without pinned_nodes support — fall back to rejection
-            use_rbf_poisson = False
-
-    if not use_rbf_poisson:
-        # Periodic rejection sampler (user's original algorithm)
-        random_frac, _trials = _poisson_like_periodic(
-            skeleton_frac, n_random_target, d_min_frac,
-            max_trials=max(200_000, 2000 * n_random_target), rng=rng,
-        )
-
-    # ── parity counterparts ──────────────────────────────────────────────────
-    if include_parity and len(random_frac) > 0:
-        parity_frac = _wrap_frac(1.0 - random_frac)
+    if len(level3_base_frac):
+        level3_frac = np.vstack([
+            _wrap_frac(r0 + _FCC_OFFSETS_FRAC) for r0 in level3_base_frac
+        ])
+        level3_frac = _unique_rows_mod1(level3_frac)
     else:
-        parity_frac = np.empty((0, 3), dtype=np.float64)
+        level3_frac = np.empty((0, 3), dtype=np.float64)
+
+    if template_mode not in ("hybrid", "fcc_refined"):
+        raise ValueError(f"template_mode must be 'hybrid' or 'fcc_refined', got {template_mode!r}")
+
+    if template_mode == "fcc_refined":
+        base_fcc_frac = _generate_shifted_refined_fcc_frac(
+            scale_factor=fcc_scale_factor, origin_frac=fcc_origin_frac)
+        cell_nodes_frac = base_fcc_frac
+        cell_role_idx = np.full(len(cell_nodes_frac), 4, dtype=np.int64)  # FCC deterministic role
+
+        n_base_fcc = int(len(cell_nodes_frac))
+        n_enh1_added = 0
+        n_enh2_added = 0
+
+        # ── Enhancement 1: finer FCC near atoms (role=5, fcc_local) ──────────
+        if int(fcc_atom_refine_factor) > fcc_scale_factor and float(fcc_atom_radius_frac) > 0.0:
+            local_fcc_frac = _generate_shifted_refined_fcc_frac(
+                scale_factor=int(fcc_atom_refine_factor),
+                origin_frac=fcc_origin_frac,
+            )
+            # Vectorised periodic proximity: keep points near any atom
+            rad = float(fcc_atom_radius_frac)
+            if len(local_fcc_frac) > 0 and len(atom_frac) > 0:
+                near_atom = np.zeros(len(local_fcc_frac), dtype=bool)
+                for af in atom_frac:
+                    d = np.abs(_periodic_delta_frac(local_fcc_frac, af))  # (N, 3)
+                    near_atom |= np.sqrt(np.sum(d * d, axis=1)) < rad
+                local_fcc_frac = local_fcc_frac[near_atom]
+
+            # Remove fine points that duplicate or are too close to base FCC
+            if len(local_fcc_frac) > 0 and len(base_fcc_frac) > 0:
+                _shifts = np.array(
+                    [[i, j, k] for i in (-1., 0., 1.)
+                     for j in (-1., 0., 1.)
+                     for k in (-1., 0., 1.)], dtype=np.float64)
+                base_aug = np.vstack([base_fcc_frac + s for s in _shifts])
+                dists_fine, _ = cKDTree(base_aug).query(local_fcc_frac, k=1)
+                local_fcc_frac = local_fcc_frac[dists_fine >= d_min_frac]
+
+            n_enh1_added = int(len(local_fcc_frac))
+            if n_enh1_added > 0:
+                cell_nodes_frac = np.vstack([base_fcc_frac, local_fcc_frac])
+                cell_role_idx = np.concatenate([
+                    np.full(len(base_fcc_frac), 4, dtype=np.int64),
+                    np.full(n_enh1_added, 5, dtype=np.int64),
+                ])
+            if verbose:
+                print(f"[conv_cell] Enhancement 1 (fine FCC near atoms): "
+                      f"refine_factor={fcc_atom_refine_factor}, "
+                      f"radius_frac={fcc_atom_radius_frac:.3f}, "
+                      f"added {n_enh1_added} nodes")
+
+        # ── Enhancement 2: adaptive random on top of FCC backbone ────────────
+        if adaptive_random:
+            if adaptive_gaussian_builder is None:
+                raise ValueError("adaptive_random=True requires adaptive_gaussian_builder")
+            rng_enh2 = np.random.default_rng(seed)
+            n_grid_enh2 = int(adaptive_grid_n)
+            cand_frac_enh2 = _build_uniform_frac_grid(n_grid_enh2)
+            V_cand_enh2 = np.asarray(
+                adaptive_gaussian_builder.evaluate_at_points(cand_frac_enh2 * a),
+                dtype=np.float64,
+            )
+            gnorm_enh2, lap_enh2 = _estimate_grad_laplacian_uniform(
+                V_cand_enh2, n_grid_enh2, a)
+            denom_enh2 = (1.0
+                          + float(adaptive_lambda_grad) * gnorm_enh2
+                          + float(adaptive_lambda_lap) * lap_enh2)
+            h_w_enh2 = 1.0 / np.maximum(denom_enh2, 1e-12)
+            n_cands_enh2 = int(max(1, round(float(adaptive_candidate_multiplier)
+                                             * n_random_target)))
+            n_take_enh2 = min(n_cands_enh2, len(h_w_enh2))
+            # Uniform random preselection ensures full-domain coverage.
+            # Density variation is handled by accept-reject (p ∝ h_w) inside
+            # _adaptive_accept_and_filter_periodic.  Top-k would cluster all
+            # candidates near high-gradient corners, leaving the rest empty.
+            take_enh2 = rng_enh2.choice(len(h_w_enh2), size=n_take_enh2, replace=False)
+            random_frac_enh2 = _adaptive_accept_and_filter_periodic(
+                candidates_frac=cand_frac_enh2[take_enh2],
+                weights_h=h_w_enh2[take_enh2],
+                d_min_frac=d_min_frac,
+                n_target=n_random_target,
+                rng=rng_enh2,
+                pinned_frac=cell_nodes_frac,
+            )
+            n_enh2_added = int(len(random_frac_enh2))
+            if n_enh2_added > 0:
+                cell_nodes_frac = np.vstack([cell_nodes_frac, random_frac_enh2])
+                cell_role_idx = np.concatenate([
+                    cell_role_idx,
+                    np.full(n_enh2_added, 2, dtype=np.int64),
+                ])
+            if verbose:
+                print(f"[conv_cell] Enhancement 2 (adaptive random): "
+                      f"λ_grad={adaptive_lambda_grad}, λ_lap={adaptive_lambda_lap}, "
+                      f"added {n_enh2_added} nodes")
+
+        cell_stats: Dict[str, Any] = {
+            "cell_skeleton":         0,
+            "cell_random":           n_enh2_added,
+            "cell_accepted_parity":  0,
+            "cell_after_filter":     int(len(cell_nodes_frac)),
+            "cell_template_nodes_frac": cell_nodes_frac.copy(),
+            "cell_template_nodes_cart": (cell_nodes_frac * a).copy(),
+            "cell_template_roles":      cell_role_idx.copy(),
+            "template_mode": "fcc_refined",
+            "fcc_scale_factor": int(fcc_scale_factor),
+            "fcc_base_nodes": n_base_fcc,
+            "fcc_enh1_atom_refine_added": n_enh1_added,
+            "fcc_enh2_adaptive_random_added": n_enh2_added,
+        }
+    else:
+        # skeleton = atoms + level-3 (these are all pinned)
+        skeleton_frac = _unique_rows_mod1(np.vstack([atom_frac, level3_frac]))
+
+        # ── Poisson-like / adaptive random points in [0,1)^3 ─────────────────────
+        rng = np.random.default_rng(seed)
+        if adaptive_random:
+            if adaptive_gaussian_builder is None:
+                raise ValueError("adaptive_random=True requires adaptive_gaussian_builder")
+            n_grid = int(adaptive_grid_n)
+            cand_frac = _build_uniform_frac_grid(n_grid)
+            cand_cart = cand_frac * a
+            V_cand = np.asarray(adaptive_gaussian_builder.evaluate_at_points(cand_cart),
+                                dtype=np.float64)
+            _raise_on_nonfinite("conv_cell adaptive V_cand", V_cand)
+            gnorm, lap_abs = _estimate_grad_laplacian_uniform(V_cand, n_grid, a)
+            _raise_on_nonfinite("conv_cell adaptive |grad V|", gnorm)
+            _raise_on_nonfinite("conv_cell adaptive |lap V|", lap_abs)
+            denom = 1.0 + float(adaptive_lambda_grad) * gnorm + float(adaptive_lambda_lap) * lap_abs
+            _raise_on_nonfinite("conv_cell adaptive denom", denom)
+            if np.any(denom <= 0.0):
+                dmin = float(np.min(denom))
+                n_nonpos = int(np.count_nonzero(denom <= 0.0))
+                raise ValueError(
+                    "conv_cell adaptive denom has non-positive entries "
+                    f"({n_nonpos}/{denom.size}); min={dmin:.6e}. "
+                    "Please reduce adaptive lambdas."
+                )
+            h_w = 1.0 / np.maximum(denom, 1e-12)
+            _raise_on_nonfinite("conv_cell adaptive h_w", h_w)
+            n_candidates = int(max(1, round(float(adaptive_candidate_multiplier) * n_random_target)))
+            n_take = min(n_candidates, len(h_w))
+            # Uniform random preselection ensures full-domain coverage regardless
+            # of lambda.  Top-k by h_w concentrates ALL candidates near atoms
+            # (high-gradient corners), leaving no candidates for the rest of the
+            # domain — both for λ=0 (grid prefix bias) and λ>0 (corner atom bias).
+            # Density variation is produced by the accept-reject step inside
+            # _adaptive_accept_and_filter_periodic (p_accept = h_w / h_max).
+            take = rng.choice(len(h_w), size=n_take, replace=False)
+            random_frac = _adaptive_accept_and_filter_periodic(
+                candidates_frac=cand_frac[take],
+                weights_h=h_w[take],
+                d_min_frac=d_min_frac,
+                n_target=n_random_target,
+                rng=rng,
+                pinned_frac=skeleton_frac,
+            )
+            _raise_on_nonfinite("conv_cell adaptive random_frac", random_frac)
+        elif use_rbf_poisson:
+            vert, smp = _make_unit_cube_surface(a)
+            pinned_cart = skeleton_frac * a
+            try:
+                rbf_nodes_cart, _rbf_groups, _ = poisson_disc_nodes(
+                    d_min_frac * a, (vert, smp), pinned_nodes=pinned_cart,
+                )
+                n_pin = len(pinned_cart)
+                extra_cart = rbf_nodes_cart[n_pin:]
+                face_tol = 1e-6 * a
+                in_interior = np.all(
+                    (extra_cart > face_tol) & (extra_cart < a - face_tol), axis=1)
+                extra_cart = extra_cart[in_interior]
+                random_frac = extra_cart / a
+                if len(random_frac) > n_random_target:
+                    perm = rng.permutation(len(random_frac))[:n_random_target]
+                    random_frac = random_frac[perm]
+            except TypeError:
+                use_rbf_poisson = False
+
+        if not use_rbf_poisson:
+            random_frac, _trials = _poisson_like_periodic(
+                skeleton_frac, n_random_target, d_min_frac,
+                max_trials=max(200_000, 2000 * n_random_target), rng=rng,
+            )
+
+        # ── parity counterparts ──────────────────────────────────────────────────
+        if include_parity and len(random_frac) > 0:
+            parity_frac = _wrap_frac(1.0 - random_frac)
+        else:
+            parity_frac = np.empty((0, 3), dtype=np.float64)
 
     # ── assemble template with role labels, then greedy d_min filter ─────────
-    parts = [
-        ("atoms",  atom_frac),
-        ("level3", level3_frac),
-        ("random", random_frac),
-        ("parity", parity_frac),
-    ]
-    ordered_frac = np.vstack([p[1] for p in parts if len(p[1])])
-    ordered_frac = _unique_rows_mod1(ordered_frac)
-    # Track roles (by fractional coordinate lookup, using rounding)
-    role_map: Dict[str, Array] = {}
-    for name, arr in parts:
-        role_map[name] = _wrap_frac(arr) if len(arr) else np.empty((0, 3), dtype=np.float64)
+        parts = [
+            ("atoms",  atom_frac),
+            ("level3", level3_frac),
+            ("random", random_frac),
+            ("parity", parity_frac),
+        ]
+        ordered_frac = np.vstack([p[1] for p in parts if len(p[1])])
+        ordered_frac = _unique_rows_mod1(ordered_frac)
+        role_map: Dict[str, Array] = {}
+        for name, arr in parts:
+            role_map[name] = _wrap_frac(arr) if len(arr) else np.empty((0, 3), dtype=np.float64)
 
-    cell_nodes_frac = _greedy_filter_by_dmin_periodic(ordered_frac, d_min_frac)
-    cell_nodes_frac = _unique_rows_mod1(cell_nodes_frac)
+        cell_nodes_frac = _greedy_filter_by_dmin_periodic(ordered_frac, d_min_frac)
+        cell_nodes_frac = _unique_rows_mod1(cell_nodes_frac)
 
-    # For each surviving cell node, record which role set it came from
-    # (first match in priority order atoms > level3 > random > parity)
-    cell_role_idx: list[int] = []
-    role_priority = ["atoms", "level3", "random", "parity"]
-    for node in cell_nodes_frac:
-        assigned = 3  # fallback = parity
-        for ri, rname in enumerate(role_priority):
-            src = role_map[rname]
-            if len(src) == 0:
-                continue
-            if np.any(np.all(np.abs(_periodic_diff(src, node)) < 1e-9, axis=1)):
-                assigned = ri
-                break
-        cell_role_idx.append(assigned)
-    cell_role_idx = np.asarray(cell_role_idx, dtype=np.int64)
+        cell_role_idx = []
+        role_priority = ["atoms", "level3", "random", "parity"]
+        for node in cell_nodes_frac:
+            assigned = 3
+            for ri, rname in enumerate(role_priority):
+                src = role_map[rname]
+                if len(src) and np.any(np.all(np.abs(_periodic_diff(src, node)) < 1e-9, axis=1)):
+                    assigned = ri
+                    break
+            cell_role_idx.append(assigned)
+        cell_role_idx = np.asarray(cell_role_idx, dtype=np.int64)
 
-    cell_stats: Dict[str, Any] = {
-        "cell_skeleton":         int(len(skeleton_frac)),
-        "cell_random":           int(len(random_frac)),
-        "cell_accepted_parity":  int(len(parity_frac)),
-        "cell_after_filter":     int(len(cell_nodes_frac)),
-        "cell_template_nodes_frac": cell_nodes_frac.copy(),
-        "cell_template_nodes_cart": (cell_nodes_frac * a).copy(),
-        "cell_template_roles":      cell_role_idx.copy(),
-    }
+        cell_stats = {
+            "cell_skeleton":         int(len(skeleton_frac)),
+            "cell_random":           int(len(random_frac)),
+            "cell_accepted_parity":  int(len(parity_frac)),
+            "cell_after_filter":     int(len(cell_nodes_frac)),
+            "cell_template_nodes_frac": cell_nodes_frac.copy(),
+            "cell_template_nodes_cart": (cell_nodes_frac * a).copy(),
+            "cell_template_roles":      cell_role_idx.copy(),
+            "template_mode": "hybrid",
+        }
+
+    t_after_cell_template = time.perf_counter()
 
     # ── tile the one-cell template to cover [bbox_min, bbox_max) ─────────────
     cell_nodes_cart = cell_nodes_frac * a
     if len(cell_nodes_cart) == 0:
         return (np.empty((0, 3), dtype=np.float64),
                 {k: np.empty(0, dtype=np.int64)
-                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity")},
+                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity",
+                           "fcc", "fcc_local")},
                 {**cell_stats, "tiled_total": 0})
 
     nmin = np.floor((bbox_min - cell_nodes_cart.max(axis=0)) / a).astype(int) - 1
@@ -1020,7 +1217,8 @@ def generate_conv_cell_nodes(
     if not tiled_nodes:
         return (np.empty((0, 3), dtype=np.float64),
                 {k: np.empty(0, dtype=np.int64)
-                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity")},
+                 for k in ("interior", "boundary", "atoms", "level3", "random", "parity",
+                           "fcc", "fcc_local")},
                 {**cell_stats, "tiled_total": 0})
 
     nodes = np.vstack(tiled_nodes)
@@ -1031,6 +1229,9 @@ def generate_conv_cell_nodes(
     idx_u = np.sort(idx_u)
     nodes = nodes[idx_u]
     roles = roles[idx_u]
+    nodes_tiled_raw = nodes.copy()
+    roles_tiled_raw = roles.copy()
+    t_after_tiling = time.perf_counter()
 
     if domain_shape not in ("cube", "sphere"):
         raise ValueError(
@@ -1050,8 +1251,11 @@ def generate_conv_cell_nodes(
         sphere_center = None
         sphere_radius_eff = None
     else:
-        # Sphere mode: keep tiled template points inside the sphere and add
-        # explicit boundary nodes on the sphere surface.
+        # Sphere mode: keep tiled template points strictly INSIDE the sphere as
+        # interior nodes, then append a proper icosphere shell as boundary nodes.
+        # Using tiled-template nodes near the sphere surface as "boundary" gave
+        # poor results because the FCC lattice only sparsely and irregularly
+        # approximates a sphere surface, leaving gaps and uneven Dirichlet BC.
         sphere_center = 0.5 * (bbox_min + bbox_max)
         if sphere_radius is None:
             sphere_radius_eff = 0.5 * float(np.min(bbox_max - bbox_min))
@@ -1062,50 +1266,104 @@ def generate_conv_cell_nodes(
                 f"sphere_radius must be > 0, got {sphere_radius_eff}")
 
         r = np.linalg.norm(nodes - sphere_center[None, :], axis=1)
-        inside = r < sphere_radius_eff
+        # Keep only points strictly inside the sphere (with a small inward margin
+        # so the last interior shell doesn't crowd the icosphere boundary nodes).
+        # Points within d_min of the surface become boundary via icosphere below.
+        rad_tol = max(1e-8, 1e-6 * a)
+        interior_margin = max(d_min_frac * a, boundary_margin_frac * a)
+        inside = r <= (sphere_radius_eff - interior_margin + rad_tol)
+        nodes = nodes[inside]
+        roles = roles[inside]
 
-        nodes_in = nodes[inside]
-        roles_in = roles[inside]
+        # Build a proper icosphere boundary on the sphere surface.
+        ico_verts_raw, _ = _make_icosphere(sphere_radius_eff, sphere_subdivide)
+        ico_verts = ico_verts_raw + sphere_center[None, :]
+        n_interior = len(nodes)
+        n_ico = len(ico_verts)
 
-        vert_s, smp_s = _make_icosphere(sphere_radius_eff, sphere_subdivide)
-        vert_s = vert_s + sphere_center[None, :]
-        spacing_surf = max(d_min_frac * a, 1e-6)
-        surf_nodes_all, surf_groups, _ = poisson_disc_nodes(spacing_surf, (vert_s, smp_s))
-        surf_boundary = surf_nodes_all[surf_groups["boundary"]]
+        nodes = np.vstack([nodes, ico_verts])
+        # role=6 reserved for icosphere boundary nodes
+        roles = np.concatenate([roles, np.full(n_ico, 6, dtype=np.int64)])
 
-        # Keep only boundary points to avoid adding volume fill from the sphere
-        # Poisson solve; boundary points are on the triangulated surface.
-        if len(nodes_in):
-            nodes = np.vstack([nodes_in, surf_boundary])
-        else:
-            nodes = surf_boundary.copy()
-        roles = np.concatenate([roles_in, -np.ones(len(surf_boundary), dtype=np.int64)])
-
-        nodes_q = np.round(nodes / 1e-8).astype(np.int64)
-        _, idx_u2 = np.unique(nodes_q, axis=0, return_index=True)
-        idx_u2 = np.sort(idx_u2)
-        nodes = nodes[idx_u2]
-        roles = roles[idx_u2]
-
-        is_surf = roles < 0
-        boundary_idx = np.where(is_surf)[0].astype(np.int64)
-        interior_idx = np.where(~is_surf)[0].astype(np.int64)
+        interior_idx = np.arange(n_interior, dtype=np.int64)
+        boundary_idx = np.arange(n_interior, n_interior + n_ico, dtype=np.int64)
         margin = 0.0
 
+    nodes_after_domain = nodes.copy()
+    roles_after_domain = roles.copy()
+    t_after_domain = time.perf_counter()
+
     groups: Dict[str, Array] = {
-        "interior": interior_idx,
-        "boundary": boundary_idx,
-        "atoms":    np.where(roles == 0)[0].astype(np.int64),
-        "level3":   np.where(roles == 1)[0].astype(np.int64),
-        "random":   np.where(roles == 2)[0].astype(np.int64),
-        "parity":   np.where(roles == 3)[0].astype(np.int64),
+        "interior":  interior_idx,
+        "boundary":  boundary_idx,
+        "atoms":     np.where(roles == 0)[0].astype(np.int64),
+        "level3":    np.where(roles == 1)[0].astype(np.int64),
+        "random":    np.where(roles == 2)[0].astype(np.int64),
+        "parity":    np.where(roles == 3)[0].astype(np.int64),
+        "fcc":       np.where(roles == 4)[0].astype(np.int64),
+        "fcc_local":  np.where(roles == 5)[0].astype(np.int64),  # Enhancement 1 fine nodes
+        "icosphere":  np.where(roles == 6)[0].astype(np.int64),  # sphere-mode boundary shell
     }
+
+    if min_dist_cart > 0.0 and len(nodes) > 1:
+        # cKDTree is imported at module level — no local import needed
+        # protect boundary and atom-aligned nodes first
+        protected = np.zeros(len(nodes), dtype=bool)
+        protected[groups["boundary"]] = True
+        protected[groups["atoms"]] = True
+        order_idx = np.concatenate([np.where(protected)[0], np.where(~protected)[0]])
+        keep: list[int] = []
+        tree = None
+        for i in order_idx:
+            p = nodes[i]
+            if tree is not None and tree.query_ball_point(p, min_dist_cart):
+                continue
+            keep.append(int(i))
+            tree = cKDTree(nodes[np.array(keep, dtype=np.int64)])
+        keep = np.array(sorted(keep), dtype=np.int64)
+        remap = -np.ones(len(nodes), dtype=np.int64)
+        remap[keep] = np.arange(len(keep), dtype=np.int64)
+        for k in list(groups.keys()):
+            mapped = remap[groups[k]]
+            groups[k] = mapped[mapped >= 0].astype(np.int64)
+        nodes = nodes[keep]
+    nodes_after_close_filter = nodes.copy()
+    t_after_close_filter = time.perf_counter()
+
+    if not include_interior or not include_boundary:
+        keep_mask = np.zeros(len(nodes), dtype=bool)
+        if include_interior:
+            keep_mask[groups["interior"]] = True
+        if include_boundary:
+            keep_mask[groups["boundary"]] = True
+        keep = np.where(keep_mask)[0].astype(np.int64)
+        remap = -np.ones(len(nodes), dtype=np.int64)
+        remap[keep] = np.arange(len(keep), dtype=np.int64)
+        for k in list(groups.keys()):
+            mapped = remap[groups[k]]
+            groups[k] = mapped[mapped >= 0].astype(np.int64)
+        nodes = nodes[keep]
+    t_after_group_select = time.perf_counter()
     stats = {
         **cell_stats,
         "tiled_total": int(len(nodes)),
         "domain_shape": domain_shape,
         "sphere_radius": (float(sphere_radius_eff) if sphere_radius_eff is not None else None),
         "adaptive_random": bool(adaptive_random),
+        "step_cell_template_nodes_cart": (cell_nodes_frac * a).copy(),
+        "step_tiled_raw_nodes_cart": nodes_tiled_raw,
+        "step_tiled_raw_roles": roles_tiled_raw.copy(),
+        "step_after_domain_nodes_cart": nodes_after_domain,
+        "step_after_domain_roles": roles_after_domain.copy(),
+        "step_after_close_filter_nodes_cart": nodes_after_close_filter,
+        "timings_seconds": {
+            "cell_template": float(t_after_cell_template - t_prev),
+            "tiling": float(t_after_tiling - t_after_cell_template),
+            "domain_tagging": float(t_after_domain - t_after_tiling),
+            "close_filter": float(t_after_close_filter - t_after_domain),
+            "group_select": float(t_after_group_select - t_after_close_filter),
+            "total": float(t_after_group_select - t_start),
+        },
     }
 
     if verbose:
@@ -1117,19 +1375,31 @@ def generate_conv_cell_nodes(
         i_bbox_max = (nodes[interior_idx].max(axis=0)
                       if len(interior_idx) else np.full(3, np.nan))
         print(f"[conv_cell] a={a:.4f}  bbox={bbox_min.tolist()} → {bbox_max.tolist()}")
+        tmpl_extra = ""
+        if cell_stats.get("fcc_base_nodes") is not None:
+            tmpl_extra = (
+                f"  [fcc_base={cell_stats['fcc_base_nodes']}"
+                f"  enh1_fine={cell_stats['fcc_enh1_atom_refine_added']}"
+                f"  enh2_rand={cell_stats['fcc_enh2_adaptive_random_added']}]"
+            )
         print(f"[conv_cell]   cell template: {cell_stats['cell_after_filter']} nodes "
               f"(skeleton={cell_stats['cell_skeleton']}, random={cell_stats['cell_random']}, "
-              f"parity={cell_stats['cell_accepted_parity']})")
+              f"parity={cell_stats['cell_accepted_parity']}){tmpl_extra}")
         print(f"[conv_cell]   tile shifts: {tile_range[0]}×{tile_range[1]}×{tile_range[2]} "
               f"→ {len(nodes)} tiled nodes")
+        n_fcc_local = int(len(groups.get("fcc_local", [])))
+        if n_fcc_local > 0:
+            print(f"[conv_cell]   fcc_local (enh1) tiled: {n_fcc_local} nodes")
         print(f"[conv_cell]   all-node bbox     : {np.round(a_bbox_min, 3).tolist()} → "
               f"{np.round(a_bbox_max, 3).tolist()}")
         if domain_shape == "cube":
             print(f"[conv_cell]   margin={margin:.3f} Bohr  (frac={boundary_margin_frac})")
         else:
+            n_ico = int(len(groups.get("icosphere", [])))
             print(f"[conv_cell]   sphere center      : {np.round(sphere_center, 3).tolist()}")
             print(f"[conv_cell]   sphere radius      : {sphere_radius_eff:.3f} Bohr")
-            print(f"[conv_cell]   sphere subdivide   : {sphere_subdivide}")
+            print(f"[conv_cell]   sphere subdivide   : {sphere_subdivide}  "
+                  f"(icosphere boundary nodes: {n_ico})")
         print(f"[conv_cell]   interior / boundary = "
               f"{len(interior_idx)} / {len(boundary_idx)}")
         if len(interior_idx):
@@ -1263,6 +1533,315 @@ def compute_node_quality(
     }
 
 
+def weight_matrix_conv_cell_reuse(
+    x: Array,
+    p: Array,
+    n: int,
+    diffs: Any,
+    phi: str,
+    eps: float,
+    order: int,
+    round_decimals: int = 8,
+) -> sp.csr_matrix:
+    """
+    RBF-FD weight matrix that reuses repeated local stencil solves.
+
+    For domains built by tiling a single template (e.g. ``conv_cell``), most
+    interior stencils are exact translations of each other.  Because the
+    Laplacian (and any constant-coefficient differential operator) commutes
+    with translation, the resulting RBF-FD weights are identical across all
+    translation-equivalent stencils.  This routine groups rows by their
+    canonicalised stencil offset pattern and runs the local linear solve once
+    per equivalence class.
+
+    The output sparse matrix is row/column-compatible with
+    ``rbf.pde.fd.weight_matrix(x, p, n, diffs, ...).tocsr()`` (same shape,
+    same nonzero pattern, same numerical values up to floating-point round-off)
+    and is returned in *canonical* CSR form (column indices sorted per row).
+    """
+    x = np.ascontiguousarray(np.asarray(x, dtype=np.float64))
+    p = np.ascontiguousarray(np.asarray(p, dtype=np.float64))
+    if x.ndim != 2 or x.shape[1] != 3:
+        raise ValueError(f"x must have shape (N, 3), got {x.shape}")
+    if p.ndim != 2 or p.shape[1] != 3:
+        raise ValueError(f"p must have shape (M, 3), got {p.shape}")
+    if n <= 0:
+        raise ValueError(f"n must be > 0, got {n}")
+
+    N, M = x.shape[0], p.shape[0]
+    k = int(min(n, M))
+    if k == 0 or N == 0:
+        return sp.csr_matrix((N, M), dtype=np.float64)
+
+    # 1) Stencils via k-nearest neighbours (matches rbf.weight_matrix's choice).
+    tree = cKDTree(p)
+    _dist, neigh = tree.query(x, k=k)
+    if neigh.ndim == 1:
+        neigh = neigh[:, None]
+    neigh = neigh.astype(np.int64, copy=False)
+
+    # 2) Canonicalise each row's stencil by sorting offsets lexicographically
+    #    on (rounded x, y, z).  Identical patterns produce identical sort keys.
+    offsets = p[neigh] - x[:, None, :]
+    rounded = np.round(offsets, round_decimals)
+    sort_idx = np.lexsort(
+        (rounded[:, :, 2], rounded[:, :, 1], rounded[:, :, 0]),
+        axis=1,
+    )
+    sorted_offsets = np.take_along_axis(offsets, sort_idx[:, :, None], axis=1)
+    sorted_neigh = np.take_along_axis(neigh, sort_idx, axis=1)
+    key_arr = np.round(sorted_offsets, round_decimals)
+
+    # 3) Group rows by signature (tobytes on the (k, 3) rounded offset block).
+    keys = [key_arr[i].tobytes() for i in range(N)]
+    rep_for_key: Dict[bytes, int] = {}
+    for i, key in enumerate(keys):
+        if key not in rep_for_key:
+            rep_for_key[key] = i
+
+    # 4) Solve the local RBF-FD system once per signature.  The local call has
+    #    only k candidate points with n=k, so the entire input set forms the
+    #    stencil and the returned weights map 1:1 onto local_p's row order.
+    cached_w: Dict[bytes, Array] = {}
+    for key, i_rep in rep_for_key.items():
+        center = x[i_rep:i_rep + 1]
+        local_p = p[sorted_neigh[i_rep]]
+        local_w_sparse = weight_matrix(
+            x=center,
+            p=local_p,
+            n=k,
+            diffs=diffs,
+            phi=phi,
+            eps=eps,
+            order=order,
+        ).tocsr()
+        local_w = np.zeros(k, dtype=np.float64)
+        local_w[local_w_sparse.indices] = local_w_sparse.data
+        cached_w[key] = local_w
+
+    # 5) Broadcast cached weights to all rows that share the signature.  Both
+    #    `data_per_row` and `cols_per_row` are in stencil-sorted order, so they
+    #    are already aligned (no inverse permutation needed).
+    data_per_row = np.empty((N, k), dtype=np.float64)
+    for i, key in enumerate(keys):
+        data_per_row[i] = cached_w[key]
+    cols_per_row = sorted_neigh
+
+    # 6) Sort each row's columns ascending → canonical CSR (matches what
+    #    `rbf.pde.fd.weight_matrix(...).tocsr()` produces after sort_indices()).
+    col_order = np.argsort(cols_per_row, axis=1, kind="stable")
+    indices_2d = np.take_along_axis(cols_per_row, col_order, axis=1)
+    data_2d = np.take_along_axis(data_per_row, col_order, axis=1)
+
+    indices = np.ascontiguousarray(indices_2d.reshape(-1))
+    data = np.ascontiguousarray(data_2d.reshape(-1))
+    indptr = np.arange(0, (N + 1) * k, k, dtype=indices.dtype)
+
+    L = sp.csr_matrix((data, indices, indptr), shape=(N, M))
+    L.has_sorted_indices = True
+
+    n_unique = len(rep_for_key)
+    print(
+        f"[conv_cell_reuse] n_interior={N}, stencil_size={k}, "
+        f"unique_patterns={n_unique}  (reuse {N / max(n_unique, 1):.1f}×, "
+        f"solve_ratio={n_unique / max(N, 1):.3f})"
+    )
+    return L
+
+
+# ─── Ball-radius stencil with fingerprint acceleration ───────────────────────
+
+def weight_matrix_ball_fingerprint(
+    x: Array,
+    p: Array,
+    r: float,
+    diffs,
+    phi: str = "ga",
+    eps: float = 1.0,
+    order: int = 0,
+    fingerprint_tol: float = 1e-4,
+    min_stencil: int = 4,
+    verbose: bool = True,
+    inner_radius: float = 0.0,
+    max_neighbors: int = 0,
+    select_near_first: bool = True,
+) -> tuple:
+    """
+    Build an RBF-FD weight matrix using ball-radius stencil with fingerprint reuse.
+
+    For each interior node x_i, neighbours are all p_j with
+    inner_radius <= ||x_i - p_j|| <= r  (the center point itself, dist=0, is
+    always kept).  If max_neighbors > 0 and the shell still has more points,
+    keep the nearest (select_near_first=True) or farthest (False) max_neighbors.
+
+    Rows with identical sorted relative-offset fingerprints (rounded to
+    fingerprint_tol Bohr) are grouped; the RBF system is solved once per unique
+    pattern and weights reused — exploiting translational symmetry in tiled
+    conv_cell domains.
+
+    Parameters
+    ----------
+    x, p              : (n_interior, 3) and (n_all, 3) Cartesian node arrays (Bohr)
+    r                 : outer ball search radius (Bohr)
+    diffs             : differential spec, e.g. [[2,0,0],[0,2,0],[0,0,2]] for Laplacian
+    phi, eps, order   : RBF kernel, shape parameter, polynomial order
+    fingerprint_tol   : absolute rounding tolerance (Bohr) for grouping rows
+    min_stencil       : warn if any row has fewer neighbours
+    verbose           : print grouping statistics
+    inner_radius      : exclude neighbours closer than this (Bohr); the center
+                        point (dist==0) is always kept regardless
+    max_neighbors     : cap stencil to at most this many points (0 = no cap)
+    select_near_first : when capping, True = keep nearest, False = keep farthest
+
+    Returns
+    -------
+    (scipy.sparse.csr_matrix of shape (n_interior, n_all), stencil_stats dict)
+    """
+    from rbf.pde.fd import weight_matrix as _rbf_wm
+
+    x = np.asarray(x, dtype=np.float64)
+    p = np.asarray(p, dtype=np.float64)
+    n_int = x.shape[0]
+
+    tree = cKDTree(p)
+    # Query outer ball; we'll apply inner_radius / max_neighbors per row below
+    raw_lists = tree.query_ball_point(x, r)
+
+    inv_tol = 1.0 / fingerprint_tol
+    groups_fp: Dict[tuple, list] = {}
+    stencil_sizes: list[int] = []
+    n_too_small = 0
+
+    for i, raw_nbrs in enumerate(raw_lists):
+        nbrs_arr = np.asarray(raw_nbrs, dtype=np.int64)
+        offsets = p[nbrs_arr] - x[i]                         # (k_raw, 3)
+        dists   = np.linalg.norm(offsets, axis=1)            # (k_raw,)
+
+        # Inner-radius exclusion: keep the center (dist≈0) + shell [inner_radius, r]
+        if inner_radius > 0.0:
+            keep = (dists < 1e-14) | (dists >= inner_radius)
+            nbrs_arr = nbrs_arr[keep]
+            offsets  = offsets[keep]
+            dists    = dists[keep]
+
+        # Max-neighbours cap (center always preserved at index 0 after argsort)
+        if max_neighbors > 0 and len(nbrs_arr) > max_neighbors:
+            sort_idx = np.argsort(dists)                      # ascending
+            if select_near_first:
+                sel = sort_idx[:max_neighbors]
+            else:
+                # always keep center (the only dist==0 point), then farthest
+                center_mask = dists[sort_idx] < 1e-14
+                center_idx  = sort_idx[center_mask]
+                far_idx     = sort_idx[~center_mask][-(max_neighbors - len(center_idx)):]
+                sel = np.concatenate([center_idx, far_idx])
+            nbrs_arr = nbrs_arr[sel]
+            offsets  = offsets[sel]
+
+        k = len(nbrs_arr)
+        stencil_sizes.append(k)
+        if k < min_stencil:
+            n_too_small += 1
+
+        rounded   = np.round(offsets * inv_tol).astype(np.int64)
+        lex_order = np.lexsort(rounded.T[::-1])
+        key = tuple(map(tuple, rounded[lex_order]))
+        if key not in groups_fp:
+            groups_fp[key] = []
+        groups_fp[key].append((i, nbrs_arr.tolist(), lex_order))
+
+    # ── Stencil-size distribution (power-of-2 bins) ──────────────────────────
+    _bin_edges  = [0, 8, 16, 32, 64, 128, 256]
+    _bin_labels = ["<8", "8-15", "16-31", "32-63", "64-127", "128-255", ">=256"]
+    sizes_arr   = np.array(stencil_sizes, dtype=np.int64)
+    bin_counts: Dict[str, int] = {}
+    for label, lo, hi in zip(_bin_labels,
+                              _bin_edges,
+                              _bin_edges[1:] + [2**31]):
+        bin_counts[label] = int(np.sum((sizes_arr >= lo) & (sizes_arr < hi)))
+    bin_pcts: Dict[str, float] = {
+        k: round(100.0 * v / max(n_int, 1), 2)
+        for k, v in bin_counts.items()
+    }
+
+    stencil_stats: Dict[str, Any] = {
+        "n_interior":       n_int,
+        "outer_radius_bohr": float(r),
+        "inner_radius_bohr": float(inner_radius),
+        "max_neighbors_cap": int(max_neighbors),
+        "select_near_first": bool(select_near_first),
+        "min_neighbors":    int(sizes_arr.min()) if n_int else 0,
+        "max_neighbors_actual": int(sizes_arr.max()) if n_int else 0,
+        "mean_neighbors":   float(sizes_arr.mean()) if n_int else 0.0,
+        "unique_patterns":  len(groups_fp),
+        "neighbor_bins":    bin_counts,
+        "neighbor_bins_pct": bin_pcts,
+    }
+
+    if verbose:
+        print(
+            f"[ball_fingerprint] n_interior={n_int}, r={r:.4f} Bohr"
+            + (f", r_inner={inner_radius:.4f}" if inner_radius > 0 else "")
+            + (f", max_nbrs={max_neighbors}({'near' if select_near_first else 'far'})"
+               if max_neighbors > 0 else "")
+            + f"\n  stencil min/mean/max="
+              f"{stencil_stats['min_neighbors']}/"
+              f"{stencil_stats['mean_neighbors']:.1f}/"
+              f"{stencil_stats['max_neighbors_actual']}, "
+              f"unique_patterns={len(groups_fp)} "
+              f"(reuse {n_int/max(len(groups_fp),1):.1f}×)"
+        )
+        parts = [f"{lbl}:{cnt}" for lbl, cnt in bin_counts.items() if cnt > 0]
+        print(f"  neighbor distribution: {', '.join(parts)}")
+
+    if n_too_small > 0:
+        import warnings
+        warnings.warn(
+            f"[ball_fingerprint] {n_too_small} rows have <{min_stencil} neighbours "
+            f"(r={r:.4f}, r_inner={inner_radius:.4f}) — check node layout.",
+            RuntimeWarning, stacklevel=2,
+        )
+
+    row_idx: list[int] = []
+    col_idx: list[int] = []
+    wdata:   list[float] = []
+    x_origin = np.zeros((1, 3), dtype=np.float64)
+
+    for key, members in groups_fp.items():
+        i0, nbrs0, lex0 = members[0]
+        k = len(nbrs0)
+        nbrs0_arr = np.asarray(nbrs0)
+        sorted_nbrs0 = nbrs0_arr[lex0]
+        p_local = p[sorted_nbrs0] - x[i0]   # (k, 3) centered at origin, lex-sorted
+
+        try:
+            wmat = _rbf_wm(x=x_origin, p=p_local, n=k,
+                           diffs=diffs, phi=phi, eps=eps, order=order)
+            w_sorted = np.asarray(wmat.toarray()[0], dtype=np.float64)
+        except Exception as exc:
+            import warnings
+            warnings.warn(
+                f"[ball_fingerprint] weight_matrix failed (k={k}): {exc}",
+                RuntimeWarning, stacklevel=2,
+            )
+            w_sorted = np.zeros(k, dtype=np.float64)
+
+        for (i, nbrs, lex_i) in members:
+            sorted_nbrs_i = np.asarray(nbrs)[lex_i]
+            for j, j_global in enumerate(sorted_nbrs_i):
+                row_idx.append(i)
+                col_idx.append(int(j_global))
+                wdata.append(float(w_sorted[j]))
+
+    return (
+        sp.csr_matrix(
+            (wdata, (row_idx, col_idx)),
+            shape=(n_int, p.shape[0]),
+        ),
+        stencil_stats,
+    )
+
+
 # ─── QD problem builder ──────────────────────────────────────────────────────
 
 def build_qd_problem(
@@ -1284,6 +1863,11 @@ def build_qd_problem(
     conv_cell_n_random: int = 120,
     conv_cell_seed: int = 42,
     conv_cell_parity: bool = True,
+    conv_cell_template_mode: str = "hybrid",
+    conv_cell_fcc_scale_factor: int = 8,
+    conv_cell_fcc_origin_frac: Optional[Array] = None,
+    conv_cell_fcc_atom_refine_factor: int = 0,
+    conv_cell_fcc_atom_radius_frac: float = 0.0,
     conv_cell_boundary_margin_frac: float = 0.06,
     conv_cell_use_rbf_poisson: bool = True,
     conv_cell_domain_shape: str = "cube",
@@ -1294,6 +1878,16 @@ def build_qd_problem(
     conv_cell_adaptive_lambda_grad: float = 0.0,
     conv_cell_adaptive_lambda_lap: float = 0.0,
     conv_cell_adaptive_candidate_multiplier: float = 8.0,
+    conv_cell_include_skeleton: bool = True,
+    conv_cell_reuse_weights: bool = True,
+    stencil_radius: float = 0.0,
+    stencil_fingerprint_tol: float = 1e-4,
+    stencil_inner_radius: float = 0.0,
+    stencil_max_neighbors: int = 0,
+    stencil_select_near_first: bool = True,
+    include_interior: bool = True,
+    include_boundary: bool = True,
+    node_min_dist: float = 0.0,
     # ── V_nodes source ──
     # "grid_interp"     : linear-interpolate V from the cube-file grid to the
     #                     node positions (legacy, has interp error)
@@ -1362,6 +1956,11 @@ def build_qd_problem(
     conv_cell_sphere_radius  : sphere radius (Bohr) when conv_cell_domain_shape='sphere';
                                None means 0.5*min(bbox side lengths)
     conv_cell_sphere_subdivide : icosphere subdivision for spherical boundary
+    conv_cell_fcc_atom_refine_factor : local FCC refinement scale around atoms
+                                       (0 disables this enhancement)
+    conv_cell_fcc_atom_radius_frac : keep local refined FCC points whose
+                                     periodic distance to any atom is < this
+                                     fractional radius (0 disables)
     conv_cell_adaptive_random : if True, random template points are sampled by
                                 dense-grid potential-adaptive accept/reject
     conv_cell_adaptive_grid_n : one-cell dense uniform grid resolution per axis
@@ -1369,6 +1968,15 @@ def build_qd_problem(
     conv_cell_adaptive_lambda_lap  : λ2 in h = h_max/(1+λ1|∇V|+λ2|ΔV|)
     conv_cell_adaptive_candidate_multiplier : preselection budget multiplier
                                               before accept+KDTree filtering
+    conv_cell_reuse_weights  : when True (default), reuse repeated stencil
+                               solves in conv_cell Laplacian assembly
+    stencil_radius           : outer ball search radius (Bohr); 0 = use k-nearest
+    stencil_fingerprint_tol  : fingerprint rounding tolerance (Bohr, default 1e-4)
+    stencil_inner_radius     : exclude neighbours closer than this (Bohr, 0=off);
+                               forms a spherical-shell stencil [inner, outer]
+    stencil_max_neighbors    : cap stencil size (0 = no cap)
+    stencil_select_near_first: True = keep nearest when capping (default),
+                               False = keep farthest (shell-biased)
     """
     from scipy.interpolate import RegularGridInterpolator
 
@@ -1393,10 +2001,25 @@ def build_qd_problem(
             "interior": interior_idx,
             "boundary": np.where(on_boundary)[0],
         }
+        if (not include_interior) or (not include_boundary):
+            keep_mask = np.zeros(len(nodes), dtype=bool)
+            if include_interior:
+                keep_mask[groups["interior"]] = True
+            if include_boundary:
+                keep_mask[groups["boundary"]] = True
+            keep = np.where(keep_mask)[0].astype(np.int64)
+            remap = -np.ones(len(nodes), dtype=np.int64)
+            remap[keep] = np.arange(len(keep), dtype=np.int64)
+            groups["interior"] = remap[groups["interior"]]
+            groups["interior"] = groups["interior"][groups["interior"] >= 0]
+            groups["boundary"] = remap[groups["boundary"]]
+            groups["boundary"] = groups["boundary"][groups["boundary"] >= 0]
+            nodes = nodes[keep]
         cfg_L = float(np.max(np.abs(nodes)))
 
     elif domain == "sphere":
-        nodes, groups = generate_sphere_nodes(spacing, R, sphere_subdivide)
+        nodes, groups = generate_sphere_nodes(
+            spacing, R, sphere_subdivide, min_dist=node_min_dist)
         interior_idx = groups["interior"]
         cfg_L = R
 
@@ -1410,6 +2033,9 @@ def build_qd_problem(
             augment=augment,
             exclude_radius=exclude_radius,
             sphere_subdivide=sphere_subdivide,
+            include_interior=include_interior,
+            include_boundary=include_boundary,
+            min_dist=node_min_dist,
         )
         interior_idx = groups["interior"]
         cfg_L = R
@@ -1441,6 +2067,11 @@ def build_qd_problem(
             n_random_target=conv_cell_n_random,
             seed=conv_cell_seed,
             include_parity=conv_cell_parity,
+            template_mode=conv_cell_template_mode,
+            fcc_scale_factor=conv_cell_fcc_scale_factor,
+            fcc_origin_frac=conv_cell_fcc_origin_frac,
+            fcc_atom_refine_factor=conv_cell_fcc_atom_refine_factor,
+            fcc_atom_radius_frac=conv_cell_fcc_atom_radius_frac,
             boundary_margin_frac=conv_cell_boundary_margin_frac,
             use_rbf_poisson=conv_cell_use_rbf_poisson,
             domain_shape=conv_cell_domain_shape,
@@ -1452,10 +2083,25 @@ def build_qd_problem(
             adaptive_lambda_lap=conv_cell_adaptive_lambda_lap,
             adaptive_candidate_multiplier=conv_cell_adaptive_candidate_multiplier,
             adaptive_gaussian_builder=adaptive_builder,
+            include_skeleton=conv_cell_include_skeleton,
+            include_interior=include_interior,
+            include_boundary=include_boundary,
+            min_dist_cart=node_min_dist,
         )
         groups["conv_cell_template_nodes_frac"] = _cell_stats["cell_template_nodes_frac"]
         groups["conv_cell_template_nodes_cart"] = _cell_stats["cell_template_nodes_cart"]
         groups["conv_cell_template_roles"] = _cell_stats["cell_template_roles"]
+        groups["conv_cell_step_cell_template_nodes_cart"] = _cell_stats.get("step_cell_template_nodes_cart")
+        groups["conv_cell_step_tiled_raw_nodes_cart"] = _cell_stats.get("step_tiled_raw_nodes_cart")
+        groups["conv_cell_step_tiled_raw_roles"] = _cell_stats.get("step_tiled_raw_roles")
+        groups["conv_cell_step_after_domain_nodes_cart"] = _cell_stats.get("step_after_domain_nodes_cart")
+        groups["conv_cell_step_after_domain_roles"] = _cell_stats.get("step_after_domain_roles")
+        groups["conv_cell_step_after_close_filter_nodes_cart"] = _cell_stats.get("step_after_close_filter_nodes_cart")
+        groups["conv_cell_step_timings_seconds"] = _cell_stats.get("timings_seconds")
+        # Enhancement stats (exposed for caller / result JSON)
+        groups["_enh1_fcc_base"]  = _cell_stats.get("fcc_base_nodes", 0)
+        groups["_enh1_added"]     = _cell_stats.get("fcc_enh1_atom_refine_added", 0)
+        groups["_enh2_added"]     = _cell_stats.get("fcc_enh2_adaptive_random_added", 0)
         interior_idx = groups["interior"]
         cfg_L = float(np.max(np.abs(nodes))) if len(nodes) else 0.0
 
@@ -1488,16 +2134,47 @@ def build_qd_problem(
     # gaussian_direct since the Gaussian fit is analytic and smooth)
     v_cap = float(np.percentile(V_nodes, v_clip_percentile))
     V_nodes = np.clip(V_nodes, None, v_cap)
+    _raise_on_nonfinite("V_nodes (after clip)", V_nodes)
 
-    laplacian_matrix = weight_matrix(
-        x=nodes[interior_idx],
-        p=nodes,
-        n=stencil_size,
-        diffs=[[2, 0, 0], [0, 2, 0], [0, 0, 2]],
-        phi=phi,
-        eps=eps,
-        order=order,
-    )
+    _lap_diffs = [[2, 0, 0], [0, 2, 0], [0, 0, 2]]
+    if stencil_radius > 0.0:
+        laplacian_matrix, _ball_stats = weight_matrix_ball_fingerprint(
+            x=nodes[interior_idx],
+            p=nodes,
+            r=float(stencil_radius),
+            diffs=_lap_diffs,
+            phi=phi,
+            eps=eps,
+            order=order,
+            fingerprint_tol=float(stencil_fingerprint_tol),
+            inner_radius=float(stencil_inner_radius),
+            max_neighbors=int(stencil_max_neighbors),
+            select_near_first=bool(stencil_select_near_first),
+            verbose=True,
+        )
+        if domain == "conv_cell":
+            groups["_ball_stencil_stats"] = _ball_stats
+    elif domain == "conv_cell" and conv_cell_reuse_weights:
+        laplacian_matrix = weight_matrix_conv_cell_reuse(
+            x=nodes[interior_idx],
+            p=nodes,
+            n=stencil_size,
+            diffs=_lap_diffs,
+            phi=phi,
+            eps=eps,
+            order=order,
+        )
+    else:
+        laplacian_matrix = weight_matrix(
+            x=nodes[interior_idx],
+            p=nodes,
+            n=stencil_size,
+            diffs=_lap_diffs,
+            phi=phi,
+            eps=eps,
+            order=order,
+        )
+    _raise_on_nonfinite("laplacian_matrix.data", laplacian_matrix.data)
 
     cfg = RBFConfig(
         spacing=spacing, L=cfg_L,

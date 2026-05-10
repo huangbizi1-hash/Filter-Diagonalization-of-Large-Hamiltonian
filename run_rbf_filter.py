@@ -69,6 +69,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import scipy.sparse.linalg as spla
+import primme
 
 
 # ============================================================
@@ -126,6 +128,9 @@ CONFIG: Dict[str, Any] = {
     "conv_cell_n_random":             120,
     "conv_cell_seed":                 42,
     "conv_cell_parity":               True,
+    "conv_cell_template_mode":        "hybrid",  # "hybrid" | "fcc_refined"
+    "conv_cell_fcc_scale_factor":     8,
+    "conv_cell_fcc_origin_frac":      [0.0, 0.0, 0.0],
     # 面附近多近算 boundary：薄壳（≈1·d_min）才合理；= d_min_frac 是好默认
     "conv_cell_boundary_margin_frac": 0.06,
     "conv_cell_use_rbf_poisson":      True,
@@ -137,6 +142,9 @@ CONFIG: Dict[str, Any] = {
     "conv_cell_adaptive_lambda_grad":          0.0,
     "conv_cell_adaptive_lambda_lap":           0.0,
     "conv_cell_adaptive_candidate_multiplier": 8.0,
+    "include_interior":               True,
+    "include_boundary":               True,
+    "node_min_dist":                  0.0,
     # 节点质量检测（运行时计算 q, h, ρ 并打印 / 写 JSON）：
     "quality_probe_method":           "uniform",
     "quality_probe_n":                0,
@@ -178,6 +186,18 @@ CONFIG: Dict[str, Any] = {
     "max_energies": 200,
     # RBF-FD 的 L 一般非对称，默认用 eig（取实部）；symmetrize=True 则用 eigh
     "hermitian_RR": True,
+
+    # ---------- 求解器路径 ----------
+    "solver": "filter",   # "filter" | "jdqmr"
+    "jdqmr": {
+        "n_levels": 20,
+        "target": None,      # None -> 使用 which；否则用 shift-invert target
+        "which": "SA",
+        "tol": 1e-6,
+        "maxBlockSize": 1,
+        "maxMatvecs": 30000,
+        "ncv": 80,
+    },
 
     # ---------- 杂项 ----------
     "print_every_filter": 1,
@@ -283,6 +303,74 @@ def _save_conv_cell_template_nodes(problem, out_dir: Path) -> None:
           f"{out_dir / 'nodes_conv_cell_template.npz'}")
 
 
+def _save_conv_cell_stage_nodes(problem, out_dir: Path) -> None:
+    """
+    Save conv_cell generation stages immediately after problem build:
+      1) one-cell template
+      2) tiled whole-node set
+      3) filtered node set
+    and record per-step timing.
+    """
+    step_cell = problem.groups.get("conv_cell_step_cell_template_nodes_cart")
+    step_tiled = problem.groups.get("conv_cell_step_tiled_raw_nodes_cart")
+    step_tiled_roles = problem.groups.get("conv_cell_step_tiled_raw_roles")
+    step_filtered = problem.groups.get("conv_cell_step_after_close_filter_nodes_cart")
+    step_after_domain = problem.groups.get("conv_cell_step_after_domain_nodes_cart")
+    step_after_domain_roles = problem.groups.get("conv_cell_step_after_domain_roles")
+    step_timing = problem.groups.get("conv_cell_step_timings_seconds")
+
+    if step_cell is None and step_tiled is None and step_filtered is None:
+        return
+
+    saved_at = datetime.now().isoformat(timespec="seconds")
+
+    if step_cell is not None:
+        np.savez(
+            out_dir / "nodes_step1_cell_template.npz",
+            nodes_cart=np.asarray(step_cell, dtype=np.float64),
+            saved_at=saved_at,
+        )
+        print(f"   saved step1 (cell template) -> {out_dir / 'nodes_step1_cell_template.npz'}")
+
+    if step_tiled is not None:
+        np.savez(
+            out_dir / "nodes_step2_tiled_all.npz",
+            nodes_cart=np.asarray(step_tiled, dtype=np.float64),
+            roles=np.asarray(step_tiled_roles if step_tiled_roles is not None else [], dtype=np.int64),
+            saved_at=saved_at,
+        )
+        print(f"   saved step2 (tiled all nodes) -> {out_dir / 'nodes_step2_tiled_all.npz'}")
+
+    if step_after_domain is not None:
+        np.savez(
+            out_dir / "nodes_step2b_after_domain.npz",
+            nodes_cart=np.asarray(step_after_domain, dtype=np.float64),
+            roles=np.asarray(step_after_domain_roles if step_after_domain_roles is not None else [], dtype=np.int64),
+            saved_at=saved_at,
+        )
+        print(f"   saved step2b (after domain select) -> {out_dir / 'nodes_step2b_after_domain.npz'}")
+
+    if step_filtered is not None:
+        np.savez(
+            out_dir / "nodes_step3_filtered.npz",
+            nodes_cart=np.asarray(step_filtered, dtype=np.float64),
+            saved_at=saved_at,
+        )
+        print(f"   saved step3 (filtered nodes) -> {out_dir / 'nodes_step3_filtered.npz'}")
+
+    timing_payload = {
+        "saved_at": saved_at,
+        "timings_seconds": dict(step_timing) if isinstance(step_timing, dict) else {},
+        "n_step1_cell_template": int(len(step_cell)) if step_cell is not None else 0,
+        "n_step2_tiled_all": int(len(step_tiled)) if step_tiled is not None else 0,
+        "n_step2b_after_domain": int(len(step_after_domain)) if step_after_domain is not None else 0,
+        "n_step3_filtered": int(len(step_filtered)) if step_filtered is not None else 0,
+    }
+    with open(out_dir / "nodes_step_timings.json", "w", encoding="utf-8") as f:
+        json.dump(timing_payload, f, ensure_ascii=False, indent=2)
+    print(f"   saved step timing -> {out_dir / 'nodes_step_timings.json'}")
+
+
 # ============================================================
 # 主运行函数
 # ============================================================
@@ -332,6 +420,10 @@ def run(cfg: Dict[str, Any]) -> None:
         conv_cell_n_random             = cfg.get("conv_cell_n_random", 120),
         conv_cell_seed                 = cfg.get("conv_cell_seed", 42),
         conv_cell_parity               = cfg.get("conv_cell_parity", True),
+        conv_cell_template_mode        = cfg.get("conv_cell_template_mode", "hybrid"),
+        conv_cell_fcc_scale_factor     = cfg.get("conv_cell_fcc_scale_factor", 8),
+        conv_cell_fcc_origin_frac      = np.asarray(
+            cfg.get("conv_cell_fcc_origin_frac", [0.0, 0.0, 0.0]), dtype=np.float64),
         conv_cell_boundary_margin_frac = cfg.get("conv_cell_boundary_margin_frac", 0.5),
         conv_cell_use_rbf_poisson      = cfg.get("conv_cell_use_rbf_poisson", True),
         conv_cell_domain_shape         = cfg.get("conv_cell_domain_shape", "cube"),
@@ -346,6 +438,9 @@ def run(cfg: Dict[str, Any]) -> None:
         conv_cell_adaptive_lambda_lap  = cfg.get("conv_cell_adaptive_lambda_lap", 0.0),
         conv_cell_adaptive_candidate_multiplier = cfg.get(
             "conv_cell_adaptive_candidate_multiplier", 8.0),
+        include_interior               = cfg.get("include_interior", True),
+        include_boundary               = cfg.get("include_boundary", True),
+        node_min_dist                  = cfg.get("node_min_dist", 0.0),
         v_source                       = pot.get("v_source", "grid_interp"),
         gaussian_params_file           = (pot.get("params_file")
                                            if pot.get("v_source") == "gaussian_direct"
@@ -395,6 +490,7 @@ def run(cfg: Dict[str, Any]) -> None:
     _plot_nodes(problem, out_dir)
     if cfg["domain"] == "conv_cell":
         _save_conv_cell_template_nodes(problem, out_dir)
+        _save_conv_cell_stage_nodes(problem, out_dir)
 
     # 频谱覆盖检查（H_max 用 Gershgorin 近似上界）
     H_max_est = float(problem.V_nodes.max()) + 50.0  # 保守；用户可覆盖 dE
@@ -414,6 +510,88 @@ def run(cfg: Dict[str, Any]) -> None:
     _ = problem.apply_H_flat(np.zeros(n_interior))
     # wrap 成 filter_core 需要的 callable
     H_apply = problem.apply_H_flat
+
+    solver_mode = str(cfg.get("solver", "filter")).lower()
+    if solver_mode == "jdqmr":
+        print("\n2. JDQMR diagonalisation (no FFT / no filter) ...")
+        t0 = time.perf_counter()
+        jd_cfg = cfg.get("jdqmr", {})
+        n_levels = int(jd_cfg.get("n_levels", 20))
+        target = jd_cfg.get("target", None)
+        which = str(jd_cfg.get("which", "SA"))
+        tol = float(jd_cfg.get("tol", 1e-6))
+        max_block = int(jd_cfg.get("maxBlockSize", 1))
+        max_matvecs = int(jd_cfg.get("maxMatvecs", 30000))
+        ncv = int(jd_cfg.get("ncv", max(80, 2 * n_levels)))
+
+        H_op = spla.LinearOperator(
+            shape=(n_interior, n_interior),
+            matvec=H_apply,
+            dtype=np.float64,
+        )
+        which_arg = target if target is not None else which
+        evals, _evecs, stats = primme.eigsh(
+            H_op,
+            k=n_levels,
+            which=which_arg,
+            method="PRIMME_JDQMR",
+            tol=tol,
+            maxBlockSize=max_block,
+            maxMatvecs=max_matvecs,
+            ncv=ncv,
+            return_stats=True,
+            return_history=False,
+        )
+        timings["jdqmr"] = time.perf_counter() - t0
+        timings["total"] = time.perf_counter() - t_total_start
+        energies = np.array(evals, dtype=float)
+
+        print(f"   converged={len(energies)}  matvecs={int(stats.get('numMatvecs', -1))}")
+        print(f"   First 10 energies: {np.round(energies[:10], 6).tolist()}")
+        print(f"   Time: {timings['jdqmr']:.3f} s")
+        print(f"\n   Total wall time: {timings['total']:.3f} s")
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.plot(np.arange(len(energies)), energies, "o-", ms=4)
+        ax.set_xlabel("Index")
+        ax.set_ylabel("Eigenvalue (Hartree)")
+        ax.set_title(f"RBF-FD JDQMR — domain={cfg['domain']}, n_interior={n_interior}")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(out_dir / "energies.png", dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        results = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "config": cfg,
+            "timings_seconds": timings,
+            "problem": {
+                "domain": cfg["domain"],
+                "n_total": n_total,
+                "n_interior": n_interior,
+                "n_atoms": int(len(atom_idx)),
+                "V_min": float(problem.V_nodes.min()),
+                "V_max": float(problem.V_nodes.max()),
+                "V_mean": float(problem.V_nodes.mean()),
+                "quality": quality,
+            },
+            "solver": {
+                "mode": "jdqmr",
+                "n_levels": n_levels,
+                "target": target,
+                "which": which,
+                "tol": tol,
+                "maxBlockSize": max_block,
+                "maxMatvecs": max_matvecs,
+                "ncv": ncv,
+                "numMatvecs": int(stats.get("numMatvecs", -1)),
+                "energies": energies.tolist(),
+            },
+        }
+        save_json(results, out_dir / "res.json")
+        print(f"   Saved: {out_dir / 'res.json'}")
+        print(f"\nAll outputs in: {out_dir}")
+        return
 
     # ================================================================
     # 3. 构建滤波系数
@@ -653,7 +831,7 @@ def _parse_val(s: str) -> Any:
 # ============================================================
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="RBF-FD filter-diagonalisation solver",
+        description="RBF-FD solver (filter-diagonalisation or JDQMR)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例（与 main.py 完全一致的覆盖/扫描风格）：

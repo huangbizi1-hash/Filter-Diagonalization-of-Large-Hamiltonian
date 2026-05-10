@@ -1,47 +1,33 @@
 """
-SVD + Rayleigh-Ritz 对角化。
+SVD + Rayleigh-Ritz 对角化——向后兼容层。
+
+原始 QR/SVD/eigh 实现已迁移到 `filter_core.svd_rayleigh_ritz_op`，
+此文件仅保留同名 thin wrapper。
 """
 from typing import Tuple
 
 import numpy as np
-from scipy.linalg import eigh
 
-from .grid import grid_to_vec, vec_to_grid
 from .hamiltonian import apply_H
 
 
 def svd_rayleigh_ritz(filtered_psi_matrix: np.ndarray,
-                      x_grid, V: np.ndarray,
+                      x_grid,
+                      V: np.ndarray,
                       Nx: int, Ny: int, Nz: int,
                       T_k_diagonal: np.ndarray,
                       svd_tol: float = 1e-3,
                       max_energies: int = 200) -> Tuple[np.ndarray, np.ndarray, int]:
+    """Thin wrapper → filter_core.svd_rayleigh_ritz_op。
+
+    将 filtered_psi_matrix (n_basis, Nx, Ny, Nz) reshape 为
+    basis_mat (n_grid, n_basis) 后委托到算符无关版本。
+    返回 (energies, Ur, rank)。
     """
-    在滤波子空间中做 Rayleigh-Ritz 对角化。
-
-    返回 energies, Ur, rank r。
-    """
-    C_f = grid_to_vec(filtered_psi_matrix)
-    C_f = C_f / np.linalg.norm(C_f, axis=0)
-    C_f = C_f[:, ~np.any(np.isinf(C_f), axis=0)]
-
-    print("  QR decomposition ...")
-    Q, R = np.linalg.qr(C_f, mode='reduced')
-
-    print("  SVD on R ...")
-    U1, sigma, _ = np.linalg.svd(R, full_matrices=False)
-    U = Q @ U1
-
-    r = int(np.sum(sigma > svd_tol))
-    print(f"  Selected rank r = {r}  (tol = {svd_tol})")
-    Ur = U[:, :r]
-
-    Ur_grid  = vec_to_grid(Ur, Nx, Ny, Nz)
-    HUr_grid = np.zeros_like(Ur_grid, dtype='complex128')
-    for i in range(r):
-        HUr_grid[i] = apply_H(Ur_grid[i], V, T_k_diagonal)
-
-    H_tilde     = Ur.T.conj() @ grid_to_vec(HUr_grid)
-    energies, _ = eigh(H_tilde)
-    energies    = np.sort(energies.real)[:max_energies]
-    return energies, Ur, r
+    from filter_core import svd_rayleigh_ritz_op
+    n_grid    = Nx * Ny * Nz
+    basis_mat = filtered_psi_matrix.reshape(-1, n_grid).T  # (n_grid, n_basis)
+    H_apply   = lambda psi_flat: apply_H(
+        psi_flat.reshape(Nx, Ny, Nz), V, T_k_diagonal).ravel()
+    return svd_rayleigh_ritz_op(basis_mat, H_apply, svd_tol, max_energies,
+                                hermitian=True)

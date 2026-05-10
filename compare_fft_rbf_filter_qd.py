@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,7 +24,6 @@ from scipy.interpolate import RegularGridInterpolator
 
 from filter_core import (
     PhysParams,
-    apply_filter_H_all_op,
     build_filter_coefficients,
     make_filter_func,
     svd_rayleigh_ritz_op,
@@ -49,6 +48,7 @@ class CompareConfig:
     ho_N: int = 16
     ho_L: float = 5.0
     el: float = -0.18
+    el_list: list = field(default_factory=list)   # 多滤波中心；非空时覆盖 el
     nc: int = 500
     dE: float = 50.0
     Vmin: float = -5.0
@@ -56,9 +56,16 @@ class CompareConfig:
     svd_tol: float = 1e-3
     max_energies: int = 30
     seed: int = 42
+    psi_init_type: str = "sine"      # sine | gaussian
+    psi_kmax: float = 3.0            # |k| 上界（仅 sine 模式）
 
     rbf_spacing: float = 0.5
     rbf_stencil_size: int = 80
+    rbf_stencil_radius: float = 0.0
+    rbf_stencil_fingerprint_tol: float = 1e-4
+    rbf_stencil_inner_radius: float = 0.0
+    rbf_stencil_max_neighbors: int = 0
+    rbf_stencil_select_near_first: bool = True
     rbf_phi: str = "phs3"
     rbf_eps: float = 0.5
     rbf_order: int = 2
@@ -81,6 +88,11 @@ class CompareConfig:
     conv_cell_n_random: int = 120           # 每个晶胞 Poisson-like 目标点数
     conv_cell_seed: int = 42
     conv_cell_parity: bool = True           # 是否加 1-r 反演对偶点
+    conv_cell_template_mode: str = "hybrid" # hybrid | fcc_refined
+    conv_cell_fcc_scale_factor: int = 8
+    conv_cell_fcc_origin_frac: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    conv_cell_fcc_atom_refine_factor: int = 0
+    conv_cell_fcc_atom_radius_frac: float = 0.0
     # 面附近多近算 boundary：薄壳（≈1·d_min）才合理；以前 0.5 太大，会让中心
     # 立方只剩 ~36% 体积，视觉上像没铺满。默认 = d_min_frac。
     conv_cell_boundary_margin_frac: float = 0.06
@@ -93,14 +105,18 @@ class CompareConfig:
     conv_cell_adaptive_lambda_grad: float = 0.0
     conv_cell_adaptive_lambda_lap: float = 0.0
     conv_cell_adaptive_candidate_multiplier: float = 8.0
+    conv_cell_include_skeleton: bool = True
+    include_interior: bool = True
+    include_boundary: bool = True
+    node_min_dist: float = 0.0
 
     # ── 节点质量度量 ───────────────────────────────────────────────────────
     quality_probe_method: str = "uniform"   # 'uniform' 或 'random'
     quality_probe_n: int = 0                # 0 = 自动（~32× n_nodes）
 
     # ── 节点持久化 ─────────────────────────────────────────────────────────
-    save_nodes: str = ""   # 非空则把节点单独写入此 JSON（无需后缀，未填则自动命名）
-    load_nodes: str = ""   # 非空则从此 JSON 加载节点，跳过节点生成；节点上的
+    save_nodes: str = ""   # 非空则把节点单独写入 NumPy 数据文件（.npz）
+    load_nodes: str = ""   # 非空则从已存节点文件（.npz/.json）加载节点，跳过节点生成；节点上的
                            #   laplacian / V_nodes 仍然会按 CLI 的 --rbf-phi / eps /
                            #   order / stencil-size / v-clip 等参数重新计算
 
@@ -126,6 +142,10 @@ class CompareConfig:
     out_dir: str = "filter_compare_results"
     power_steps: int = 30
     fft_kinetic_cut: float = 30.0
+    fft_only: bool = False
+    filter_norm_blowup_threshold: float = 1e200
+    matvec_bench_n: int = 20
+    matvec_bench_warmup: int = 2
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -155,7 +175,82 @@ def _read_cube_header(cube_path: Path):
 
 def _rayleigh(H_apply, psi: np.ndarray) -> float:
     hpsi = H_apply(psi)
-    return float(np.vdot(psi, hpsi).real / np.vdot(psi, psi).real)
+    denom = float(np.vdot(psi, psi).real)
+    if (not np.isfinite(denom)) or denom <= 0.0:
+        return float("nan")
+    num = float(np.vdot(psi, hpsi).real)
+    return float(num / denom)
+
+
+def _finite_stats(name: str, arr: np.ndarray) -> dict[str, Any]:
+    """Return finite/non-finite diagnostics for a vector or matrix."""
+    a = np.asarray(arr)
+    finite_mask = np.isfinite(a)
+    n_total = int(a.size)
+    n_finite = int(np.count_nonzero(finite_mask))
+    stats: dict[str, Any] = {
+        "name": name,
+        "shape": list(a.shape),
+        "n_total": n_total,
+        "n_finite": n_finite,
+        "n_nonfinite": n_total - n_finite,
+        "all_finite": bool(np.all(finite_mask)),
+    }
+    if n_finite > 0:
+        a_f = a[finite_mask]
+        stats.update({
+            "min": float(np.min(a_f)),
+            "max": float(np.max(a_f)),
+            "mean_abs": float(np.mean(np.abs(a_f))),
+        })
+    return stats
+
+
+def _first_nonfinite_detail(arr: np.ndarray) -> dict[str, Any] | None:
+    a = np.asarray(arr)
+    bad = np.argwhere(~np.isfinite(a))
+    if bad.size == 0:
+        return None
+    idx = tuple(int(i) for i in bad[0])
+    return {"index": list(idx), "value": float(np.real(a[idx]))}
+
+
+def _trace_matvec_nonfinite(
+    H_apply,
+    psi0: np.ndarray,
+    n_steps: int,
+    stage_name: str,
+) -> dict[str, Any]:
+    """
+    Probe repeated H-apply stability to localize where NaN/Inf first appears.
+    """
+    psi = np.asarray(psi0, dtype=float).copy()
+    trace: dict[str, Any] = {
+        "stage": stage_name,
+        "input_stats": _finite_stats(f"{stage_name}_psi0", psi),
+        "first_nonfinite_step": None,
+        "first_nonfinite_component": None,
+    }
+    if not trace["input_stats"]["all_finite"]:
+        trace["first_nonfinite_step"] = 0
+        trace["first_nonfinite_component"] = _first_nonfinite_detail(psi)
+        return trace
+
+    for k in range(1, max(1, int(n_steps)) + 1):
+        psi = H_apply(psi)
+        if not np.all(np.isfinite(psi)):
+            trace["first_nonfinite_step"] = k
+            trace["first_nonfinite_component"] = _first_nonfinite_detail(psi)
+            trace["step_stats"] = _finite_stats(f"{stage_name}_after_{k}_matvec", psi)
+            break
+        nrm = np.linalg.norm(psi)
+        if (not np.isfinite(nrm)) or nrm == 0.0:
+            trace["first_nonfinite_step"] = k
+            trace["first_nonfinite_component"] = {"norm": float(nrm)}
+            break
+        psi /= nrm
+
+    return trace
 
 
 def _power_method_energy(H_apply, psi0: np.ndarray, n_steps: int = 30) -> float:
@@ -172,6 +267,112 @@ def _power_method_energy(H_apply, psi0: np.ndarray, n_steps: int = 30) -> float:
             raise RuntimeError("power method 迭代中向量范数变为 0")
         psi /= nrm
     return _rayleigh(H_apply, psi)
+
+
+def _benchmark_single_hamiltonian_apply(
+    H_apply,
+    dim: int,
+    n_repeat: int,
+    n_warmup: int,
+    seed: int,
+    name: str,
+) -> dict[str, Any]:
+    rng = np.random.default_rng(seed)
+    repeats = max(1, int(n_repeat))
+    warmups = max(0, int(n_warmup))
+
+    # warmup
+    for _ in range(warmups):
+        psi_w = rng.standard_normal(dim)
+        out_w = H_apply(psi_w)
+        if not np.all(np.isfinite(out_w)):
+            raise RuntimeError(f"{name} matvec warmup produced NaN/Inf.")
+
+    times_sec: list[float] = []
+    for _ in range(repeats):
+        psi = rng.standard_normal(dim)
+        t0 = time.perf_counter()
+        out = H_apply(psi)
+        dt = time.perf_counter() - t0
+        if not np.all(np.isfinite(out)):
+            raise RuntimeError(f"{name} matvec benchmark produced NaN/Inf.")
+        times_sec.append(float(dt))
+
+    arr = np.asarray(times_sec, dtype=float)
+    return {
+        "name": name,
+        "n_repeat": repeats,
+        "n_warmup": warmups,
+        "mean_sec": float(np.mean(arr)),
+        "median_sec": float(np.median(arr)),
+        "min_sec": float(np.min(arr)),
+        "max_sec": float(np.max(arr)),
+        "std_sec": float(np.std(arr)),
+    }
+
+
+def _apply_filter_with_blowup_guard(
+    H_apply,
+    psi: np.ndarray,
+    nodes: np.ndarray,
+    an: np.ndarray,
+    par: PhysParams,
+    norm_blowup_threshold: float,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Apply filter with per-step norm diagnostics.
+
+    Returns (results, diag), where diag["blowup_step"] is the H-apply count
+    when norms first become non-finite / zero / exceed threshold.
+    """
+    ms, nc = an.shape
+    idx = (slice(None),) + (None,) * psi.ndim
+    results = an[:, 0][idx] * psi[None, ...]
+
+    psi_prev = psi.copy()
+    diag: dict[str, Any] = {
+        "blowup_step": None,
+        "reason": None,
+        "psi_curr_norm": None,
+        "result_norm": None,
+    }
+
+    for j in range(1, nc):
+        H_psi = H_apply(psi_prev)
+        psi_curr = ((4.0 / par.dE) * (H_psi - par.Vmin * psi_prev)
+                    - 2.0 * psi_prev
+                    - nodes[j - 1] * psi_prev)
+        results = results + an[:, j][idx] * psi_curr[None, ...]
+
+        psi_curr_norm = float(np.linalg.norm(psi_curr))
+        result_norm = float(np.linalg.norm(results[0]))
+        if (not np.isfinite(psi_curr_norm)) or (not np.isfinite(result_norm)):
+            diag.update({
+                "blowup_step": j,
+                "reason": "nonfinite_norm",
+                "psi_curr_norm": psi_curr_norm,
+                "result_norm": result_norm,
+            })
+            break
+        if psi_curr_norm == 0.0:
+            diag.update({
+                "blowup_step": j,
+                "reason": "zero_norm",
+                "psi_curr_norm": psi_curr_norm,
+                "result_norm": result_norm,
+            })
+            break
+        if (psi_curr_norm >= norm_blowup_threshold) or (result_norm >= norm_blowup_threshold):
+            diag.update({
+                "blowup_step": j,
+                "reason": "norm_threshold_exceeded",
+                "psi_curr_norm": psi_curr_norm,
+                "result_norm": result_norm,
+            })
+            break
+
+        psi_prev = psi_curr
+
+    return results, diag
 
 
 def _build_node_storage(
@@ -242,36 +443,70 @@ def _build_node_storage(
     }
 
 
-def _save_conv_cell_template_json(problem: RBFProblem, nodes_json_path: Path) -> Path | None:
+def _save_conv_cell_template_npz(problem: RBFProblem, nodes_data_path: Path) -> Path | None:
     nodes_frac = problem.groups.get("conv_cell_template_nodes_frac")
     nodes_cart = problem.groups.get("conv_cell_template_nodes_cart")
     roles = problem.groups.get("conv_cell_template_roles")
     if nodes_frac is None or nodes_cart is None or roles is None:
         return None
 
-    out = nodes_json_path.with_name(nodes_json_path.stem + "_conv_cell_template.json")
-    payload = {
-        "nodes_frac": np.asarray(nodes_frac, dtype=float).tolist(),
-        "nodes_cart": np.asarray(nodes_cart, dtype=float).tolist(),
-        "roles": np.asarray(roles, dtype=int).tolist(),
-        "role_legend": {
-            "0": "atoms",
-            "1": "level3",
-            "2": "random",
-            "3": "parity",
-        },
-    }
+    nodes_frac_arr = np.asarray(nodes_frac, dtype=np.float64)
+    nodes_cart_arr = np.asarray(nodes_cart, dtype=np.float64)
+    roles_arr = np.asarray(roles, dtype=np.int64)
+    atoms_cart_arr = nodes_cart_arr[roles_arr == 0]
+    out = nodes_data_path.with_name(nodes_data_path.stem + "_conv_cell_template.npz")
     out.parent.mkdir(parents=True, exist_ok=True)
-    with out.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    np.savez_compressed(
+        out,
+        atom_coordinates_cart=atoms_cart_arr,
+        node_coordinates_cart=nodes_cart_arr,
+        node_coordinates_frac=nodes_frac_arr,
+        node_roles=roles_arr,
+    )
     return out
 
 
-def _save_nodes_json(node_storage: dict[str, Any], path: Path) -> Path:
+def _save_nodes_npz(node_storage: dict[str, Any], path: Path) -> Path:
+    coords_all = np.asarray(node_storage["coordinates_all"], dtype=np.float64)
+    coords_interior = np.asarray(node_storage["coordinates_interior"], dtype=np.float64)
+    groups = node_storage.get("groups", {})
+    interior_idx = np.asarray(groups.get("interior", []), dtype=np.int64)
+    boundary_idx = np.asarray(groups.get("boundary", []), dtype=np.int64)
+    coords_boundary = (
+        coords_all[boundary_idx] if boundary_idx.size > 0 else np.empty((0, 3), dtype=np.float64)
+    )
+    metadata = {
+        "total_nodes": int(node_storage.get("total_nodes", coords_all.shape[0])),
+        "interior_nodes": int(node_storage.get("interior_nodes", coords_interior.shape[0])),
+        "group_counts": node_storage.get("group_counts", {}),
+        "metadata": node_storage.get("metadata", {}),
+        "quality": node_storage.get("quality", {}),
+        "source": node_storage.get("source", {}),
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(_to_jsonable(node_storage), f, ensure_ascii=False, indent=2)
+    np.savez_compressed(
+        path,
+        coordinates_all=coords_all,
+        coordinates_interior=coords_interior,
+        coordinates_boundary=coords_boundary,
+        interior_idx=interior_idx,
+        boundary_idx=boundary_idx,
+        metadata_json=np.array(json.dumps(_to_jsonable(metadata), ensure_ascii=False)),
+    )
     return path
+
+
+def _node_summary_for_result(node_storage: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "total_nodes": int(node_storage.get("total_nodes", 0)),
+        "interior_nodes": int(node_storage.get("interior_nodes", 0)),
+        "dimension": node_storage.get("dimension"),
+        "bbox_min": node_storage.get("bbox_min", []),
+        "bbox_max": node_storage.get("bbox_max", []),
+        "group_counts": node_storage.get("group_counts", {}),
+        "quality": node_storage.get("quality", {}),
+        "source": node_storage.get("source", {}),
+    }
 
 
 def _fft_grid_points(pot: PotentialGrid | None, N: int, ho_L: float) -> np.ndarray:
@@ -292,9 +527,24 @@ def _fft_grid_points(pot: PotentialGrid | None, N: int, ho_L: float) -> np.ndarr
     return np.column_stack([X.ravel(), Y.ravel(), Z.ravel()])
 
 
-def _build_problem_from_nodes_json(path: Path, cfg: "CompareConfig",
+def _sine_psi_on_pts(coords: np.ndarray, K_max: float, rng: np.random.Generator) -> np.ndarray:
+    """Normalized random sine wave on an arbitrary 3-D point cloud.
+
+    Draws (kx, ky, kz) ~ Uniform[-K_max, K_max]^3 and phase b ~ Uniform[-π, π],
+    then evaluates psi[i] = sin(kx*x[i] + ky*y[i] + kz*z[i] + b) and normalises.
+    Returns a real flat array of shape (N,).
+    """
+    kx, ky, kz = rng.uniform(-K_max, K_max, 3)
+    b = rng.uniform(-np.pi, np.pi)
+    x, y, z = coords[:, 0], coords[:, 1], coords[:, 2]
+    psi = np.sin(kx * x + ky * y + kz * z + b)
+    nrm = np.linalg.norm(psi)
+    return psi / nrm if nrm > 0 else psi
+
+
+def _build_problem_from_nodes_file(path: Path, cfg: "CompareConfig",
                                     cube_path: Path) -> tuple[RBFProblem, dict[str, Any]]:
-    """Reconstruct a RBFProblem from a saved nodes JSON.
+    """Reconstruct a RBFProblem from a saved nodes file (.npz/.json).
 
     Node positions and group assignments are loaded from the file as-is.
     The RBF-FD Laplacian and V_nodes are recomputed using the **current** CLI
@@ -303,15 +553,32 @@ def _build_problem_from_nodes_json(path: Path, cfg: "CompareConfig",
     """
     from rbf.pde.fd import weight_matrix
 
-    with path.open("r", encoding="utf-8") as f:
-        saved = json.load(f)
+    if path.suffix.lower() == ".npz":
+        with np.load(path, allow_pickle=False) as data:
+            nodes = np.asarray(data["coordinates_all"], dtype=np.float64)
+            interior_idx = np.asarray(data["interior_idx"], dtype=np.int64)
+            boundary_idx = np.asarray(data["boundary_idx"], dtype=np.int64)
+            groups = {
+                "interior": interior_idx,
+                "boundary": boundary_idx,
+            }
+            saved = {
+                "coordinates_all": nodes.tolist(),
+                "groups": {
+                    "interior": interior_idx.tolist(),
+                    "boundary": boundary_idx.tolist(),
+                },
+            }
+    else:
+        with path.open("r", encoding="utf-8") as f:
+            saved = json.load(f)
 
-    nodes = np.asarray(saved["coordinates_all"], dtype=float)
-    groups = {str(k): np.asarray(v, dtype=int) for k, v in saved["groups"].items()}
-    if "interior" not in groups:
-        raise ValueError(
-            f"saved nodes JSON {path} missing 'interior' group")
-    interior_idx = groups["interior"]
+        nodes = np.asarray(saved["coordinates_all"], dtype=float)
+        groups = {str(k): np.asarray(v, dtype=int) for k, v in saved["groups"].items()}
+        if "interior" not in groups:
+            raise ValueError(
+                f"saved nodes file {path} missing 'interior' group")
+        interior_idx = groups["interior"]
 
     # V_nodes: honour cfg.rbf_v_source (same semantics as build_qd_problem)
     if cfg.rbf_v_source == "gaussian_direct":
@@ -416,10 +683,15 @@ def run(cfg: CompareConfig) -> Path:
     dt = (cfg.nc / (cfg.dE * 2.5)) ** 2
     phys = PhysParams(dE=cfg.dE, Vmin=cfg.Vmin, dt=dt)
 
+    El_array = np.array(cfg.el_list, dtype=float) if cfg.el_list else np.array([cfg.el], dtype=float)
+    ms = len(El_array)
+    if ms > 1:
+        print(f"[filter] El_list ({ms} centers): {El_array.tolist()}")
+
     t1 = time.perf_counter()
     filt_func = make_filter_func("gaussian", dt=dt)
     an, samp = build_filter_coefficients(
-        np.array([cfg.el]),
+        El_array,
         phys,
         cfg.nc,
         filter_func=filt_func,
@@ -436,134 +708,211 @@ def run(cfg: CompareConfig) -> Path:
     )
     timings["build_fft_operator"] = time.perf_counter() - t2
 
-    t3 = time.perf_counter()
-    provenance: dict[str, Any] = {
-        "system":          cfg.system,
-        "qd_radius":       cfg.qd_radius if cfg.system == "qd" else None,
-        "qd_cube":         str(qd_cube) if qd_cube is not None else None,
-        "node_method":     cfg.rbf_node_method,
-        "rbf_spacing":     cfg.rbf_spacing,
-        "rbf_R":           cfg.rbf_R,
-        "rbf_sphere_subdivide": cfg.rbf_sphere_subdivide,
-        "rbf_augment":     cfg.rbf_augment,
-        "rbf_exclude_radius": cfg.rbf_exclude_radius,
-        "conv_cell_a":     cfg.conv_cell_a,
-        "conv_cell_d_min_frac": cfg.conv_cell_d_min_frac,
-        "conv_cell_n_random":   cfg.conv_cell_n_random,
-        "conv_cell_seed":       cfg.conv_cell_seed,
-        "conv_cell_parity":     cfg.conv_cell_parity,
-        "conv_cell_boundary_margin_frac": cfg.conv_cell_boundary_margin_frac,
-        "conv_cell_use_rbf_poisson":      cfg.conv_cell_use_rbf_poisson,
-        "conv_cell_domain_shape":         cfg.conv_cell_domain_shape,
-        "conv_cell_sphere_radius":        cfg.conv_cell_sphere_radius,
-        "conv_cell_sphere_subdivide":     cfg.conv_cell_sphere_subdivide,
-        "conv_cell_adaptive_random":      cfg.conv_cell_adaptive_random,
-        "conv_cell_adaptive_grid_n":      cfg.conv_cell_adaptive_grid_n,
-        "conv_cell_adaptive_lambda_grad": cfg.conv_cell_adaptive_lambda_grad,
-        "conv_cell_adaptive_lambda_lap":  cfg.conv_cell_adaptive_lambda_lap,
-        "conv_cell_adaptive_candidate_multiplier": cfg.conv_cell_adaptive_candidate_multiplier,
-        "ho_L":            cfg.ho_L,
-        "loaded_from":     cfg.load_nodes or None,
-    }
+    provenance: dict[str, Any] = {}
+    problem: RBFProblem | None = None
+    node_storage: dict[str, Any] = {}
+    nodes_data_path: Path | None = None
+    n_interior = 0
+    H_rbf_op = None
+    h_rbf_matrix_stats: dict[str, Any] | None = None
+    rbf_min_eig_info: dict[str, Any] | None = None
+    interior_idx = np.array([], dtype=np.int64)
+    if not cfg.fft_only:
+        t3 = time.perf_counter()
+        provenance = {
+            "system":          cfg.system,
+            "qd_radius":       cfg.qd_radius if cfg.system == "qd" else None,
+            "qd_cube":         str(qd_cube) if qd_cube is not None else None,
+            "node_method":     cfg.rbf_node_method,
+            "rbf_spacing":     cfg.rbf_spacing,
+            "rbf_R":           cfg.rbf_R,
+            "rbf_sphere_subdivide": cfg.rbf_sphere_subdivide,
+            "rbf_augment":     cfg.rbf_augment,
+            "rbf_exclude_radius": cfg.rbf_exclude_radius,
+            "conv_cell_a":     cfg.conv_cell_a,
+            "conv_cell_d_min_frac": cfg.conv_cell_d_min_frac,
+            "conv_cell_n_random":   cfg.conv_cell_n_random,
+            "conv_cell_seed":       cfg.conv_cell_seed,
+            "conv_cell_parity":     cfg.conv_cell_parity,
+            "conv_cell_template_mode": cfg.conv_cell_template_mode,
+            "conv_cell_fcc_scale_factor": cfg.conv_cell_fcc_scale_factor,
+            "conv_cell_fcc_origin_frac": list(cfg.conv_cell_fcc_origin_frac),
+            "conv_cell_fcc_atom_refine_factor": cfg.conv_cell_fcc_atom_refine_factor,
+            "conv_cell_fcc_atom_radius_frac": cfg.conv_cell_fcc_atom_radius_frac,
+            "conv_cell_boundary_margin_frac": cfg.conv_cell_boundary_margin_frac,
+            "conv_cell_use_rbf_poisson":      cfg.conv_cell_use_rbf_poisson,
+            "conv_cell_domain_shape":         cfg.conv_cell_domain_shape,
+            "conv_cell_sphere_radius":        cfg.conv_cell_sphere_radius,
+            "conv_cell_sphere_subdivide":     cfg.conv_cell_sphere_subdivide,
+            "conv_cell_adaptive_random":      cfg.conv_cell_adaptive_random,
+            "conv_cell_adaptive_grid_n":      cfg.conv_cell_adaptive_grid_n,
+            "conv_cell_adaptive_lambda_grad": cfg.conv_cell_adaptive_lambda_grad,
+            "conv_cell_adaptive_lambda_lap":  cfg.conv_cell_adaptive_lambda_lap,
+            "conv_cell_adaptive_candidate_multiplier": cfg.conv_cell_adaptive_candidate_multiplier,
+            "conv_cell_include_skeleton": cfg.conv_cell_include_skeleton,
+            "rbf_stencil_radius": cfg.rbf_stencil_radius,
+            "rbf_stencil_fingerprint_tol": cfg.rbf_stencil_fingerprint_tol,
+            "rbf_stencil_inner_radius": cfg.rbf_stencil_inner_radius,
+            "rbf_stencil_max_neighbors": cfg.rbf_stencil_max_neighbors,
+            "rbf_stencil_select_near_first": cfg.rbf_stencil_select_near_first,
+            "include_interior": cfg.include_interior,
+            "include_boundary": cfg.include_boundary,
+            "node_min_dist": cfg.node_min_dist,
+            "ho_L":            cfg.ho_L,
+            "loaded_from":     cfg.load_nodes or None,
+        }
 
-    if cfg.load_nodes:
-        # 从已存节点 JSON 重建 RBFProblem（Laplacian + V 按当前 CLI 重新算）
-        if cfg.system != "qd" or qd_cube is None:
-            raise ValueError("--load-nodes 目前只支持 --system qd（需要 cube 文件做 V 插值）")
-        load_path = Path(cfg.load_nodes)
-        if not load_path.exists():
-            raise FileNotFoundError(f"--load-nodes 指定的文件不存在: {load_path}")
-        problem, _saved_meta = _build_problem_from_nodes_json(load_path, cfg, qd_cube)
-        provenance["loaded_from"] = str(load_path)
-    elif cfg.system == "qd":
-        assert qd_cube is not None
-        if cfg.rbf_node_method not in ("cube", "sphere", "atoms", "conv_cell"):
-            raise ValueError(
-                "--rbf-node-method 仅支持 cube | sphere | atoms | conv_cell，"
-                f"收到 {cfg.rbf_node_method!r}"
+        if cfg.load_nodes:
+            # 从已存节点文件重建 RBFProblem（Laplacian + V 按当前 CLI 重新算）
+            if cfg.system != "qd" or qd_cube is None:
+                raise ValueError("--load-nodes 目前只支持 --system qd（需要 cube 文件做 V 插值）")
+            load_path = Path(cfg.load_nodes)
+            if not load_path.exists():
+                raise FileNotFoundError(f"--load-nodes 指定的文件不存在: {load_path}")
+            problem, _saved_meta = _build_problem_from_nodes_file(load_path, cfg, qd_cube)
+            provenance["loaded_from"] = str(load_path)
+        elif cfg.system == "qd":
+            assert qd_cube is not None
+            if cfg.rbf_node_method not in ("cube", "sphere", "atoms", "conv_cell"):
+                raise ValueError(
+                    "--rbf-node-method 仅支持 cube | sphere | atoms | conv_cell，"
+                    f"收到 {cfg.rbf_node_method!r}"
+                )
+            problem = build_qd_problem(
+                cube_file=str(qd_cube),
+                domain=cfg.rbf_node_method,
+                spacing=cfg.rbf_spacing,
+                R=cfg.rbf_R,
+                stencil_size=cfg.rbf_stencil_size,
+                phi=cfg.rbf_phi,
+                eps=cfg.rbf_eps,
+                order=cfg.rbf_order,
+                sphere_subdivide=cfg.rbf_sphere_subdivide,
+                augment=cfg.rbf_augment,
+                exclude_radius=cfg.rbf_exclude_radius,
+                v_clip_percentile=cfg.rbf_v_clip_percentile,
+                conv_cell_a=cfg.conv_cell_a,
+                conv_cell_d_min_frac=cfg.conv_cell_d_min_frac,
+                conv_cell_n_random=cfg.conv_cell_n_random,
+                conv_cell_seed=cfg.conv_cell_seed,
+                conv_cell_parity=cfg.conv_cell_parity,
+                conv_cell_template_mode=cfg.conv_cell_template_mode,
+                conv_cell_fcc_scale_factor=cfg.conv_cell_fcc_scale_factor,
+                conv_cell_fcc_origin_frac=np.asarray(cfg.conv_cell_fcc_origin_frac, dtype=np.float64),
+                conv_cell_fcc_atom_refine_factor=cfg.conv_cell_fcc_atom_refine_factor,
+                conv_cell_fcc_atom_radius_frac=cfg.conv_cell_fcc_atom_radius_frac,
+                conv_cell_boundary_margin_frac=cfg.conv_cell_boundary_margin_frac,
+                conv_cell_use_rbf_poisson=cfg.conv_cell_use_rbf_poisson,
+                conv_cell_domain_shape=cfg.conv_cell_domain_shape,
+                conv_cell_sphere_radius=(
+                    cfg.conv_cell_sphere_radius
+                    if cfg.conv_cell_sphere_radius > 0.0 else None
+                ),
+                conv_cell_sphere_subdivide=cfg.conv_cell_sphere_subdivide,
+                conv_cell_adaptive_random=cfg.conv_cell_adaptive_random,
+                conv_cell_adaptive_grid_n=cfg.conv_cell_adaptive_grid_n,
+                conv_cell_adaptive_lambda_grad=cfg.conv_cell_adaptive_lambda_grad,
+                conv_cell_adaptive_lambda_lap=cfg.conv_cell_adaptive_lambda_lap,
+                conv_cell_adaptive_candidate_multiplier=cfg.conv_cell_adaptive_candidate_multiplier,
+                conv_cell_include_skeleton=cfg.conv_cell_include_skeleton,
+                stencil_radius=cfg.rbf_stencil_radius,
+                stencil_fingerprint_tol=cfg.rbf_stencil_fingerprint_tol,
+                stencil_inner_radius=cfg.rbf_stencil_inner_radius,
+                stencil_max_neighbors=cfg.rbf_stencil_max_neighbors,
+                stencil_select_near_first=cfg.rbf_stencil_select_near_first,
+                include_interior=cfg.include_interior,
+                include_boundary=cfg.include_boundary,
+                node_min_dist=cfg.node_min_dist,
+                v_source=cfg.rbf_v_source,
+                gaussian_params_file=(cfg.potential_params_file
+                                      if cfg.rbf_v_source == "gaussian_direct"
+                                      else None),
+                r_cut=cfg.potential_r_cut,
             )
-        problem = build_qd_problem(
-            cube_file=str(qd_cube),
-            domain=cfg.rbf_node_method,
-            spacing=cfg.rbf_spacing,
-            R=cfg.rbf_R,
-            stencil_size=cfg.rbf_stencil_size,
-            phi=cfg.rbf_phi,
-            eps=cfg.rbf_eps,
-            order=cfg.rbf_order,
-            sphere_subdivide=cfg.rbf_sphere_subdivide,
-            augment=cfg.rbf_augment,
-            exclude_radius=cfg.rbf_exclude_radius,
-            v_clip_percentile=cfg.rbf_v_clip_percentile,
-            conv_cell_a=cfg.conv_cell_a,
-            conv_cell_d_min_frac=cfg.conv_cell_d_min_frac,
-            conv_cell_n_random=cfg.conv_cell_n_random,
-            conv_cell_seed=cfg.conv_cell_seed,
-            conv_cell_parity=cfg.conv_cell_parity,
-            conv_cell_boundary_margin_frac=cfg.conv_cell_boundary_margin_frac,
-            conv_cell_use_rbf_poisson=cfg.conv_cell_use_rbf_poisson,
-            conv_cell_domain_shape=cfg.conv_cell_domain_shape,
-            conv_cell_sphere_radius=(
-                cfg.conv_cell_sphere_radius
-                if cfg.conv_cell_sphere_radius > 0.0 else None
-            ),
-            conv_cell_sphere_subdivide=cfg.conv_cell_sphere_subdivide,
-            conv_cell_adaptive_random=cfg.conv_cell_adaptive_random,
-            conv_cell_adaptive_grid_n=cfg.conv_cell_adaptive_grid_n,
-            conv_cell_adaptive_lambda_grad=cfg.conv_cell_adaptive_lambda_grad,
-            conv_cell_adaptive_lambda_lap=cfg.conv_cell_adaptive_lambda_lap,
-            conv_cell_adaptive_candidate_multiplier=cfg.conv_cell_adaptive_candidate_multiplier,
-            v_source=cfg.rbf_v_source,
-            gaussian_params_file=(cfg.potential_params_file
-                                  if cfg.rbf_v_source == "gaussian_direct"
-                                  else None),
-            r_cut=cfg.potential_r_cut,
+        else:
+            rbf_cfg = RBFConfig(
+                spacing=cfg.rbf_spacing,
+                L=cfg.ho_L,
+                stencil_size=cfg.rbf_stencil_size,
+                phi=cfg.rbf_phi,
+                eps=cfg.rbf_eps,
+                order=cfg.rbf_order,
+            )
+            problem = build_problem(config=rbf_cfg, build_interpolation=False)
+        H_rbf = build_hamiltonian_matrix(problem, symmetrize=True)
+        h_rbf_matrix_stats = _finite_stats("H_rbf.data", H_rbf.data)
+        if not h_rbf_matrix_stats["all_finite"]:
+            bad_detail = _first_nonfinite_detail(H_rbf.data)
+            raise RuntimeError(
+                "RBF Hamiltonian contains NaN/Inf values. "
+                f"first_bad={bad_detail}. "
+                "Try adjusting node/stencil parameters (e.g. --rbf-stencil-size, "
+                "--rbf-eps, --conv-cell-d-min-frac) to improve conditioning."
+            )
+        t_min_eval = time.perf_counter()
+        try:
+            eig_min_arr = spla.eigs(
+                H_rbf,
+                k=1,
+                which="SR",
+                return_eigenvectors=False,
+                tol=1e-8,
+                maxiter=max(2000, 5 * H_rbf.shape[0]),
+            )
+            eig_min = complex(eig_min_arr[0])
+            rbf_min_eig_info = {
+                "success": True,
+                "which": "SR",
+                "value": {
+                    "real": float(np.real(eig_min)),
+                    "imag": float(np.imag(eig_min)),
+                },
+                "abs": float(np.abs(eig_min)),
+            }
+            print("[rbf] 稀疏矩阵最小特征值(复数, which='SR') = "
+                  f"{eig_min.real:+.10e} {eig_min.imag:+.10e}j")
+        except Exception as exc:
+            rbf_min_eig_info = {
+                "success": False,
+                "which": "SR",
+                "error": str(exc),
+            }
+            print(f"[rbf] 警告：最小特征值计算失败（which='SR'）：{exc}")
+        timings["rbf_min_eigenvalue"] = time.perf_counter() - t_min_eval
+        H_rbf_op = spla.aslinearoperator(H_rbf)
+        interior_idx = problem.interior_idx
+        n_interior = int(len(interior_idx))
+        node_storage = _build_node_storage(
+            problem,
+            provenance=provenance,
+            quality_probe_method=cfg.quality_probe_method,
+            quality_probe_n=cfg.quality_probe_n,
         )
-    else:
-        rbf_cfg = RBFConfig(
-            spacing=cfg.rbf_spacing,
-            L=cfg.ho_L,
-            stencil_size=cfg.rbf_stencil_size,
-            phi=cfg.rbf_phi,
-            eps=cfg.rbf_eps,
-            order=cfg.rbf_order,
-        )
-        problem = build_problem(config=rbf_cfg, build_interpolation=False)
-    H_rbf = build_hamiltonian_matrix(problem, symmetrize=True)
-    H_rbf_op = spla.aslinearoperator(H_rbf)
-    interior_idx = problem.interior_idx
-    node_storage = _build_node_storage(
-        problem,
-        provenance=provenance,
-        quality_probe_method=cfg.quality_probe_method,
-        quality_probe_n=cfg.quality_probe_n,
-    )
-    q_info = node_storage.get("quality", {})
-    if q_info:
-        print(f"[node quality] q={q_info.get('q', float('nan')):.4e}  "
-              f"h={q_info.get('h', float('nan')):.4e}  "
-              f"ρ={q_info.get('rho', float('nan')):.3f}  "
-              f"(n_probe={q_info.get('n_probe', 0)}, "
-              f"method={q_info.get('probe_method', '')})")
-    timings["build_rbf_operator"] = time.perf_counter() - t3
+        q_info = node_storage.get("quality", {})
+        if q_info:
+            print(f"[node quality] q={q_info.get('q', float('nan')):.4e}  "
+                  f"h={q_info.get('h', float('nan')):.4e}  "
+                  f"ρ={q_info.get('rho', float('nan')):.3f}  "
+                  f"(n_probe={q_info.get('n_probe', 0)}, "
+                  f"method={q_info.get('probe_method', '')})")
+        timings["build_rbf_operator"] = time.perf_counter() - t3
 
-    # 按需单独落盘节点 JSON（便于后续 --load-nodes 复用，不依赖结果 JSON）
-    nodes_json_path: Path | None = None
+    # 按需单独落盘节点数据（便于后续 --load-nodes 复用，不依赖结果 JSON）
     ts_nodes = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if cfg.save_nodes:
+    if cfg.save_nodes and (not cfg.fft_only):
         # 用户给了路径——如果是目录则自动命名，否则当作完整文件路径
         p_user = Path(cfg.save_nodes)
         if p_user.suffix == "" or p_user.is_dir():
             p_user.mkdir(parents=True, exist_ok=True)
             tag = (f"qd_R{cfg.qd_radius}" if cfg.system == "qd"
                    else f"ho_N{cfg.ho_N}")
-            nodes_json_path = p_user / f"nodes_{tag}_{cfg.rbf_node_method}_{ts_nodes}.json"
+            nodes_data_path = p_user / f"nodes_{tag}_{cfg.rbf_node_method}_{ts_nodes}.npz"
         else:
-            nodes_json_path = p_user
-        _save_nodes_json(node_storage, nodes_json_path)
-        print(f"节点 JSON 已保存: {nodes_json_path}")
+            nodes_data_path = p_user if p_user.suffix.lower() == ".npz" else p_user.with_suffix(".npz")
+        _save_nodes_npz(node_storage, nodes_data_path)
+        print(f"节点数据文件已保存: {nodes_data_path}")
         if cfg.rbf_node_method == "conv_cell":
-            template_path = _save_conv_cell_template_json(problem, nodes_json_path)
+            template_path = _save_conv_cell_template_npz(problem, nodes_data_path)
             if template_path is not None:
                 print(f"原胞模板节点已保存: {template_path}")
 
@@ -571,61 +920,170 @@ def run(cfg: CompareConfig) -> Path:
     #   FFT: 均匀网格，维度 n_grid = N³
     #   RBF: 散点节点，维度 n_interior（与 n_grid 无关）
     # 必须为两者各自独立生成随机向量，不能用 psi_full[interior_idx] 互相索引。
-    n_interior = int(len(interior_idx))
     rng_fft = np.random.default_rng(cfg.seed)
-    rng_rbf = np.random.default_rng(cfg.seed + 1)
+    rng_rbf = np.random.default_rng(cfg.seed + 1) if not cfg.fft_only else None
+
+    # 正弦初态所需的 3D 坐标（sine 模式下提前计算，避免循环内重复）
+    _use_sine = (cfg.psi_init_type == "sine")
+    fft_pts_sine: np.ndarray | None = None
+    rbf_pts_sine: np.ndarray | None = None
+    if _use_sine:
+        fft_pts_sine = _fft_grid_points(pot, N, cfg.ho_L)   # (N³, 3)
+        if not cfg.fft_only and H_rbf_op is not None and problem is not None:
+            rbf_pts_sine = problem.nodes[interior_idx]       # (n_interior, 3)
+        print(f"[psi init] type=sine  K_max={cfg.psi_kmax}")
+    else:
+        print(f"[psi init] type=gaussian")
 
     t_power = time.perf_counter()
     psi_power_fft = rng_fft.standard_normal(n_grid)
-    psi_power_rbf = rng_rbf.standard_normal(n_interior)
     Emax_fft = _power_method_energy(H_fft.matvec, psi_power_fft, n_steps=cfg.power_steps)
-    Emax_rbf = _power_method_energy(H_rbf_op.matvec, psi_power_rbf, n_steps=cfg.power_steps)
+    Emax_rbf = None
+    if not cfg.fft_only and rng_rbf is not None and H_rbf_op is not None:
+        psi_power_rbf = rng_rbf.standard_normal(n_interior)
+        Emax_rbf = _power_method_energy(H_rbf_op.matvec, psi_power_rbf, n_steps=cfg.power_steps)
     timings["power_method"] = time.perf_counter() - t_power
+
+    t_bench = time.perf_counter()
+    matvec_benchmark: dict[str, Any] = {
+        "n_repeat": int(cfg.matvec_bench_n),
+        "n_warmup": int(cfg.matvec_bench_warmup),
+        "fft": _benchmark_single_hamiltonian_apply(
+            H_fft.matvec, n_grid, cfg.matvec_bench_n, cfg.matvec_bench_warmup, cfg.seed + 123, "fft"
+        ),
+        "rbf": None,
+        "speedup_rbf_over_fft": None,
+        "speedup_fft_over_rbf": None,
+    }
+    if not cfg.fft_only and H_rbf_op is not None:
+        matvec_benchmark["rbf"] = _benchmark_single_hamiltonian_apply(
+            H_rbf_op.matvec, n_interior, cfg.matvec_bench_n, cfg.matvec_bench_warmup, cfg.seed + 456, "rbf"
+        )
+        fft_t = float(matvec_benchmark["fft"]["mean_sec"])
+        rbf_t = float(matvec_benchmark["rbf"]["mean_sec"])
+        if fft_t > 0.0 and rbf_t > 0.0:
+            matvec_benchmark["speedup_rbf_over_fft"] = float(fft_t / rbf_t)
+            matvec_benchmark["speedup_fft_over_rbf"] = float(rbf_t / fft_t)
+    timings["matvec_benchmark"] = time.perf_counter() - t_bench
 
     per_state = []
     fft_basis = []
     rbf_basis = []
+    rbf_invalid_states: list[dict[str, Any]] = []
 
     t4 = time.perf_counter()
     for i in range(cfg.n_random):
-        psi_full = rng_fft.standard_normal(n_grid)
-        psi_full /= np.linalg.norm(psi_full)
-        psi_int = rng_rbf.standard_normal(n_interior)
-        psi_int /= np.linalg.norm(psi_int)
+        if _use_sine:
+            psi_full = _sine_psi_on_pts(fft_pts_sine, cfg.psi_kmax, rng_fft)
+        else:
+            psi_full = rng_fft.standard_normal(n_grid)
+            psi_full /= np.linalg.norm(psi_full)
+        fft_filt_all, fft_filter_diag = _apply_filter_with_blowup_guard(
+            H_apply=H_fft.matvec,
+            psi=psi_full,
+            nodes=samp,
+            an=an,
+            par=phys,
+            norm_blowup_threshold=cfg.filter_norm_blowup_threshold,
+        )
+        # fft_filt_all: (ms, n_grid)
 
-        fft_filt = apply_filter_H_all_op(H_fft.matvec, psi_full, samp, an, phys)[0]
-        rbf_filt = apply_filter_H_all_op(H_rbf_op.matvec, psi_int, samp, an, phys)[0]
+        psi_int = None
+        rbf_filt_all = None
+        rbf_filter_diag = None
+        if not cfg.fft_only and rng_rbf is not None and H_rbf_op is not None:
+            if _use_sine and rbf_pts_sine is not None:
+                psi_int = _sine_psi_on_pts(rbf_pts_sine, cfg.psi_kmax, rng_rbf)
+            else:
+                psi_int = rng_rbf.standard_normal(n_interior)
+                psi_int /= np.linalg.norm(psi_int)
+            rbf_filt_all, rbf_filter_diag = _apply_filter_with_blowup_guard(
+                H_apply=H_rbf_op.matvec,
+                psi=psi_int,
+                nodes=samp,
+                an=an,
+                par=phys,
+                norm_blowup_threshold=cfg.filter_norm_blowup_threshold,
+            )
+            # rbf_filt_all: (ms, n_interior)
+            if rbf_filter_diag["blowup_step"] is not None:
+                print(
+                    "[RBF filter blowup] "
+                    f"state={i}, H_apply_count={rbf_filter_diag['blowup_step']}, "
+                    f"reason={rbf_filter_diag['reason']}, "
+                    f"psi_curr_norm={rbf_filter_diag['psi_curr_norm']}, "
+                    f"result_norm={rbf_filter_diag['result_norm']}"
+                )
 
-        norm_fft = float(np.linalg.norm(fft_filt))
-        norm_rbf = float(np.linalg.norm(rbf_filt))
-        if norm_fft > 0:
-            fft_filt = fft_filt / norm_fft
-        if norm_rbf > 0:
-            rbf_filt = rbf_filt / norm_rbf
+        for ie in range(ms):
+            el_ctr = float(El_array[ie])
 
-        E_fft = _rayleigh(H_fft.matvec, fft_filt)
-        E_rbf = _rayleigh(H_rbf_op.matvec, rbf_filt)
+            fft_filt = fft_filt_all[ie].copy()
+            norm_fft = float(np.linalg.norm(fft_filt))
+            if norm_fft > 0:
+                fft_filt = fft_filt / norm_fft
+            E_fft = _rayleigh(H_fft.matvec, fft_filt)
+            fft_basis.append(fft_filt)
 
-        per_state.append(
-            {
+            norm_rbf = None
+            E_rbf = None
+            if rbf_filt_all is not None:
+                rbf_filt = rbf_filt_all[ie].copy()
+                norm_rbf = float(np.linalg.norm(rbf_filt))
+                is_valid_rbf = np.isfinite(norm_rbf) and (norm_rbf > 0.0) and np.all(np.isfinite(rbf_filt))
+                if is_valid_rbf:
+                    rbf_filt = rbf_filt / norm_rbf
+                    E_rbf = _rayleigh(H_rbf_op.matvec, rbf_filt)
+                    if np.isfinite(E_rbf):
+                        rbf_basis.append(rbf_filt)
+                    else:
+                        rbf_invalid_states.append({
+                            "state_index": i,
+                            "el_idx": ie,
+                            "el_center": el_ctr,
+                            "reason": "rayleigh_nonfinite",
+                            "filter_norm_rbf": norm_rbf,
+                            "filter_stats": _finite_stats("rbf_filt", rbf_filt),
+                            "nonfinite_detail": _first_nonfinite_detail(rbf_filt),
+                            "filter_diag": rbf_filter_diag,
+                            "matvec_trace": _trace_matvec_nonfinite(
+                                H_rbf_op.matvec, psi_int, n_steps=min(8, cfg.nc), stage_name="rbf_filter_input"
+                            ),
+                        })
+                        E_rbf = None
+                else:
+                    rbf_invalid_states.append({
+                        "state_index": i,
+                        "el_idx": ie,
+                        "el_center": el_ctr,
+                        "reason": "filter_output_nonfinite_or_zero_norm",
+                        "filter_norm_rbf": norm_rbf,
+                        "filter_stats": _finite_stats("rbf_filt", rbf_filt),
+                        "nonfinite_detail": _first_nonfinite_detail(rbf_filt),
+                        "filter_diag": rbf_filter_diag,
+                        "matvec_trace": _trace_matvec_nonfinite(
+                            H_rbf_op.matvec, psi_int, n_steps=min(8, cfg.nc), stage_name="rbf_filter_input"
+                        ),
+                    })
+                    E_rbf = None
+
+            per_state.append({
                 "state_index": i,
+                "el_idx": ie,
+                "el_center": el_ctr,
                 "filter_norm_fft": norm_fft,
                 "filter_norm_rbf": norm_rbf,
+                "filter_diag_fft": fft_filter_diag,
+                "filter_diag_rbf": rbf_filter_diag,
                 "energy_fft": E_fft,
                 "energy_rbf": E_rbf,
-                "abs_diff": abs(E_fft - E_rbf),
-                "signed_diff": E_rbf - E_fft,
-            }
-        )
-
-        fft_basis.append(fft_filt)
-        rbf_basis.append(rbf_filt)
+                "abs_diff": abs(E_fft - E_rbf) if E_rbf is not None else None,
+                "signed_diff": (E_rbf - E_fft) if E_rbf is not None else None,
+            })
 
     timings["filter_states"] = time.perf_counter() - t4
 
     fft_basis_mat = np.column_stack(fft_basis)
-    rbf_basis_mat = np.column_stack(rbf_basis)
-
     t5 = time.perf_counter()
     evals_fft, _, rank_fft = svd_rayleigh_ritz_op(
         fft_basis_mat,
@@ -636,15 +1094,21 @@ def run(cfg: CompareConfig) -> Path:
     )
     timings["rr_fft"] = time.perf_counter() - t5
 
-    t6 = time.perf_counter()
-    evals_rbf, _, rank_rbf = svd_rayleigh_ritz_op(
-        rbf_basis_mat,
-        H_rbf_op.matvec,
-        svd_tol=cfg.svd_tol,
-        max_energies=cfg.max_energies,
-        hermitian=True,
-    )
-    timings["rr_rbf"] = time.perf_counter() - t6
+    evals_rbf: np.ndarray = np.array([], dtype=np.float64)
+    rank_rbf = 0
+    if not cfg.fft_only and H_rbf_op is not None and len(rbf_basis) > 0:
+        rbf_basis_mat = np.column_stack(rbf_basis)
+        t6 = time.perf_counter()
+        evals_rbf, _, rank_rbf = svd_rayleigh_ritz_op(
+            rbf_basis_mat,
+            H_rbf_op.matvec,
+            svd_tol=cfg.svd_tol,
+            max_energies=cfg.max_energies,
+            hermitian=True,
+        )
+        timings["rr_rbf"] = time.perf_counter() - t6
+    elif not cfg.fft_only and H_rbf_op is not None:
+        timings["rr_rbf"] = 0.0
 
     # ── 可选：带插值的对照 Ritz ─────────────────────────────────────────────
     # 把 RBF 滤波基从 n_interior 非均匀节点插到 FFT 均匀格点 (n_grid)，
@@ -655,7 +1119,7 @@ def run(cfg: CompareConfig) -> Path:
     t_rr_rbf_interp = 0.0
     per_state_interp: list[dict[str, Any]] = []
 
-    if cfg.rbf_interp_ritz:
+    if cfg.rbf_interp_ritz and (not cfg.fft_only):
         t_ib0 = time.perf_counter()
         from rbf.pde.fd import weight_matrix as _weight_matrix_for_interp
 
@@ -743,7 +1207,8 @@ def run(cfg: CompareConfig) -> Path:
                 "signed_diff": float(evals_rbf_interp[i] - evals_fft[i]),
             })
 
-    avg_state_err = float(np.mean([x["abs_diff"] for x in per_state])) if per_state else None
+    state_abs_diffs = [x["abs_diff"] for x in per_state if x["abs_diff"] is not None]
+    avg_state_err = float(np.mean(state_abs_diffs)) if state_abs_diffs else None
     avg_eval_err = float(np.mean([x["abs_diff"] for x in paired])) if paired else None
     avg_interp_eff = (
         float(np.mean([x["abs_diff"] for x in paired_rbf_interp_vs_nodes]))
@@ -756,27 +1221,31 @@ def run(cfg: CompareConfig) -> Path:
         "grid": {
             "N_fft": N,
             "N_grid_fft": n_grid,
-            "n_interior_rbf": n_interior,
+            "n_interior_rbf": n_interior if not cfg.fft_only else None,
             "qd_cube": str(qd_cube) if qd_cube is not None else None,
         },
-        # 结果 JSON 中保留完整 node_storage；nodes_file 指向独立落盘的副本（如有）
-        "rbf_nodes": node_storage,
-        "rbf_nodes_file": str(nodes_json_path) if nodes_json_path else None,
+        # 结果 JSON 仅保留节点元数据；完整坐标在独立 .npz 文件中（如有）
+        "rbf_nodes": _node_summary_for_result(node_storage),
+        "rbf_nodes_file": str(nodes_data_path) if nodes_data_path else None,
         "filter": {
             "EL": cfg.el,
+            "El_list": El_array.tolist(),
+            "n_el_centers": ms,
             "NC_input": cfg.nc,
             "NC_true": int(len(samp)),
             "dE": cfg.dE,
             "Vmin": cfg.Vmin,
             "dt": dt,
             "sigma": float(1.0 / np.sqrt(2.0 * dt)),
+            "psi_init_type": cfg.psi_init_type,
+            "psi_kmax": cfg.psi_kmax,
         },
         "power_method": {
             "steps": int(cfg.power_steps),
             "max_energy_fft": float(Emax_fft),
-            "max_energy_rbf": float(Emax_rbf),
-            "abs_diff": float(abs(Emax_fft - Emax_rbf)),
-            "signed_diff": float(Emax_rbf - Emax_fft),
+            "max_energy_rbf": float(Emax_rbf) if Emax_rbf is not None else None,
+            "abs_diff": float(abs(Emax_fft - Emax_rbf)) if Emax_rbf is not None else None,
+            "signed_diff": float(Emax_rbf - Emax_fft) if Emax_rbf is not None else None,
         },
         "rr": {
             # evals_rbf 始终是"直接在非均匀节点上 Ritz"的结果（无波函数插值）
@@ -794,13 +1263,16 @@ def run(cfg: CompareConfig) -> Path:
             "paired_level_diffs_rbf_interp_vs_fft":   paired_interp_vs_fft,
             "avg_abs_error_eigenvalues": avg_eval_err,
             "avg_abs_error_interp_effect": avg_interp_eff,   # ← 插值的净影响
+            "n_valid_rbf_basis": int(len(rbf_basis)),
+            "n_invalid_rbf_basis": int(len(rbf_invalid_states)),
         },
         "per_state_filtered_energy": per_state,
+        "rbf_invalid_states": rbf_invalid_states,
         "per_state_filtered_energy_interp": per_state_interp,
         "summary": {
             "avg_abs_error_per_state_filtered_energy": avg_state_err,
             "avg_abs_error_eigenvalues": avg_eval_err,
-            "max_abs_error_per_state_filtered_energy": float(np.max([x["abs_diff"] for x in per_state])) if per_state else None,
+            "max_abs_error_per_state_filtered_energy": float(np.max(state_abs_diffs)) if state_abs_diffs else None,
             "max_abs_error_eigenvalues": float(np.max([x["abs_diff"] for x in paired])) if paired else None,
             "avg_abs_error_interp_effect_eigenvalues": avg_interp_eff,
             "max_abs_error_interp_effect_eigenvalues": (
@@ -808,7 +1280,61 @@ def run(cfg: CompareConfig) -> Path:
                 if paired_rbf_interp_vs_nodes else None),
         },
         "timings_sec": timings,
+        "matvec_benchmark": matvec_benchmark,
     }
+    if h_rbf_matrix_stats is not None:
+        out["rbf_operator"] = {"matrix_data_stats": h_rbf_matrix_stats}
+        if H_rbf is not None and n_interior > 0:
+            nnz = int(H_rbf.nnz)
+            out["rbf_operator"]["nnz"] = nnz
+            out["rbf_operator"]["n_interior"] = int(n_interior)
+            out["rbf_operator"]["avg_stencil_size_from_nnz"] = float(nnz / n_interior)
+        if rbf_min_eig_info is not None:
+            out["rbf_operator"]["min_eigenvalue_complex"] = rbf_min_eig_info
+
+    if cfg.rbf_node_method == "conv_cell" and not cfg.fft_only and not cfg.load_nodes:
+        grp = problem.groups
+        enh = {
+            "fcc_base_nodes":            int(grp.get("_enh1_fcc_base", 0)),
+            "enh1_atom_refine_added":    int(grp.get("_enh1_added", 0)),
+            "enh2_adaptive_random_added": int(grp.get("_enh2_added", 0)),
+            "fcc_local_tiled":           int(len(grp.get("fcc_local", []))),
+        }
+        out["conv_cell_enhancement"] = enh
+        if enh["enh1_atom_refine_added"] > 0 or enh["enh2_adaptive_random_added"] > 0:
+            print(
+                f"[conv_cell enhancement] "
+                f"fcc_base={enh['fcc_base_nodes']}  "
+                f"enh1_fine={enh['enh1_atom_refine_added']}  "
+                f"enh2_rand={enh['enh2_adaptive_random_added']}  "
+                f"fcc_local_tiled={enh['fcc_local_tiled']}"
+            )
+
+    if cfg.rbf_stencil_radius > 0.0 and not cfg.fft_only and not cfg.load_nodes:
+        _ball_stats = problem.groups.get("_ball_stencil_stats")
+        if _ball_stats is not None:
+            out["stencil_neighbor_stats"] = _ball_stats
+            # Pretty console summary
+            bc = _ball_stats["neighbor_bins"]
+            bp = _ball_stats["neighbor_bins_pct"]
+            print(
+                f"[stencil] outer={_ball_stats['outer_radius_bohr']:.3f} Bohr"
+                + (f"  inner={_ball_stats['inner_radius_bohr']:.3f}" if _ball_stats["inner_radius_bohr"] > 0 else "")
+                + (f"  max_cap={_ball_stats['max_neighbors_cap']}({'near' if _ball_stats['select_near_first'] else 'far'})"
+                   if _ball_stats["max_neighbors_cap"] > 0 else "")
+            )
+            print(
+                f"  min/mean/max neighbours: "
+                f"{_ball_stats['min_neighbors']} / "
+                f"{_ball_stats['mean_neighbors']:.1f} / "
+                f"{_ball_stats['max_neighbors_actual']}"
+            )
+            print("  distribution (count / %):")
+            for lbl in ["<8", "8-15", "16-31", "32-63", "64-127", "128-255", ">=256"]:
+                cnt = bc.get(lbl, 0)
+                pct = bp.get(lbl, 0.0)
+                if cnt > 0:
+                    print(f"    {lbl:>8} neighbours: {cnt:>8}  ({pct:.1f}%)")
 
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -827,15 +1353,43 @@ def parse_args() -> CompareConfig:
     p.add_argument("--ho-N", type=int, default=16)
     p.add_argument("--ho-L", type=float, default=5.0)
     p.add_argument("--el", type=float, default=-0.18)
+    p.add_argument("--el-list", type=float, nargs="+", default=[],
+                   metavar="E",
+                   help="多个滤波中心能量（Hartree），非空时覆盖 --el；"
+                        "例：--el-list -0.20 -0.19 -0.18 -0.17 -0.16")
     p.add_argument("--nc", type=int, default=500)
     p.add_argument("--dE", type=float, default=50.0)
-    p.add_argument("--Vmin", type=float, default=-5.0)
+    p.add_argument(
+        "--emin", "--V-min", "--Vmin", "--V_min",
+        dest="emin",
+        type=float,
+        default=-5.0,
+        help="filter 能量窗口下界 E_min（兼容旧参数 --Vmin/--V_min）",
+    )
     p.add_argument("--n-random", type=int, default=16)
     p.add_argument("--svd-tol", type=float, default=1e-3)
     p.add_argument("--max-energies", type=int, default=30)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--psi-init-type", type=str, choices=["sine", "gaussian"],
+                   default="sine",
+                   help="初始波函数类型：sine（随机正弦叠加，默认）或 gaussian（高斯白噪声）")
+    p.add_argument("--psi-kmax", type=float, default=3.0,
+                   help="正弦初态波矢上界 |k_{x,y,z}| ≤ K_max（仅 sine 模式，默认 3.0）")
     p.add_argument("--rbf-spacing", type=float, default=0.5)
     p.add_argument("--rbf-stencil-size", type=int, default=80)
+    p.add_argument("--rbf-stencil-radius", type=float, default=0.0,
+                   help="ball-stencil 搜索半径（Bohr）；>0 时用 ball 半径搜索邻居+指纹加速，"
+                        "0=禁用（使用 k-nearest stencil_size）")
+    p.add_argument("--rbf-stencil-fingerprint-tol", type=float, default=1e-4,
+                   help="ball-stencil 指纹分组舍入容差（Bohr，默认 1e-4）")
+    p.add_argument("--rbf-stencil-inner-radius", type=float, default=0.0,
+                   help="ball-stencil 内半径（Bohr）；在 [inner, outer] 球壳内选邻居，"
+                        "中心节点自身（距离0）始终保留；0=禁用")
+    p.add_argument("--rbf-stencil-max-neighbors", type=int, default=0,
+                   help="ball-stencil 最大邻居数上限（0=不限）；超出时按"
+                        " --rbf-stencil-select-near/far 策略裁剪")
+    p.add_argument("--rbf-stencil-select-far-first", action="store_true",
+                   help="超过最大邻居数时优先保留远处节点（默认保留近处节点）")
     p.add_argument("--rbf-phi", type=str, default="phs3")
     p.add_argument("--rbf-eps", type=float, default=0.5)
     p.add_argument("--rbf-order", type=int, default=2)
@@ -874,6 +1428,18 @@ def parse_args() -> CompareConfig:
                    help="conv_cell 随机种子")
     p.add_argument("--conv-cell-no-parity", action="store_true",
                    help="不加 1-r 反演对偶点")
+    p.add_argument("--conv-cell-template-mode", type=str,
+                   choices=["hybrid", "fcc_refined"], default="hybrid",
+                   help="conv_cell 模板模式：hybrid(默认) 或 fcc_refined(确定性FCC)")
+    p.add_argument("--conv-cell-fcc-scale-factor", type=int, default=8,
+                   help="fcc_refined 模式每轴细分 scale_factor（总点数约 4*sf^3/胞）")
+    p.add_argument("--conv-cell-fcc-origin-frac", type=float, nargs=3,
+                   default=[0.0, 0.0, 0.0], metavar=("FX", "FY", "FZ"),
+                   help="fcc_refined 模式 FCC 原点分数坐标偏移")
+    p.add_argument("--conv-cell-fcc-atom-refine-factor", type=int, default=0,
+                   help="增强方法一：原子附近 local FCC 的更细密 scale_factor（0=关闭）")
+    p.add_argument("--conv-cell-fcc-atom-radius-frac", type=float, default=0.0,
+                   help="增强方法一：仅保留与任意原子周期距离 < radius_frac 的 local FCC 点（0=关闭）")
     p.add_argument("--conv-cell-boundary-margin-frac", type=float, default=0.06,
                    help="距 bbox 面小于 margin*a 的节点判为 boundary；"
                         "默认 0.06 = d_min_frac，薄壳；设 0 关闭 boundary 划分")
@@ -896,6 +1462,14 @@ def parse_args() -> CompareConfig:
                    help="conv_cell 自适应采样 λ2（h = h_max/(1+λ1|∇V|+λ2|ΔV|)）")
     p.add_argument("--conv-cell-adaptive-candidate-multiplier", type=float, default=8.0,
                    help="conv_cell 自适应采样候选预算倍数（相对 n_random）")
+    p.add_argument("--conv-cell-no-skeleton", action="store_true",
+                   help="conv_cell hybrid 模式：去掉原子+level3骨架，仅保留自适应泊松采样节点")
+    p.add_argument("--exclude-boundary", action="store_true",
+                   help="仅保留 interior 节点（去掉 boundary）")
+    p.add_argument("--exclude-interior", action="store_true",
+                   help="仅保留 boundary 节点（去掉 interior）")
+    p.add_argument("--node-min-dist", type=float, default=0.0,
+                   help="节点最小距离过滤阈值（Bohr，0=关闭）")
 
     # 节点质量度量
     p.add_argument("--quality-probe-method", type=str,
@@ -914,32 +1488,48 @@ def parse_args() -> CompareConfig:
     # 节点持久化
     p.add_argument(
         "--save-nodes", type=str, default="",
-        help="把节点单独存成 JSON（可以是目录或完整文件路径）；"
-             "目录时会自动命名为 nodes_<tag>_<method>_<ts>.json")
+        help="把节点单独存成 NumPy 数据文件 .npz（可以是目录或完整文件路径）；"
+             "目录时会自动命名为 nodes_<tag>_<method>_<ts>.npz")
     p.add_argument(
         "--load-nodes", type=str, default="",
-        help="从已存的节点 JSON 加载（跳过节点生成，Laplacian/V 仍按当前 CLI 重新算）")
+        help="从已存节点文件加载（.npz/.json；跳过节点生成，Laplacian/V 仍按当前 CLI 重新算）")
 
     p.add_argument("--power-steps", type=int, default=30)
+    p.add_argument("--matvec-bench-n", type=int, default=20,
+                   help="比较单次哈密顿乘法时间时的重复次数（取平均）")
+    p.add_argument("--matvec-bench-warmup", type=int, default=2,
+                   help="单次哈密顿乘法计时前的 warmup 次数")
     p.add_argument("--fft-kinetic-cut", type=float, default=30.0)
+    p.add_argument("--fft-only", action="store_true",
+                   help="只运行 FFT filter + Ritz，跳过 RBF 建点/哈密顿量/对比项")
     p.add_argument("--out-dir", type=str, default="filter_compare_results")
 
     a = p.parse_args()
+    if a.exclude_interior and a.exclude_boundary:
+        p.error("--exclude-interior 和 --exclude-boundary 不能同时设置")
     return CompareConfig(
         system=a.system,
         qd_radius=a.qd_radius,
         ho_N=a.ho_N,
         ho_L=a.ho_L,
         el=a.el,
+        el_list=a.el_list,
         nc=a.nc,
         dE=a.dE,
-        Vmin=a.Vmin,
+        Vmin=a.emin,
         n_random=a.n_random,
         svd_tol=a.svd_tol,
         max_energies=a.max_energies,
         seed=a.seed,
+        psi_init_type=a.psi_init_type,
+        psi_kmax=a.psi_kmax,
         rbf_spacing=a.rbf_spacing,
         rbf_stencil_size=a.rbf_stencil_size,
+        rbf_stencil_radius=a.rbf_stencil_radius,
+        rbf_stencil_fingerprint_tol=a.rbf_stencil_fingerprint_tol,
+        rbf_stencil_inner_radius=a.rbf_stencil_inner_radius,
+        rbf_stencil_max_neighbors=a.rbf_stencil_max_neighbors,
+        rbf_stencil_select_near_first=(not a.rbf_stencil_select_far_first),
         rbf_phi=a.rbf_phi,
         rbf_eps=a.rbf_eps,
         rbf_order=a.rbf_order,
@@ -958,6 +1548,11 @@ def parse_args() -> CompareConfig:
         conv_cell_n_random=a.conv_cell_n_random,
         conv_cell_seed=a.conv_cell_seed,
         conv_cell_parity=(not a.conv_cell_no_parity),
+        conv_cell_template_mode=a.conv_cell_template_mode,
+        conv_cell_fcc_scale_factor=a.conv_cell_fcc_scale_factor,
+        conv_cell_fcc_origin_frac=tuple(float(v) for v in a.conv_cell_fcc_origin_frac),
+        conv_cell_fcc_atom_refine_factor=a.conv_cell_fcc_atom_refine_factor,
+        conv_cell_fcc_atom_radius_frac=a.conv_cell_fcc_atom_radius_frac,
         conv_cell_boundary_margin_frac=a.conv_cell_boundary_margin_frac,
         conv_cell_use_rbf_poisson=(not a.conv_cell_use_legacy_poisson),
         conv_cell_domain_shape=a.conv_cell_domain_shape,
@@ -968,10 +1563,17 @@ def parse_args() -> CompareConfig:
         conv_cell_adaptive_lambda_grad=a.conv_cell_adaptive_lambda_grad,
         conv_cell_adaptive_lambda_lap=a.conv_cell_adaptive_lambda_lap,
         conv_cell_adaptive_candidate_multiplier=a.conv_cell_adaptive_candidate_multiplier,
+        conv_cell_include_skeleton=(not a.conv_cell_no_skeleton),
+        include_interior=(not a.exclude_interior),
+        include_boundary=(not a.exclude_boundary),
+        node_min_dist=a.node_min_dist,
         quality_probe_method=a.quality_probe_method,
         quality_probe_n=a.quality_probe_n,
         power_steps=a.power_steps,
+        matvec_bench_n=a.matvec_bench_n,
+        matvec_bench_warmup=a.matvec_bench_warmup,
         fft_kinetic_cut=a.fft_kinetic_cut,
+        fft_only=a.fft_only,
         out_dir=a.out_dir,
     )
 
