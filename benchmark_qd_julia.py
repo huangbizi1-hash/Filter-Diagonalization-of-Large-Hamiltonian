@@ -47,6 +47,7 @@ Usage
 import argparse
 import csv
 import json
+import pickle
 import re
 import subprocess
 import sys
@@ -217,6 +218,34 @@ def count_ops_per_part(jl_path):
     }
 
 
+def count_pkl_ops(cube_dir, n):
+    """Count SymPy ops in H^n directly from H_power_{n}.pkl (Ps and Pc parts).
+
+    Loads the pkl without combining with other powers, so this is fast and
+    cannot OOM.  Uses count_ops(visual=True) to extract ADD and MUL counts,
+    matching the approach in analyze_cube_expr_complexity.py.
+
+    Returns the same dict shape as count_ops_per_part, or None if pkl missing.
+    """
+    pkl_path = Path(cube_dir) / f'H_power_{n}.pkl'
+    if not pkl_path.exists():
+        return None
+    with open(pkl_path, 'rb') as fh:
+        data = pickle.load(fh)
+    out = {}
+    for key, part in (('Ps', 'sin'), ('Pc', 'cos')):
+        expr = data.get(key, sp.Integer(0))
+        visual = sp.count_ops(expr, visual=True)
+        plus = int(visual.coeff(sp.Symbol('ADD')))
+        mul  = int(visual.coeff(sp.Symbol('MUL')))
+        out[f'plus_{part}']  = plus
+        out[f'mul_{part}']   = mul
+        out[f'total_{part}'] = plus + mul
+    out['n_cos_groups'] = 0
+    out['n_sin_groups'] = 0
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Grid helpers
 # ---------------------------------------------------------------------------
@@ -356,7 +385,8 @@ def _pick_cubes_by_atom_counts(candidates, atom_counts, rng):
 def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                    sample, seed, julia_exe, outdir, a, b,
                    select_atoms=None, expand=False, do_timing=True,
-                   do_sympy_timing=False, nop_json_path=None, regen=False):
+                   do_sympy_timing=False, nop_json_path=None, regen=False,
+                   count_pkl=False):
     """For --sample cubes sweep n=1..m_max; count ops and optionally time."""
     rng = np.random.default_rng(seed)
     _, X, Y, Z = build_full_grid(L_s, d_grid)
@@ -413,24 +443,37 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                   f"n_atoms={rec['n_atoms']}  n_pts={rec['n_pts']}")
 
             for n in range(1, m_max + 1):
-                # --- find or generate .jl for order n ---
-                jl_path = find_or_generate_jl(
-                    expr_dir, rec['dirname'], n, a, b, expand=expand, regen=regen)
-                if jl_path is None:
-                    print(f"    n={n}: no pkl/jl – skipped")
-                    continue
+                if count_pkl:
+                    # --- count ops directly from H^n pkl (fast, no OOM risk) ---
+                    cube_dir_path = Path(expr_dir) / rec['dirname']
+                    try:
+                        ops = count_pkl_ops(cube_dir_path, n)
+                    except Exception as exc:
+                        print(f"    n={n}: pkl op-count error: {exc}")
+                        continue
+                    if ops is None:
+                        print(f"    n={n}: H_power_{n}.pkl missing – skipped")
+                        continue
+                    jl_path = None
+                else:
+                    # --- find or generate .jl for order n ---
+                    jl_path = find_or_generate_jl(
+                        expr_dir, rec['dirname'], n, a, b, expand=expand, regen=regen)
+                    if jl_path is None:
+                        print(f"    n={n}: no pkl/jl – skipped")
+                        continue
 
-                # --- count ops ---
-                try:
-                    ops = count_ops_per_part(jl_path)
-                except Exception as exc:
-                    print(f"    n={n}: op-count error: {exc}")
-                    continue
+                    # --- count ops from .jl ---
+                    try:
+                        ops = count_ops_per_part(jl_path)
+                    except Exception as exc:
+                        print(f"    n={n}: op-count error: {exc}")
+                        continue
 
-                # --- optional timing ---
+                # --- optional timing (only when .jl available) ---
                 ms_wave = ns_pt = 0.0
                 sympy_ms_wave = sympy_ns_pt = 0.0
-                if do_timing:
+                if do_timing and jl_path is not None:
                     try:
                         timing = run_julia_on_cube(
                             jl_path, rec['Xf'], rec['Yf'], rec['Zf'],
@@ -845,6 +888,10 @@ def main():
     parser.add_argument('--regen', action='store_true', default=False,
                         help='Force re-generation of all .jl files even if they exist on disk '
                              '(needed after julia_codegen.py is updated)')
+    parser.add_argument('--count_pkl', action='store_true', default=False,
+                        help='Sweep mode: count ops from H_power_n.pkl directly '
+                             '(measures H^n complexity, fast, no OOM risk). '
+                             'Skips .jl generation and Julia timing.')
     args = parser.parse_args()
 
     if args.n_waves < 2 and not args.no_timing:
@@ -928,7 +975,8 @@ def main():
             do_timing=not args.no_timing,
             do_sympy_timing=args.sympy_timing,
             nop_json_path=args.nop_json,
-            regen=args.regen)
+            regen=args.regen,
+            count_pkl=args.count_pkl)
 
     if args.mode in ('full', 'both'):
         print(f"\n{'='*60}")
