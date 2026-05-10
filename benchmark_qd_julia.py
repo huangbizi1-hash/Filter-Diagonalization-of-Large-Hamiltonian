@@ -69,7 +69,7 @@ from symbolic_code.chebyshev_filter import (
     group_by_exp_combined,
     apply_horner,
 )
-from symbolic_code.julia_codegen import build_julia_batch_script
+from symbolic_code.julia_codegen import build_julia_batch_script, build_julia_hn_cse_script
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +131,41 @@ def find_jl_file(expr_dir, cube_dir_name, n):
         return None
     matches = sorted(cube_path.glob(f'eval_filter_m{n}_*.jl'))
     return matches[0] if matches else None
+
+
+def generate_hn_cse_jl_for_cube(cube_dir, n, regen=False):
+    """Generate eval_Hn_cse_m{n}.jl via sp.cse() on the raw unexpanded pkl.
+
+    Preserves SymPy tree structure: applies CSE to data['Pc'] and data['Ps']
+    without expanding first.  Much fewer FLOP than the expand+group path.
+    Returns (jl_path, total_ops), or (None, 0) if pkl missing.
+    """
+    cube_dir = Path(cube_dir)
+    pkl_path = cube_dir / f'H_power_{n}.pkl'
+    if not pkl_path.exists():
+        return None, 0
+
+    jl_path = cube_dir / f'eval_Hn_cse_m{n}.jl'
+    if jl_path.exists() and not regen:
+        # read total_ops from header comment
+        first_lines = jl_path.read_text(encoding='utf-8').split('\n')[:5]
+        for ln in first_lines:
+            m = re.search(r'total_ops=(\d+)', ln)
+            if m:
+                return jl_path, int(m.group(1))
+        return jl_path, 0
+
+    try:
+        with open(pkl_path, 'rb') as fh:
+            data = pickle.load(fh)
+        expr_cos = data.get('Pc', sp.Integer(0))
+        expr_sin = data.get('Ps', sp.Integer(0))
+        jl_src, total_ops = build_julia_hn_cse_script(expr_cos, expr_sin)
+        jl_path.write_text(jl_src, encoding='utf-8')
+        return jl_path, total_ops
+    except Exception as exc:
+        print(f"\n    [Hn CSE codegen error] {cube_dir.name} n={n}: {exc}")
+        return None, 0
 
 
 def generate_hn_jl_for_cube(cube_dir, n, regen=False):
@@ -418,7 +453,7 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                    sample, seed, julia_exe, outdir, a, b,
                    select_atoms=None, expand=False, do_timing=True,
                    do_sympy_timing=False, nop_json_path=None, regen=False,
-                   count_pkl=False, hn_julia=False):
+                   count_pkl=False, hn_julia=False, hn_cse=False):
     """For --sample cubes sweep n=1..m_max; count ops and optionally time."""
     rng = np.random.default_rng(seed)
     _, X, Y, Z = build_full_grid(L_s, d_grid)
@@ -487,6 +522,21 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                         print(f"    n={n}: H_power_{n}.pkl missing – skipped")
                         continue
                     jl_path = None
+                elif hn_cse:
+                    # --- generate eval_Hn_cse_m{n}.jl via sp.cse on raw pkl ---
+                    cube_dir_path = Path(expr_dir) / rec['dirname']
+                    jl_path, total_ops_cse = generate_hn_cse_jl_for_cube(
+                        cube_dir_path, n, regen=regen)
+                    if jl_path is None:
+                        print(f"    n={n}: H_power_{n}.pkl missing – skipped")
+                        continue
+                    # Report total CSE ops as Ps; Pc is 0 (merged into CSE)
+                    ops = {
+                        'plus_cos': 0, 'mul_cos': 0, 'total_cos': 0,
+                        'n_cos_groups': 0,
+                        'plus_sin': total_ops_cse, 'mul_sin': 0,
+                        'total_sin': total_ops_cse, 'n_sin_groups': 0,
+                    }
                 elif hn_julia:
                     # --- generate eval_Hn_m{n}.jl from H^n pkl directly ---
                     cube_dir_path = Path(expr_dir) / rec['dirname']
@@ -982,6 +1032,11 @@ def main():
                         help='Sweep mode: generate eval_Hn_m{n}.jl from H_power_n.pkl '
                              'and time Julia eval of H^n (single power, not filter). '
                              'Fast: loads pkl directly, no Chebyshev combination.')
+    parser.add_argument('--hn_cse', action='store_true', default=False,
+                        help='Sweep mode: generate eval_Hn_cse_m{n}.jl by applying '
+                             'sp.cse() directly to the unexpanded H^n SymPy tree. '
+                             'Preserves implicit sharing — expect far fewer FLOP than '
+                             '--hn_julia (which expands first).')
     args = parser.parse_args()
 
     if args.n_waves < 2 and not args.no_timing:
@@ -1067,7 +1122,8 @@ def main():
             nop_json_path=args.nop_json,
             regen=args.regen,
             count_pkl=args.count_pkl,
-            hn_julia=args.hn_julia)
+            hn_julia=args.hn_julia,
+            hn_cse=args.hn_cse)
 
     if args.mode in ('full', 'both'):
         print(f"\n{'='*60}")
