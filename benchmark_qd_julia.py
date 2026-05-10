@@ -510,10 +510,10 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
                     'atoms' : rec['n_atoms'],
                     'n'     : n,
                     'n_pts' : rec['n_pts'],
-                    'ms_per_wave'         : round(ms_wave, 4),
-                    'ns_per_pt_per_wave'  : round(ns_pt, 4),
-                    'sympy_ms_per_wave'   : round(sympy_ms_wave, 4),
-                    'sympy_ns_per_pt_per_wave': round(sympy_ns_pt, 4),
+                    'ms_per_wave'         : float(ms_wave),
+                    'ns_per_pt_per_wave'  : float(ns_pt),
+                    'sympy_ms_per_wave'   : float(sympy_ms_wave),
+                    'sympy_ns_per_pt_per_wave': float(sympy_ns_pt),
                 }
                 rows.append({**base, 'part': 'Pc',
                              'plus': ops['plus_cos'], 'mul': ops['mul_cos'],
@@ -540,10 +540,52 @@ def run_sweep_mode(manager, expr_dir, m_max, n_waves, k_max, L_s, d_grid,
         w.writerows(rows)
     print(f"\n  CSV  → {csv_path}")
 
+    timing_json_path = outdir / f'timing_sweep_m{m_max}.json'
+    _write_timing_json(rows, timing_json_path)
+
     _plot_sweep(rows, outdir, m_max, do_timing)
 
     if nop_json_path:
         _write_nop_summary_json(rows, nop_json_path)
+
+
+
+def _write_timing_json(rows, json_path):
+    """Write high-precision timing data grouped by cube and Chebyshev order n."""
+    payload = {
+        'description': 'High-precision sweep timing and operation counts per cube/order',
+        'records': []
+    }
+
+    for row in rows:
+        if row['part'] != 'Ps':
+            continue
+
+        cube = row['cube']
+        n = int(row['n'])
+        cos_row = next((r for r in rows
+                        if r['cube'] == cube and r['n'] == n and r['part'] == 'Pc'), None)
+        if cos_row is None:
+            continue
+
+        payload['records'].append({
+            'cube': cube,
+            'atoms': int(row['atoms']),
+            'n': n,
+            'n_pts': int(row['n_pts']),
+            'nop_cos': int(cos_row['total']),
+            'nop_sin': int(row['total']),
+            'nop_total': int(cos_row['total']) + int(row['total']),
+            'ms_per_wave': float(row['ms_per_wave']),
+            'ns_per_pt_per_wave': float(row['ns_per_pt_per_wave']),
+            'sympy_ms_per_wave': float(row['sympy_ms_per_wave']),
+            'sympy_ns_per_pt_per_wave': float(row['sympy_ns_per_pt_per_wave']),
+        })
+
+    json_path = Path(json_path)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding='utf-8')
+    print(f"  JSON → {json_path}")
 
 
 def _write_nop_summary_json(rows, json_path):
