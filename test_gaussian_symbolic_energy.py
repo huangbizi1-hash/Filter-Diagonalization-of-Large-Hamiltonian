@@ -17,6 +17,13 @@ Two evaluation paths
            4. Rayleigh quotient E_sym_i = ⟨ψ_i|H_sym|ψ_i⟩
            5. Residual ‖H_sym ψ_i − E_ref_i ψ_i‖ / ‖ψ_i‖
 
+Random-state Chebyshev filter test (--n_random, --E_lo, --E_hi, --cheb_m)
+---------------------------------------------------------------------------
+Generates --n_random random real states, applies the Chebyshev explosion
+filter T_{cheb_m}(aH+b) (with a,b mapping [E_lo,E_hi]→[-1,1]) using the
+FFT Hamiltonian, then compares FFT and symbolic Rayleigh quotients for each
+filtered state.  This mirrors the chebyshev_explosion path in main.py.
+
 Symbolic pipeline
 -----------------
   1. SymPy apply_H_on_pair → Pc_new, Ps_new for cos-start and sin-start
@@ -30,6 +37,7 @@ Usage
   python test_gaussian_symbolic_energy.py
   python test_gaussian_symbolic_energy.py --A 10 --B 0.5 --d 0.5 --box_L 6
   python test_gaussian_symbolic_energy.py --n_levels 8 --batch_size 512 --save_jl
+  python test_gaussian_symbolic_energy.py --n_random 4 --E_lo -9.0 --E_hi -6.0 --cheb_m 20
 """
 
 import argparse
@@ -64,23 +72,57 @@ def make_grid(d: float, box_L: float):
 
 # ── FFT reference operator ───────────────────────────────────────────────────
 
+def _make_T_k(N: int, x1d: np.ndarray) -> np.ndarray:
+    """Kinetic-energy diagonal in k-space: T_k[kx,ky,kz] = (kx²+ky²+kz²)/2."""
+    d = float(x1d[1] - x1d[0])
+    k1d = 2.0 * np.pi * np.fft.fftfreq(N, d=d)
+    return (k1d[:, None, None] ** 2 +
+            k1d[None, :, None] ** 2 +
+            k1d[None, None, :] ** 2) / 2.0
+
+
+def _apply_H_fft(psi: np.ndarray, V_num: np.ndarray, T_k: np.ndarray) -> np.ndarray:
+    """Apply H = -½∇² + V to psi (3-D array) via FFT."""
+    return np.fft.ifftn(T_k * np.fft.fftn(psi)).real + V_num * psi
+
+
 def build_fft_H_op(N: int, x1d: np.ndarray, V_num: np.ndarray):
     """Build scipy LinearOperator for H = -½∇² + V using numpy.fft.
 
     T̂ψ = IFFT[ (k²/2) · FFT(ψ) ]   (periodic BCs, pseudospectral)
     """
-    d = float(x1d[1] - x1d[0])
-    k1d = 2.0 * np.pi * np.fft.fftfreq(N, d=d)
-    T_k = (k1d[:, None, None] ** 2 +
-           k1d[None, :, None] ** 2 +
-           k1d[None, None, :] ** 2) / 2.0
+    T_k = _make_T_k(N, x1d)
 
     def matvec(v):
-        psi = v.reshape(N, N, N)
-        Tpsi = np.fft.ifftn(T_k * np.fft.fftn(psi)).real
-        return (Tpsi + V_num * psi).ravel()
+        return _apply_H_fft(v.reshape(N, N, N), V_num, T_k).ravel()
 
     return LinearOperator((N ** 3, N ** 3), matvec=matvec, dtype=float)
+
+
+def apply_chebyshev_filter_fft(
+        psi: np.ndarray, V_num: np.ndarray, T_k: np.ndarray,
+        m: int, E_lo: float, E_hi: float) -> np.ndarray:
+    """Apply T_m(aH+b) to psi using the three-term Chebyshev recurrence.
+
+    Maps [E_lo, E_hi] → [-1, 1] via a = 2/(E_hi-E_lo), b = -(E_hi+E_lo)/(E_hi-E_lo).
+    Identical to apply_chebyshev_explosion in fft_code/hamiltonian.py but
+    self-contained (no external imports).
+    """
+    a = 2.0 / (E_hi - E_lo)
+    b = -(E_hi + E_lo) / (E_hi - E_lo)
+
+    def _apply_Hs(phi: np.ndarray) -> np.ndarray:
+        return a * _apply_H_fft(phi, V_num, T_k) + b * phi
+
+    y_prev = psi.copy()
+    if m == 0:
+        return y_prev
+    y_curr = _apply_Hs(psi)
+    for _ in range(2, m + 1):
+        y_next = 2.0 * _apply_Hs(y_curr) - y_prev
+        y_prev = y_curr
+        y_curr = y_next
+    return y_curr
 
 
 # ── symbolic H^1 codegen ─────────────────────────────────────────────────────
@@ -240,7 +282,24 @@ def main():
                     help='Output JSON path (default: gaussian_symbolic_test.json)')
     ap.add_argument('--save_jl', action='store_true',
                     help='Save generated .jl files as h1_cos.jl / h1_sin.jl')
+    # ── Chebyshev filter / random-state test ────────────────────────────────
+    ap.add_argument('--n_random', type=int, default=0,
+                    help='Number of random initial states to filter and test '
+                         '(default 0 = skip random-state test). '
+                         'Requires --E_lo and --E_hi.')
+    ap.add_argument('--E_lo', type=float, default=None,
+                    help='Lower energy bound for Chebyshev explosion filter.')
+    ap.add_argument('--E_hi', type=float, default=None,
+                    help='Upper energy bound for Chebyshev explosion filter.')
+    ap.add_argument('--cheb_m', type=int, default=20,
+                    help='Chebyshev filter order m (default 20). '
+                         'T_m(aH+b) maps [E_lo,E_hi]→[-1,1].')
+    ap.add_argument('--seed', type=int, default=42,
+                    help='RNG seed for random initial states (default 42)')
     args = ap.parse_args()
+
+    if args.n_random > 0 and (args.E_lo is None or args.E_hi is None):
+        ap.error('--n_random requires both --E_lo and --E_hi')
 
     # ── Grid ────────────────────────────────────────────────────────────────
     N, x1d = make_grid(args.d, args.box_L)
@@ -252,10 +311,11 @@ def main():
 
     X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
     V_num   = -args.A * np.exp(-args.B * (X ** 2 + Y ** 2 + Z ** 2))
+    T_k     = _make_T_k(N, x1d)    # kinetic diagonal in k-space (shared)
 
     # ── Reference: FFT + eigsh ───────────────────────────────────────────────
     print('\n[ref] Building FFT H operator and solving with eigsh ...')
-    H_fft  = build_fft_H_op(N, x1d, V_num)
+    H_fft  = build_fft_H_op(N, x1d, V_num)   # uses pre-built T_k internally
     t0_ref = time.perf_counter()
     E_ref, psi_ref = eigsh(H_fft, k=args.n_levels, which='SA')
     t_ref  = time.perf_counter() - t0_ref
@@ -334,17 +394,92 @@ def main():
                 'time_sym_s'     : t_sym_i,
             })
 
+    # ── Random-state Chebyshev filter test ───────────────────────────────────
+    random_results = []
+    if args.n_random > 0:
+        rng = np.random.default_rng(args.seed)
+        print(f'\n[rand] Chebyshev explosion filter test:')
+        print(f'  E_lo={args.E_lo}  E_hi={args.E_hi}  cheb_m={args.cheb_m}  '
+              f'n_random={args.n_random}  seed={args.seed}')
+        a_cheb = 2.0 / (args.E_hi - args.E_lo)
+        b_cheb = -(args.E_hi + args.E_lo) / (args.E_hi - args.E_lo)
+        print(f'  Chebyshev scaling: a={a_cheb:.4f}  b={b_cheb:.4f}')
+
+        with tempfile.TemporaryDirectory(prefix='gsym_rand_') as td_rand:
+            jl_cos_r = Path(td_rand) / 'h1_cos.jl'
+            jl_sin_r = Path(td_rand) / 'h1_sin.jl'
+            jl_cos_r.write_text(jl_src_cos)
+            jl_sin_r.write_text(jl_src_sin)
+
+            for i in range(args.n_random):
+                # Random real state, Gaussian-modulated for faster decay at boundaries
+                psi_r = rng.standard_normal((N, N, N))
+                norm2_r = float(np.sum(psi_r ** 2) * d ** 3)
+                psi_r /= np.sqrt(norm2_r)
+
+                # Apply Chebyshev explosion filter with FFT H
+                t0_f = time.perf_counter()
+                psi_f = apply_chebyshev_filter_fft(
+                    psi_r, V_num, T_k, args.cheb_m, args.E_lo, args.E_hi)
+                t_filter = time.perf_counter() - t0_f
+
+                # Normalize filtered state
+                norm2_f = float(np.sum(psi_f ** 2) * d ** 3)
+                if norm2_f < 1e-30:
+                    print(f'  random[{i}]: filtered state has negligible norm; skipping.')
+                    continue
+                psi_fn = psi_f / np.sqrt(norm2_f)
+
+                # FFT Rayleigh quotient
+                Hpsi_fft_r = _apply_H_fft(psi_fn, V_num, T_k)
+                E_fft_r    = float(np.sum(psi_fn * Hpsi_fft_r) * d ** 3)
+
+                # Symbolic Rayleigh quotient via Julia
+                t0_s = time.perf_counter()
+                Hpsi_sym_r = apply_H_sym(
+                    jl_cos_r, jl_sin_r, psi_fn, N, x1d,
+                    args.julia, td_rand, args.batch_size)
+                t_sym_r = time.perf_counter() - t0_s
+                E_sym_r = float(np.sum(psi_fn * Hpsi_sym_r) * d ** 3)
+
+                abs_err_r = abs(E_sym_r - E_fft_r)
+                in_window = args.E_lo <= E_fft_r <= args.E_hi
+                print(f'  random[{i:03d}]: E_fft={E_fft_r:.6f}  E_sym={E_sym_r:.6f}  '
+                      f'|ΔE|={abs_err_r:.2e}  in_window={in_window}  '
+                      f't_filter={t_filter:.1f}s  t_sym={t_sym_r:.1f}s')
+
+                random_results.append({
+                    'idx'            : i,
+                    'E_fft'          : E_fft_r,
+                    'E_sym'          : E_sym_r,
+                    'abs_energy_err' : abs_err_r,
+                    'in_window'      : in_window,
+                    'time_filter_s'  : t_filter,
+                    'time_sym_s'     : t_sym_r,
+                })
+
+        n_in = sum(1 for r in random_results if r['in_window'])
+        if random_results:
+            max_err_r = max(r['abs_energy_err'] for r in random_results)
+            print(f'\n  In-window: {n_in}/{len(random_results)}  '
+                  f'Max |ΔE(sym−fft)|={max_err_r:.2e} Ha')
+
     # ── Save JSON ────────────────────────────────────────────────────────────
     summary = {
         'params': {
-            'A'        : args.A,
-            'B'        : args.B,
-            'd'        : d,
-            'box_L'    : args.box_L,
-            'N'        : N,
-            'N3'       : N3,
-            'n_levels' : args.n_levels,
+            'A'         : args.A,
+            'B'         : args.B,
+            'd'         : d,
+            'box_L'     : args.box_L,
+            'N'         : N,
+            'N3'        : N3,
+            'n_levels'  : args.n_levels,
             'batch_size': args.batch_size,
+            'n_random'  : args.n_random,
+            'E_lo'      : args.E_lo,
+            'E_hi'      : args.E_hi,
+            'cheb_m'    : args.cheb_m,
+            'seed'      : args.seed,
         },
         'ops_cos'            : ops_cos,
         'ops_sin'            : ops_sin,
@@ -353,13 +488,24 @@ def main():
         'results'            : results,
         'max_abs_energy_err' : max(r['abs_energy_err'] for r in results),
         'max_residual'       : max(r['residual'] for r in results),
+        'random_results'     : random_results,
     }
+    if random_results:
+        summary['random_max_abs_energy_err'] = max(
+            r['abs_energy_err'] for r in random_results)
+        summary['random_in_window_fraction'] = (
+            sum(1 for r in random_results if r['in_window']) / len(random_results))
     Path(args.out_json).write_text(json.dumps(summary, indent=2))
 
     print(f'\n{"="*55}')
     print(f'Results → {args.out_json}')
-    print(f'Max |ΔE|     = {summary["max_abs_energy_err"]:.2e} Ha')
+    print(f'Max |ΔE|     = {summary["max_abs_energy_err"]:.2e} Ha  (eigsh states)')
     print(f'Max residual = {summary["max_residual"]:.2e}')
+    if random_results:
+        print(f'Max |ΔE|     = {summary["random_max_abs_energy_err"]:.2e} Ha  '
+              f'(random states, sym vs fft)')
+        print(f'In window    = {summary["random_in_window_fraction"]*100:.0f}%  '
+              f'of {len(random_results)} random states')
     print(f'{"="*55}')
 
 
