@@ -1,47 +1,41 @@
 #!/usr/bin/env python3
 """test_gaussian_symbolic_energy.py
 
-Test accuracy of the symbolic Julia H-operator against a FFT+eigsh reference
-on a 3-D Gaussian potential well  V(r) = -A * exp(-B * r²).
+Chebyshev explosion filter on a 3-D Gaussian potential well
+  V(r) = -A * exp(-B * r²)
 
-Two evaluation paths
---------------------
-[ref]  FFT H (LinearOperator via numpy.fft) + scipy eigsh
-         → reference eigenvalues E_ref[i] and eigenvectors ψ_ref[i]
+Three paths are compared:
+  [ref] scipy eigsh on FFT Hamiltonian – reference eigenvalues
+  [fft] T_m(aH+b) applied to n_random states via FFT three-term recurrence,
+        then Rayleigh-Ritz diagonalisation of the filtered subspace
+  [sym] Same but the filter f(H) is assembled from symbolic H^n expressions
+        (stored as sympy pkl) and evaluated at every grid point via Julia
 
-[sym]  Symbolic H^1 → Julia batch evaluation
-         For each ψ_ref[i]:
-           1. Decompose in plane-wave basis: ĉ_k = FFT(ψ_i)
-           2. Batch-evaluate H|k_cos⟩ and H|k_sin⟩ at all grid points using Julia
-           3. Reconstruct H_sym ψ_i = (1/N³) Σ_k [Re(ĉ_k)·H_cos_k − Im(ĉ_k)·H_sin_k]
-           4. Rayleigh quotient E_sym_i = ⟨ψ_i|H_sym|ψ_i⟩
-           5. Residual ‖H_sym ψ_i − E_ref_i ψ_i‖ / ‖ψ_i‖
+Symbolic pipeline (one-time cost per (A,B,m,E_lo,E_hi)):
+  1. Generate H^n pkl files   → H_powers_gaussian/A{A}_B{B}/H_power_{n}.pkl
+  2. Assemble f(H) from H^n  → Pc_total, Ps_total (envelope functions)
+  3. Build Julia scripts      → H_powers_gaussian/A{A}_B{B}/*.jl  (cached)
+  4. One Julia call per batch, all random states processed per batch
+     (minimises per-call JIT overhead)
 
-Random-state Chebyshev filter test (--n_random, --E_lo, --E_hi, --cheb_m)
----------------------------------------------------------------------------
-Generates --n_random random real states, applies the Chebyshev explosion
-filter T_{cheb_m}(aH+b) (with a,b mapping [E_lo,E_hi]→[-1,1]) using the
-FFT Hamiltonian, then compares FFT and symbolic Rayleigh quotients for each
-filtered state.  This mirrors the chebyshev_explosion path in main.py.
+Per-batch formula:
+  f(H)|ψ⟩(r_i) = (1/N³) Σ_k [Re(c_k) fH_cos(k,r_i) − Im(c_k) fH_sin(k,r_i)]
+  where fH_cos = f(H)|cos(k·r)⟩, fH_sin = f(H)|sin(k·r)⟩ (Julia outputs)
 
-Symbolic pipeline
------------------
-  1. SymPy apply_H_on_pair → Pc_new, Ps_new for cos-start and sin-start
-  2. julia_codegen.build_julia_hn_cse_script → two Julia source files
-       h1_cos.jl : out[i] = cos_p[i] * (k²/2 + V(r_i))   [cos-start]
-       h1_sin.jl : out[i] = sin_p[i] * (k²/2 + V(r_i))   [sin-start]
-  3. Julia is called in batches (--batch_size k-vectors at a time)
+Output:
+  • Per-state Rayleigh-quotient energies after f(H) normalisation
+  • Ritz eigenvalues for both [fft] and [sym] subspaces
+  • JSON with full results (--out_json)
 
-Usage
------
-  python test_gaussian_symbolic_energy.py
-  python test_gaussian_symbolic_energy.py --A 10 --B 0.5 --d 0.5 --box_L 6
-  python test_gaussian_symbolic_energy.py --n_levels 8 --batch_size 512 --save_jl
-  python test_gaussian_symbolic_energy.py --n_random 4 --E_lo -9.0 --E_hi -6.0 --cheb_m 20
+Usage:
+  python test_gaussian_symbolic_energy.py --n_random 4 --E_lo -3.0 --E_hi 20.0 --cheb_m 5
+  python test_gaussian_symbolic_energy.py --A 10 --B 0.5 --d 0.5 --box_L 6 \\
+      --n_random 8 --E_lo -6.0 --E_hi 20.0 --cheb_m 8 --n_levels 5
 """
 
 import argparse
 import json
+import pickle
 import subprocess
 import sys
 import tempfile
@@ -50,463 +44,517 @@ from pathlib import Path
 
 import numpy as np
 import sympy as sp
-from scipy.sparse.linalg import LinearOperator, eigsh
+from scipy.sparse.linalg import eigsh
 
 sys.path.insert(0, str(Path(__file__).parent))
-from symbolic_code.h_powers import apply_H_on_pair
+from symbolic_code.h_powers import apply_H_on_pair, generate_H_powers
+from symbolic_code.chebyshev_filter import apply_f_of_H_from_raw_powers
 from symbolic_code.julia_codegen import build_julia_hn_cse_script
+from filter_core import svd_rayleigh_ritz_op
 
 
-# ── grid helpers ─────────────────────────────────────────────────────────────
+# ── grid ──────────────────────────────────────────────────────────────────────
 
 def make_grid(d: float, box_L: float):
-    """Uniform periodic grid on [-box_L, box_L) with spacing d.
-
-    Returns N (points per axis) and x1d (1-D coordinate array, length N).
-    The grid does NOT include +box_L; this is consistent with periodic FFT.
-    """
     N = int(round(2.0 * box_L / d))
     x1d = np.arange(N) * d - box_L
     return N, x1d
 
 
-# ── FFT reference operator ───────────────────────────────────────────────────
-
-def _make_T_k(N: int, x1d: np.ndarray) -> np.ndarray:
-    """Kinetic-energy diagonal in k-space: T_k[kx,ky,kz] = (kx²+ky²+kz²)/2."""
-    d = float(x1d[1] - x1d[0])
+def make_T_k(N: int, d: float) -> np.ndarray:
     k1d = 2.0 * np.pi * np.fft.fftfreq(N, d=d)
-    return (k1d[:, None, None] ** 2 +
-            k1d[None, :, None] ** 2 +
-            k1d[None, None, :] ** 2) / 2.0
+    return (k1d[:, None, None]**2 +
+            k1d[None, :, None]**2 +
+            k1d[None, None, :]**2) / 2.0
 
 
-def _apply_H_fft(psi: np.ndarray, V_num: np.ndarray, T_k: np.ndarray) -> np.ndarray:
-    """Apply H = -½∇² + V to psi (3-D array) via FFT."""
-    return np.fft.ifftn(T_k * np.fft.fftn(psi)).real + V_num * psi
+# ── FFT Hamiltonian ───────────────────────────────────────────────────────────
+
+def apply_H_fft(psi: np.ndarray, V_num: np.ndarray, T_k: np.ndarray) -> np.ndarray:
+    """H|ψ⟩ via FFT (periodic BCs). psi may be 3-D or 1-D (auto-reshapes)."""
+    sh = psi.shape
+    p3 = psi.reshape(T_k.shape)
+    res = np.fft.ifftn(T_k * np.fft.fftn(p3)).real + V_num * p3
+    return res.reshape(sh)
 
 
-def build_fft_H_op(N: int, x1d: np.ndarray, V_num: np.ndarray):
-    """Build scipy LinearOperator for H = -½∇² + V using numpy.fft.
-
-    T̂ψ = IFFT[ (k²/2) · FFT(ψ) ]   (periodic BCs, pseudospectral)
-    """
-    T_k = _make_T_k(N, x1d)
-
-    def matvec(v):
-        return _apply_H_fft(v.reshape(N, N, N), V_num, T_k).ravel()
-
-    return LinearOperator((N ** 3, N ** 3), matvec=matvec, dtype=float)
-
-
-def apply_chebyshev_filter_fft(
-        psi: np.ndarray, V_num: np.ndarray, T_k: np.ndarray,
-        m: int, E_lo: float, E_hi: float) -> np.ndarray:
-    """Apply T_m(aH+b) to psi using the three-term Chebyshev recurrence.
-
-    Maps [E_lo, E_hi] → [-1, 1] via a = 2/(E_hi-E_lo), b = -(E_hi+E_lo)/(E_hi-E_lo).
-    Identical to apply_chebyshev_explosion in fft_code/hamiltonian.py but
-    self-contained (no external imports).
-    """
+def apply_chebyshev_fft(psi: np.ndarray, V_num: np.ndarray, T_k: np.ndarray,
+                         m: int, E_lo: float, E_hi: float) -> np.ndarray:
+    """T_m(aH+b)|ψ⟩ via three-term Chebyshev recurrence (FFT path)."""
     a = 2.0 / (E_hi - E_lo)
     b = -(E_hi + E_lo) / (E_hi - E_lo)
 
-    def _apply_Hs(phi: np.ndarray) -> np.ndarray:
-        return a * _apply_H_fft(phi, V_num, T_k) + b * phi
+    def Hs(phi):
+        return a * apply_H_fft(phi, V_num, T_k) + b * phi
 
-    y_prev = psi.copy()
+    y0 = psi.copy()
     if m == 0:
-        return y_prev
-    y_curr = _apply_Hs(psi)
+        return y0
+    y1 = Hs(y0)
     for _ in range(2, m + 1):
-        y_next = 2.0 * _apply_Hs(y_curr) - y_prev
-        y_prev = y_curr
-        y_curr = y_next
-    return y_curr
+        y1, y0 = 2.0 * Hs(y1) - y0, y1
+    return y1
 
 
-# ── symbolic H^1 codegen ─────────────────────────────────────────────────────
+# ── H^n sympy cache ───────────────────────────────────────────────────────────
 
-def build_h1_symbolic(A: float, B: float):
-    """Return symbolic H^1 envelopes for V = -A*exp(-B*r²).
-
-    Two starting conditions:
-      cos-start (Pc=1, Ps=0): H maps cos(k·r) → Pc_new*cos(k·r) + Ps_new*sin(k·r)
-      sin-start (Pc=0, Ps=1): H maps sin(k·r) → Pc_new*cos(k·r) + Ps_new*sin(k·r)
-
-    For this simple Gaussian:
-      cos-start → Pc_new = k²/2 + V,  Ps_new = 0
-      sin-start → Pc_new = 0,          Ps_new = k²/2 + V
-
-    Returns (Pc_cos, Ps_cos, Pc_sin, Ps_sin) and symbol dict.
-    """
+def _sympy_ingredients(A: float, B: float):
     x, y, z = sp.symbols('x y z', real=True)
     kx, ky, kz = sp.symbols('kx ky kz', real=True)
-    V_sym = -A * sp.exp(-B * (x ** 2 + y ** 2 + z ** 2))
-    k2 = kx ** 2 + ky ** 2 + kz ** 2
+    V_sym = -A * sp.exp(-B * x**2) * sp.exp(-B * y**2) * sp.exp(-B * z**2)
+    k2 = kx**2 + ky**2 + kz**2
+    return x, y, z, kx, ky, kz, V_sym, k2
+
+
+def ensure_h_powers(n_max: int, A: float, B: float, cache_base: str) -> Path:
+    """Generate (or load from cache) H^0 … H^n_max pkl files.
+
+    Cache directory: {cache_base}/A{A:g}_B{B:g}/
+    Files: H_power_0.pkl … H_power_{n_max}.pkl
+    """
+    outdir = Path(cache_base) / f'A{A:g}_B{B:g}'
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    missing = [n for n in range(n_max + 1)
+               if not (outdir / f'H_power_{n}.pkl').exists()]
+    if not missing:
+        print(f'  [cache] H^0..H^{n_max} already cached in {outdir}')
+        return outdir
+
+    # Find the highest power already on disk to extend from
+    cached = sorted(
+        int(p.stem.split('_')[-1])
+        for p in outdir.glob('H_power_*.pkl')
+        if p.stem.split('_')[-1].isdigit()
+    )
+
+    x, y, z, kx, ky, kz, V_sym, k2 = _sympy_ingredients(A, B)
     kvec = (kx, ky, kz)
 
-    # cos-start: initial Ps=0, Pc=1
-    Ps_cos, Pc_cos = apply_H_on_pair(
-        sp.Integer(0), sp.Integer(1), V_sym, kvec, k2, 0.5, x, y, z)
-    Pc_cos = sp.expand(Pc_cos)
-    Ps_cos = sp.Integer(0) if sp.simplify(Ps_cos) == 0 else sp.expand(Ps_cos)
+    if cached and cached[-1] < n_max:
+        # Extend from the last cached power
+        start = cached[-1]
+        print(f'  [cache] Extending from H^{start} up to H^{n_max} in {outdir}')
+        with open(outdir / f'H_power_{start}.pkl', 'rb') as fh:
+            d = pickle.load(fh)
+        Ps, Pc = d['Ps'], d['Pc']
+        for n in range(start + 1, n_max + 1):
+            print(f'    H^{n} ...', end=' ', flush=True)
+            t0 = time.perf_counter()
+            Ps_H, Pc_H = apply_H_on_pair(Ps, Pc, V_sym, kvec, k2, 0.5, x, y, z)
+            Ps = sp.expand(Ps_H)
+            Pc = sp.expand(Pc_H)
+            with open(outdir / f'H_power_{n}.pkl', 'wb') as fh:
+                pickle.dump({'Ps': Ps, 'Pc': Pc}, fh)
+            print(f'✓  ({time.perf_counter()-t0:.1f}s)')
+    else:
+        # Generate from scratch
+        print(f'  [cache] Generating H^0..H^{n_max} in {outdir}')
+        generate_H_powers(
+            n_max, outdir, file_format='pkl', expand=True,
+            V=V_sym, kvec=kvec, k2=k2, pref=0.5, x=x, y=y, z=z,
+        )
 
-    # sin-start: initial Ps=1, Pc=0
-    Ps_sin, Pc_sin = apply_H_on_pair(
-        sp.Integer(1), sp.Integer(0), V_sym, kvec, k2, 0.5, x, y, z)
-    Ps_sin = sp.expand(Ps_sin)
-    Pc_sin = sp.Integer(0) if sp.simplify(Pc_sin) == 0 else sp.expand(Pc_sin)
-
-    return Pc_cos, Ps_cos, Pc_sin, Ps_sin
+    return outdir
 
 
-# ── Julia batch runner ───────────────────────────────────────────────────────
+def assemble_fH_julia(cheb_m: int, E_lo: float, E_hi: float,
+                       cache_dir: Path) -> tuple[Path, Path]:
+    """Assemble f(H) from H^n pkl and return paths to Julia .jl files (cached).
 
-def call_julia_batch(jl_file, Xf, Yf, Zf, kx_b, ky_b, kz_b,
-                     work_dir, julia_exe):
-    """Call Julia for one batch of k-vectors; return (n_waves, N_grid) array.
+    Returns (jl_sin_path, jl_cos_path):
+      jl_sin evaluates f(H)|sin(k·r)⟩ = Pc_total*cos_p + Ps_total*sin_p
+      jl_cos evaluates f(H)|cos(k·r)⟩ = Ps_total*cos_p − Pc_total*sin_p
+        (derived from symmetry: Pc_cos_n = Ps_sin_n, Ps_cos_n = −Pc_sin_n)
+    """
+    tag = f'm{cheb_m}_Elo{E_lo:g}_Ehi{E_hi:g}'
+    jl_sin = cache_dir / f'fH_sin_{tag}.jl'
+    jl_cos = cache_dir / f'fH_cos_{tag}.jl'
 
-    k-vectors are passed with b=0 (no phase offset).
-    out[j, i] = eval_one_wave! output for wave j at grid point i.
+    if jl_sin.exists() and jl_cos.exists():
+        print(f'  [cache] Julia scripts found: {jl_sin.name}, {jl_cos.name}')
+        return jl_sin, jl_cos
+
+    a = 2.0 / (E_hi - E_lo)
+    b = -(E_hi + E_lo) / (E_hi - E_lo)
+    print(f'  [sym] Assembling f(H) (m={cheb_m}, a={a:.4f}, b={b:.4f}) ...', flush=True)
+    t0 = time.perf_counter()
+    Pc_total, Ps_total = apply_f_of_H_from_raw_powers(
+        cache_dir, cheb_m, a, b, file_type='pkl', return_envelopes=True)
+    print(f'  [sym] Assembly done in {time.perf_counter()-t0:.1f}s  '
+          f'ops_Pc={sp.count_ops(Pc_total)}  ops_Ps={sp.count_ops(Ps_total)}')
+
+    print('  [sym] Building Julia scripts (CSE) ...', flush=True)
+    t0 = time.perf_counter()
+    # sin-start: out = Pc*cos_p + Ps*sin_p  →  f(H)|sin(k·r)⟩
+    src_sin, ops_sin = build_julia_hn_cse_script(Pc_total, Ps_total)
+    # cos-start (by symmetry): out = Ps*cos_p + (-Pc)*sin_p  →  f(H)|cos(k·r)⟩
+    src_cos, ops_cos = build_julia_hn_cse_script(Ps_total, -Pc_total)
+    print(f'  [sym] Codegen done in {time.perf_counter()-t0:.1f}s  '
+          f'ops_sin={ops_sin}  ops_cos={ops_cos}')
+
+    jl_sin.write_text(src_sin)
+    jl_cos.write_text(src_cos)
+    print(f'  [sym] Saved {jl_sin.name}  ({len(src_sin):,} bytes)')
+    print(f'  [sym] Saved {jl_cos.name}  ({len(src_cos):,} bytes)')
+    return jl_sin, jl_cos
+
+
+# ── Julia batch runner ────────────────────────────────────────────────────────
+
+def _call_julia(jl_file: Path, Xf, Yf, Zf, kx_b, ky_b, kz_b,
+                work_dir: str, julia_exe: str) -> np.ndarray:
+    """Call Julia script for one batch of k-vectors.
+
+    Returns out (n_waves, N_grid) float64.
+    out[j, i] = evaluated Julia expression for k-vector j at grid point i.
     """
     N_grid = Xf.size
     n_waves = len(kx_b)
     wd = Path(work_dir)
+    grid_f = wd / '_grid.bin'
+    k_f    = wd / '_kvals.bin'
+    out_f  = wd / '_out.bin'
 
-    grid_bin = wd / '_sg.bin'
-    k_bin    = wd / '_sk.bin'
-    out_bin  = wd / '_so.bin'
-
-    with open(grid_bin, 'wb') as f:
-        Xf.astype('<f8').tofile(f)
-        Yf.astype('<f8').tofile(f)
-        Zf.astype('<f8').tofile(f)
-
-    b_zeros = np.zeros(n_waves)
-    kb = np.column_stack([kx_b, ky_b, kz_b, b_zeros]).astype('<f8')
-    kb.ravel().tofile(str(k_bin))
+    with open(grid_f, 'wb') as fh:
+        Xf.astype('<f8').tofile(fh)
+        Yf.astype('<f8').tofile(fh)
+        Zf.astype('<f8').tofile(fh)
+    kb = np.column_stack([kx_b, ky_b, kz_b, np.zeros(n_waves)]).astype('<f8')
+    kb.ravel().tofile(str(k_f))
 
     proc = subprocess.run(
         [julia_exe, str(jl_file),
-         str(grid_bin), str(k_bin), str(out_bin),
-         str(N_grid), str(n_waves)],
-        capture_output=True, text=True)
-
+         str(grid_f), str(k_f), str(out_f), str(N_grid), str(n_waves)],
+        capture_output=True, text=True,
+    )
     if proc.returncode != 0:
-        raise RuntimeError(
-            f'Julia failed (rc={proc.returncode}):\n{proc.stderr[:2000]}')
+        raise RuntimeError(f'Julia failed (rc={proc.returncode}):\n'
+                           f'{proc.stderr[:3000]}')
 
-    raw = np.fromfile(str(out_bin), dtype='<f8')
-    # Julia writes: out[1:N], out[N+1:2N], ... (wave-major order)
-    return raw.reshape(n_waves, N_grid)
+    return np.fromfile(str(out_f), dtype='<f8').reshape(n_waves, N_grid)
 
 
-# ── symbolic H application ───────────────────────────────────────────────────
+# ── symbolic f(H) applied to multiple states ──────────────────────────────────
 
-def apply_H_sym(jl_cos_file, jl_sin_file, psi, N, x1d,
-                julia_exe, work_dir, batch_size):
-    """Apply symbolic H to psi via plane-wave decomposition + Julia batch eval.
+def apply_fH_sym_all(jl_sin: Path, jl_cos: Path,
+                     psi_list: list, N: int, x1d: np.ndarray,
+                     julia_exe: str, work_dir: str,
+                     batch_size: int) -> tuple[list, float]:
+    """Apply symbolic f(H) to all states in psi_list simultaneously.
 
-    H ψ(r_i) = (1/N³) Σ_k [ Re(ĉ_k) · H_cos_k(r_i) − Im(ĉ_k) · H_sin_k(r_i) ]
+    f(H)|ψ⟩(r_i) = (1/N³) Σ_k [Re(c_k) fH_cos(k,r_i) − Im(c_k) fH_sin(k,r_i)]
 
-    where:
-      H_cos_k(r) = (k²/2 + V(r)) · cos(k·r)   ← jl_cos_file output
-      H_sin_k(r) = (k²/2 + V(r)) · sin(k·r)   ← jl_sin_file output
+    Processes all states in one sweep over k-vector batches, so Julia is called
+    only 2 * n_batches times (sin + cos scripts) regardless of len(psi_list).
 
-    Both files use b=0, so cos_p[i]=cos(k·r_i) and sin_p[i]=sin(k·r_i).
+    Returns (fHpsi_list, julia_time_s).
     """
-    N3 = N ** 3
-    d = float(x1d[1] - x1d[0])
+    N3  = N**3
+    d   = float(x1d[1] - x1d[0])
     X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
-    Xf = X.ravel().astype(float)
-    Yf = Y.ravel().astype(float)
-    Zf = Z.ravel().astype(float)
+    Xf  = X.ravel().astype(np.float64)
+    Yf  = Y.ravel().astype(np.float64)
+    Zf  = Z.ravel().astype(np.float64)
 
-    # k-grid frequencies matching numpy.fft convention
     kfreq = 2.0 * np.pi * np.fft.fftfreq(N, d=d)
     Kx, Ky, Kz = np.meshgrid(kfreq, kfreq, kfreq, indexing='ij')
     kx_all = Kx.ravel()
     ky_all = Ky.ravel()
     kz_all = Kz.ravel()
 
-    c_hat  = np.fft.fftn(psi)          # (N,N,N) complex
-    c_flat = c_hat.ravel()              # (N³,) complex, ĉ_k = c_flat[k]
+    n_states   = len(psi_list)
+    n_batches  = (N3 + batch_size - 1) // batch_size
 
-    Hpsi_flat = np.zeros(N3)
-    n_batches = (N3 + batch_size - 1) // batch_size
+    # FFT all states up front: c_all[s, k] = FFT(psi_s).ravel()[k]
+    c_all  = np.array([np.fft.fftn(p).ravel() for p in psi_list],
+                      dtype=np.complex128)              # (n_states, N3)
+    c_real = c_all.real                                  # (n_states, N3)
+    c_imag = c_all.imag                                  # (n_states, N3)
+
+    fHpsi = np.zeros((n_states, N3), dtype=np.float64)
+    t_julia = 0.0
 
     for bi in range(n_batches):
         s = bi * batch_size
         e = min(s + batch_size, N3)
-
         kx_b = kx_all[s:e]
         ky_b = ky_all[s:e]
         kz_b = kz_all[s:e]
-        c_b  = c_flat[s:e]             # shape (batch,) complex
 
-        # H_cos_k[j,i] = Pc_new(k_j, r_i) * cos(k_j·r_i)
-        H_cos = call_julia_batch(
-            jl_cos_file, Xf, Yf, Zf, kx_b, ky_b, kz_b, work_dir, julia_exe)
+        t0 = time.perf_counter()
+        # fH_sin[j, i] = f(H)|sin(k_j·r)⟩(r_i)  shape (batch, N3)
+        fH_sin = _call_julia(jl_sin, Xf, Yf, Zf, kx_b, ky_b, kz_b, work_dir, julia_exe)
+        # fH_cos[j, i] = f(H)|cos(k_j·r)⟩(r_i)  shape (batch, N3)
+        fH_cos = _call_julia(jl_cos, Xf, Yf, Zf, kx_b, ky_b, kz_b, work_dir, julia_exe)
+        t_julia += time.perf_counter() - t0
 
-        # H_sin_k[j,i] = Ps_new(k_j, r_i) * sin(k_j·r_i)
-        H_sin = call_julia_batch(
-            jl_sin_file, Xf, Yf, Zf, kx_b, ky_b, kz_b, work_dir, julia_exe)
+        # Accumulate for all states simultaneously:
+        # fHpsi[s_i, :] += Σ_j [Re(c_j^{s_i}) fH_cos[j,:] - Im(c_j^{s_i}) fH_sin[j,:]] / N3
+        # = (c_real[s_i, s:e] @ fH_cos - c_imag[s_i, s:e] @ fH_sin) / N3
+        fHpsi += (c_real[:, s:e] @ fH_cos - c_imag[:, s:e] @ fH_sin) / N3
 
-        # Accumulate: Hψ_i += (1/N³) Σ_j [Re(ĉ_j) * H_cos[j,i] - Im(ĉ_j) * H_sin[j,i]]
-        Hpsi_flat += (H_cos.T @ c_b.real - H_sin.T @ c_b.imag) / N3
-
-    return Hpsi_flat.reshape(N, N, N)
+    return [fHpsi[i].reshape(N, N, N) for i in range(n_states)], t_julia
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── normalisation / Rayleigh quotient ─────────────────────────────────────────
+
+def normalize(psi: np.ndarray, d: float):
+    norm2 = float(np.sum(psi**2) * d**3)
+    if norm2 < 1e-30:
+        return None, 0.0
+    return psi / np.sqrt(norm2), norm2
+
+
+def rayleigh_quotient(psi_n: np.ndarray, V_num: np.ndarray,
+                      T_k: np.ndarray, d: float) -> float:
+    Hpsi = apply_H_fft(psi_n, V_num, T_k)
+    return float(np.sum(psi_n * Hpsi) * d**3)
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Compare FFT+eigsh vs symbolic Julia H on Gaussian potential.')
-    ap.add_argument('--A', type=float, default=10.0,
-                    help='Gaussian depth (default 10.0 Ha)')
-    ap.add_argument('--B', type=float, default=0.5,
-                    help='Gaussian width exponent (default 0.5 Bohr⁻²)')
-    ap.add_argument('--d', type=float, default=0.5,
-                    help='Grid spacing in Bohr (default 0.5)')
-    ap.add_argument('--box_L', type=float, default=6.0,
-                    help='Half-box size in Bohr (default 6.0)')
-    ap.add_argument('--n_levels', type=int, default=5,
-                    help='Number of eigenstates to compare (default 5)')
-    ap.add_argument('--batch_size', type=int, default=256,
-                    help='k-vectors per Julia batch call (default 256)')
-    ap.add_argument('--julia', default='julia',
-                    help='Julia executable (default: julia)')
-    ap.add_argument('--out_json', default='gaussian_symbolic_test.json',
-                    help='Output JSON path (default: gaussian_symbolic_test.json)')
-    ap.add_argument('--save_jl', action='store_true',
-                    help='Save generated .jl files as h1_cos.jl / h1_sin.jl')
-    # ── Chebyshev filter / random-state test ────────────────────────────────
-    ap.add_argument('--n_random', type=int, default=0,
-                    help='Number of random initial states to filter and test '
-                         '(default 0 = skip random-state test). '
-                         'Requires --E_lo and --E_hi.')
-    ap.add_argument('--E_lo', type=float, default=None,
-                    help='Lower energy bound for Chebyshev explosion filter.')
-    ap.add_argument('--E_hi', type=float, default=None,
-                    help='Upper energy bound for Chebyshev explosion filter.')
-    ap.add_argument('--cheb_m', type=int, default=20,
-                    help='Chebyshev filter order m (default 20). '
-                         'T_m(aH+b) maps [E_lo,E_hi]→[-1,1].')
-    ap.add_argument('--seed', type=int, default=42,
-                    help='RNG seed for random initial states (default 42)')
+        description='Gaussian potential Chebyshev explosion filter: '
+                    'symbolic Julia vs FFT Hamiltonian.')
+    ap.add_argument('--A',         type=float, default=10.0,
+                    help='Gaussian depth (Ha)  [default 10.0]')
+    ap.add_argument('--B',         type=float, default=0.5,
+                    help='Gaussian exponent (Bohr⁻²)  [default 0.5]')
+    ap.add_argument('--d',         type=float, default=0.5,
+                    help='Grid spacing (Bohr)  [default 0.5]')
+    ap.add_argument('--box_L',     type=float, default=6.0,
+                    help='Half-box length (Bohr)  [default 6.0]')
+    ap.add_argument('--n_levels',  type=int,   default=5,
+                    help='Eigsh levels for reference  [default 5]')
+    ap.add_argument('--n_random',  type=int,   default=4,
+                    help='Number of random initial states  [default 4]')
+    ap.add_argument('--E_lo',      type=float, default=-3.0,
+                    help='Lower energy bound for Chebyshev filter  [default -3.0]')
+    ap.add_argument('--E_hi',      type=float, default=20.0,
+                    help='Upper energy bound for Chebyshev filter  [default 20.0]')
+    ap.add_argument('--cheb_m',    type=int,   default=8,
+                    help='Chebyshev polynomial order  [default 8]')
+    ap.add_argument('--seed',      type=int,   default=42,
+                    help='RNG seed  [default 42]')
+    ap.add_argument('--batch_size', type=int,  default=0,
+                    help='k-vectors per Julia subprocess call. '
+                         '0 = auto (N³ for small grids, 4096 otherwise)  [default 0]')
+    ap.add_argument('--julia',     type=str,   default='julia',
+                    help='Julia executable  [default julia]')
+    ap.add_argument('--cache_base', type=str,  default='H_powers_gaussian',
+                    help='Root directory for H^n / Julia caches  [default H_powers_gaussian]')
+    ap.add_argument('--svd_tol',   type=float, default=1e-4,
+                    help='SVD truncation threshold for Ritz  [default 1e-4]')
+    ap.add_argument('--out_json',  type=str,   default='gaussian_explosion_test.json',
+                    help='Output JSON path  [default gaussian_explosion_test.json]')
     args = ap.parse_args()
 
-    if args.n_random > 0 and (args.E_lo is None or args.E_hi is None):
-        ap.error('--n_random requires both --E_lo and --E_hi')
+    t_total = time.perf_counter()
 
-    # ── Grid ────────────────────────────────────────────────────────────────
+    # ── grid ──────────────────────────────────────────────────────────────────
     N, x1d = make_grid(args.d, args.box_L)
-    d      = float(x1d[1] - x1d[0])     # actual spacing (may differ slightly from args.d)
-    N3     = N ** 3
-    print(f'Grid: N={N} per axis  N³={N3}  d={d:.4f} Bohr  '
-          f'box_L={args.box_L} Bohr')
+    d = float(x1d[1] - x1d[0])
+    N3 = N**3
+    print(f'Grid: N={N}  N³={N3}  d={d:.4f} Bohr  box_L={args.box_L} Bohr')
     print(f'Potential: V = -{args.A} * exp(-{args.B} * r²)')
+    print(f'Filter: T_{args.cheb_m}(aH+b)  E_lo={args.E_lo}  E_hi={args.E_hi}')
+    print(f'        a={2/(args.E_hi-args.E_lo):.4f}  '
+          f'b={-(args.E_hi+args.E_lo)/(args.E_hi-args.E_lo):.4f}')
 
     X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
-    V_num   = -args.A * np.exp(-args.B * (X ** 2 + Y ** 2 + Z ** 2))
-    T_k     = _make_T_k(N, x1d)    # kinetic diagonal in k-space (shared)
+    V_num = -args.A * np.exp(-args.B * (X**2 + Y**2 + Z**2))
+    T_k   = make_T_k(N, d)
 
-    # ── Reference: FFT + eigsh ───────────────────────────────────────────────
-    print('\n[ref] Building FFT H operator and solving with eigsh ...')
-    H_fft  = build_fft_H_op(N, x1d, V_num)   # uses pre-built T_k internally
-    t0_ref = time.perf_counter()
-    E_ref, psi_ref = eigsh(H_fft, k=args.n_levels, which='SA')
-    t_ref  = time.perf_counter() - t0_ref
-    idx    = np.argsort(E_ref)
-    E_ref  = E_ref[idx]
-    psi_ref = psi_ref[:, idx]
+    batch_size = args.batch_size if args.batch_size > 0 else (N3 if N3 <= 30000 else 4096)
+    n_batches  = (N3 + batch_size - 1) // batch_size
+    print(f'Julia batch_size={batch_size}  n_batches={n_batches}')
+
+    # ── reference: eigsh ─────────────────────────────────────────────────────
+    from scipy.sparse.linalg import LinearOperator
+    print(f'\n[ref] eigsh ({args.n_levels} lowest levels) ...')
+    t0 = time.perf_counter()
+    H_linop = LinearOperator(
+        (N3, N3),
+        matvec=lambda v: apply_H_fft(v, V_num, T_k),
+        dtype=float,
+    )
+    E_ref, psi_ref = eigsh(H_linop, k=args.n_levels, which='SA')
+    t_ref = time.perf_counter() - t0
+    idx = np.argsort(E_ref)
+    E_ref = E_ref[idx]
     print(f'  Done in {t_ref:.2f}s')
     for i, e in enumerate(E_ref):
         print(f'  E_ref[{i}] = {e:.8f} Ha')
 
-    # ── Symbolic H^1 codegen ─────────────────────────────────────────────────
-    print('\n[sym] Building symbolic H^1 envelopes ...')
+    # ── generate random states ─────────────────────────────────────────────
+    rng = np.random.default_rng(args.seed)
+    psi_rand_list = [
+        rng.standard_normal((N, N, N)).astype(np.float64)
+        for _ in range(args.n_random)
+    ]
+    # normalise each
+    psi_rand_list = [
+        p / np.sqrt(float(np.sum(p**2) * d**3)) for p in psi_rand_list
+    ]
+
+    # ── FFT explosion filter ──────────────────────────────────────────────────
+    print(f'\n[fft] Chebyshev explosion filter (m={args.cheb_m}) ...')
     t0 = time.perf_counter()
-    Pc_cos, Ps_cos, Pc_sin, Ps_sin = build_h1_symbolic(args.A, args.B)
-    t_sym_build = time.perf_counter() - t0
-    print(f'  cos-start: Pc={Pc_cos}  Ps={Ps_cos}')
-    print(f'  sin-start: Pc={Pc_sin}  Ps={Ps_sin}')
-    print(f'  ops(Pc_cos)={sp.count_ops(Pc_cos)}  '
-          f'ops(Ps_sin)={sp.count_ops(Ps_sin)}  '
-          f'build_time={t_sym_build:.2f}s')
+    fft_filtered = []
+    fft_energies = []
+    for i, psi in enumerate(psi_rand_list):
+        psi_f = apply_chebyshev_fft(psi, V_num, T_k, args.cheb_m, args.E_lo, args.E_hi)
+        psi_fn, _ = normalize(psi_f, d)
+        if psi_fn is None:
+            print(f'  [fft] state[{i}]: negligible norm after filter, skipping')
+            continue
+        E_f = rayleigh_quotient(psi_fn, V_num, T_k, d)
+        fft_filtered.append(psi_fn)
+        fft_energies.append(E_f)
+        in_win = args.E_lo <= E_f <= args.E_hi
+        print(f'  [fft] state[{i:03d}]: E = {E_f:.8f} Ha  in_window={in_win}')
+    t_fft_filter = time.perf_counter() - t0
+    print(f'  Filter time: {t_fft_filter:.2f}s')
 
-    print('\n[sym] Generating Julia code ...')
-    # cos-start file: out[i] = cos_p[i]*(k²/2+V(r)) -- Pc_cos is the cos envelope
-    jl_src_cos, ops_cos = build_julia_hn_cse_script(Pc_cos, Ps_cos)
-    # sin-start file: out[i] = sin_p[i]*(k²/2+V(r)) -- Ps_sin is the sin envelope
-    jl_src_sin, ops_sin = build_julia_hn_cse_script(Pc_sin, Ps_sin)
-    print(f'  cos .jl: {len(jl_src_cos):,} bytes  ops={ops_cos}')
-    print(f'  sin .jl: {len(jl_src_sin):,} bytes  ops={ops_sin}')
+    # Ritz on FFT-filtered subspace
+    print('\n[fft] Rayleigh-Ritz ...')
+    t0 = time.perf_counter()
+    basis_fft = np.column_stack([p.ravel() for p in fft_filtered])  # (N3, n)
+    E_ritz_fft, _, rank_fft = svd_rayleigh_ritz_op(
+        basis_fft,
+        lambda v: apply_H_fft(v, V_num, T_k),
+        svd_tol=args.svd_tol,
+        max_energies=args.n_levels + 5,
+        hermitian=True,
+    )
+    t_ritz_fft = time.perf_counter() - t0
+    print(f'  rank={rank_fft}  time={t_ritz_fft:.2f}s')
+    print(f'  Ritz eigenvalues: {np.round(E_ritz_fft[:args.n_levels], 6).tolist()}')
 
-    # ── Rayleigh-quotient test for each eigenvector ──────────────────────────
-    results = []
-    with tempfile.TemporaryDirectory(prefix='gsym_') as td:
-        jl_cos = Path(td) / 'h1_cos.jl'
-        jl_sin = Path(td) / 'h1_sin.jl'
-        jl_cos.write_text(jl_src_cos)
-        jl_sin.write_text(jl_src_sin)
+    # ── symbolic H^n cache ───────────────────────────────────────────────────
+    print(f'\n[sym] Ensuring H^0..H^{args.cheb_m} pkl cache ...')
+    t0 = time.perf_counter()
+    cache_dir = ensure_h_powers(args.cheb_m, args.A, args.B, args.cache_base)
+    t_cache = time.perf_counter() - t0
+    print(f'  Cache ready in {t_cache:.1f}s  ({cache_dir})')
 
-        if args.save_jl:
-            Path('h1_cos.jl').write_text(jl_src_cos)
-            Path('h1_sin.jl').write_text(jl_src_sin)
-            print('  Saved h1_cos.jl  h1_sin.jl')
+    # ── build / load Julia scripts ────────────────────────────────────────────
+    print('\n[sym] Building Julia f(H) scripts ...')
+    t0 = time.perf_counter()
+    jl_sin, jl_cos = assemble_fH_julia(args.cheb_m, args.E_lo, args.E_hi, cache_dir)
+    t_codegen = time.perf_counter() - t0
+    print(f'  Codegen total time: {t_codegen:.1f}s')
 
-        for i in range(args.n_levels):
-            psi_i = psi_ref[:, i].reshape(N, N, N)
+    # ── symbolic explosion filter ─────────────────────────────────────────────
+    print(f'\n[sym] Applying symbolic f(H) to {args.n_random} states '
+          f'(batch_size={batch_size}, n_batches={n_batches}) ...')
+    t0 = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix='gexpl_') as td:
+        fH_sym_list, t_julia = apply_fH_sym_all(
+            jl_sin, jl_cos, psi_rand_list, N, x1d,
+            args.julia, td, batch_size,
+        )
+    t_sym_filter = time.perf_counter() - t0
+    print(f'  Julia time: {t_julia:.1f}s  total: {t_sym_filter:.1f}s')
 
-            # Normalise on the grid (trapezoidal / Riemann sum)
-            norm2  = float(np.sum(psi_i ** 2) * d ** 3)
-            psi_n  = psi_i / np.sqrt(norm2)
+    sym_filtered = []
+    sym_energies = []
+    sym_results  = []
+    print()
+    for i, psi_f in enumerate(fH_sym_list):
+        psi_fn, _ = normalize(psi_f, d)
+        if psi_fn is None:
+            print(f'  [sym] state[{i}]: negligible norm after filter, skipping')
+            sym_results.append({'idx': i, 'skipped': True})
+            continue
+        E_s = rayleigh_quotient(psi_fn, V_num, T_k, d)
+        sym_filtered.append(psi_fn)
+        sym_energies.append(E_s)
+        in_win = args.E_lo <= E_s <= args.E_hi
+        dE = abs(E_s - fft_energies[i]) if i < len(fft_energies) else float('nan')
+        print(f'  [sym] state[{i:03d}]: E_sym={E_s:.8f} Ha  '
+              f'E_fft={fft_energies[i]:.8f} Ha  '
+              f'|ΔE|={dE:.2e}  in_window={in_win}')
+        sym_results.append({
+            'idx': i,
+            'E_sym': float(E_s),
+            'E_fft': float(fft_energies[i]) if i < len(fft_energies) else None,
+            'abs_dE': float(dE),
+            'in_window': in_win,
+        })
 
-            print(f'\n[sym] Level {i}  E_ref={E_ref[i]:.8f}  '
-                  f'||ψ||={np.sqrt(norm2):.6f}  '
-                  f'batches={( N3 + args.batch_size - 1) // args.batch_size}')
+    # Ritz on symbolic-filtered subspace
+    if sym_filtered:
+        print('\n[sym] Rayleigh-Ritz ...')
+        t0 = time.perf_counter()
+        basis_sym = np.column_stack([p.ravel() for p in sym_filtered])
+        E_ritz_sym, _, rank_sym = svd_rayleigh_ritz_op(
+            basis_sym,
+            lambda v: apply_H_fft(v, V_num, T_k),
+            svd_tol=args.svd_tol,
+            max_energies=args.n_levels + 5,
+            hermitian=True,
+        )
+        t_ritz_sym = time.perf_counter() - t0
+        print(f'  rank={rank_sym}  time={t_ritz_sym:.2f}s')
+        print(f'  Ritz eigenvalues: {np.round(E_ritz_sym[:args.n_levels], 6).tolist()}')
+    else:
+        E_ritz_sym = np.array([])
+        t_ritz_sym = 0.0
+        rank_sym   = 0
 
-            t0_s = time.perf_counter()
-            Hpsi_sym = apply_H_sym(
-                jl_cos, jl_sin, psi_n, N, x1d,
-                args.julia, td, args.batch_size)
-            t_sym_i = time.perf_counter() - t0_s
+    t_wall = time.perf_counter() - t_total
 
-            # Rayleigh quotient: E_sym = ⟨ψ|H|ψ⟩ (ψ already normalised)
-            E_sym_i  = float(np.sum(psi_n * Hpsi_sym) * d ** 3)
+    # ── summary ───────────────────────────────────────────────────────────────
+    print(f'\n{"="*60}')
+    print(f'Reference eigenvalues (eigsh):')
+    for i, e in enumerate(E_ref):
+        print(f'  E_ref[{i}] = {e:.8f} Ha')
+    print(f'\n[fft] Per-state energies:  '
+          + '  '.join(f'{e:.5f}' for e in fft_energies))
+    print(f'[fft] Ritz: ' + '  '.join(f'{e:.5f}' for e in E_ritz_fft[:args.n_levels]))
+    if sym_energies:
+        print(f'[sym] Per-state energies:  '
+              + '  '.join(f'{e:.5f}' for e in sym_energies))
+        print(f'[sym] Ritz: ' + '  '.join(f'{e:.5f}' for e in E_ritz_sym[:args.n_levels]))
+        max_dE = max(r['abs_dE'] for r in sym_results if not r.get('skipped'))
+        print(f'\nMax |ΔE(sym−fft)| per state = {max_dE:.2e} Ha')
+    print(f'\nTotal wall time: {t_wall:.1f}s')
+    print(f'{"="*60}')
 
-            # Residual: ||H_sym ψ − E_ref ψ|| / ||ψ||   (ψ normalised, so ||ψ||=1)
-            residual = float(np.sqrt(np.sum((Hpsi_sym - E_ref[i] * psi_n) ** 2) * d ** 3))
-
-            abs_err  = abs(E_sym_i - E_ref[i])
-            print(f'  E_sym={E_sym_i:.8f}  |ΔE|={abs_err:.2e}  '
-                  f'residual={residual:.2e}  t_sym={t_sym_i:.1f}s')
-
-            results.append({
-                'level'          : i,
-                'E_ref'          : float(E_ref[i]),
-                'E_sym'          : E_sym_i,
-                'abs_energy_err' : abs_err,
-                'residual'       : residual,
-                'time_sym_s'     : t_sym_i,
-            })
-
-    # ── Random-state Chebyshev filter test ───────────────────────────────────
-    random_results = []
-    if args.n_random > 0:
-        rng = np.random.default_rng(args.seed)
-        print(f'\n[rand] Chebyshev explosion filter test:')
-        print(f'  E_lo={args.E_lo}  E_hi={args.E_hi}  cheb_m={args.cheb_m}  '
-              f'n_random={args.n_random}  seed={args.seed}')
-        a_cheb = 2.0 / (args.E_hi - args.E_lo)
-        b_cheb = -(args.E_hi + args.E_lo) / (args.E_hi - args.E_lo)
-        print(f'  Chebyshev scaling: a={a_cheb:.4f}  b={b_cheb:.4f}')
-
-        with tempfile.TemporaryDirectory(prefix='gsym_rand_') as td_rand:
-            jl_cos_r = Path(td_rand) / 'h1_cos.jl'
-            jl_sin_r = Path(td_rand) / 'h1_sin.jl'
-            jl_cos_r.write_text(jl_src_cos)
-            jl_sin_r.write_text(jl_src_sin)
-
-            for i in range(args.n_random):
-                # Random real state, Gaussian-modulated for faster decay at boundaries
-                psi_r = rng.standard_normal((N, N, N))
-                norm2_r = float(np.sum(psi_r ** 2) * d ** 3)
-                psi_r /= np.sqrt(norm2_r)
-
-                # Apply Chebyshev explosion filter with FFT H
-                t0_f = time.perf_counter()
-                psi_f = apply_chebyshev_filter_fft(
-                    psi_r, V_num, T_k, args.cheb_m, args.E_lo, args.E_hi)
-                t_filter = time.perf_counter() - t0_f
-
-                # Normalize filtered state
-                norm2_f = float(np.sum(psi_f ** 2) * d ** 3)
-                if norm2_f < 1e-30:
-                    print(f'  random[{i}]: filtered state has negligible norm; skipping.')
-                    continue
-                psi_fn = psi_f / np.sqrt(norm2_f)
-
-                # FFT Rayleigh quotient
-                Hpsi_fft_r = _apply_H_fft(psi_fn, V_num, T_k)
-                E_fft_r    = float(np.sum(psi_fn * Hpsi_fft_r) * d ** 3)
-
-                # Symbolic Rayleigh quotient via Julia
-                t0_s = time.perf_counter()
-                Hpsi_sym_r = apply_H_sym(
-                    jl_cos_r, jl_sin_r, psi_fn, N, x1d,
-                    args.julia, td_rand, args.batch_size)
-                t_sym_r = time.perf_counter() - t0_s
-                E_sym_r = float(np.sum(psi_fn * Hpsi_sym_r) * d ** 3)
-
-                abs_err_r = abs(E_sym_r - E_fft_r)
-                in_window = args.E_lo <= E_fft_r <= args.E_hi
-                print(f'  random[{i:03d}]: E_fft={E_fft_r:.6f}  E_sym={E_sym_r:.6f}  '
-                      f'|ΔE|={abs_err_r:.2e}  in_window={in_window}  '
-                      f't_filter={t_filter:.1f}s  t_sym={t_sym_r:.1f}s')
-
-                random_results.append({
-                    'idx'            : i,
-                    'E_fft'          : E_fft_r,
-                    'E_sym'          : E_sym_r,
-                    'abs_energy_err' : abs_err_r,
-                    'in_window'      : in_window,
-                    'time_filter_s'  : t_filter,
-                    'time_sym_s'     : t_sym_r,
-                })
-
-        n_in = sum(1 for r in random_results if r['in_window'])
-        if random_results:
-            max_err_r = max(r['abs_energy_err'] for r in random_results)
-            print(f'\n  In-window: {n_in}/{len(random_results)}  '
-                  f'Max |ΔE(sym−fft)|={max_err_r:.2e} Ha')
-
-    # ── Save JSON ────────────────────────────────────────────────────────────
+    # ── JSON output ───────────────────────────────────────────────────────────
     summary = {
         'params': {
-            'A'         : args.A,
-            'B'         : args.B,
-            'd'         : d,
-            'box_L'     : args.box_L,
-            'N'         : N,
-            'N3'        : N3,
-            'n_levels'  : args.n_levels,
-            'batch_size': args.batch_size,
-            'n_random'  : args.n_random,
-            'E_lo'      : args.E_lo,
-            'E_hi'      : args.E_hi,
-            'cheb_m'    : args.cheb_m,
-            'seed'      : args.seed,
+            'A': args.A, 'B': args.B, 'd': d, 'box_L': args.box_L,
+            'N': N, 'N3': N3,
+            'n_random': args.n_random, 'n_levels': args.n_levels,
+            'E_lo': args.E_lo, 'E_hi': args.E_hi, 'cheb_m': args.cheb_m,
+            'seed': args.seed, 'batch_size': batch_size,
         },
-        'ops_cos'            : ops_cos,
-        'ops_sin'            : ops_sin,
-        'time_ref_s'         : t_ref,
-        'time_sym_build_s'   : t_sym_build,
-        'results'            : results,
-        'max_abs_energy_err' : max(r['abs_energy_err'] for r in results),
-        'max_residual'       : max(r['residual'] for r in results),
-        'random_results'     : random_results,
+        'timings': {
+            'ref_eigsh_s'  : t_ref,
+            'h_power_cache_s': t_cache,
+            'codegen_s'    : t_codegen,
+            'fft_filter_s' : t_fft_filter,
+            'sym_filter_s' : t_sym_filter,
+            'julia_total_s': t_julia,
+            'wall_total_s' : t_wall,
+        },
+        'E_ref'             : E_ref.tolist(),
+        'fft_state_energies': fft_energies,
+        'fft_ritz'          : E_ritz_fft.tolist(),
+        'fft_ritz_rank'     : int(rank_fft),
+        'sym_state_results' : sym_results,
+        'sym_ritz'          : E_ritz_sym.tolist(),
+        'sym_ritz_rank'     : int(rank_sym),
     }
-    if random_results:
-        summary['random_max_abs_energy_err'] = max(
-            r['abs_energy_err'] for r in random_results)
-        summary['random_in_window_fraction'] = (
-            sum(1 for r in random_results if r['in_window']) / len(random_results))
+    if sym_results and any(not r.get('skipped') for r in sym_results):
+        summary['max_abs_dE_state'] = max(
+            r['abs_dE'] for r in sym_results if not r.get('skipped'))
     Path(args.out_json).write_text(json.dumps(summary, indent=2))
-
-    print(f'\n{"="*55}')
     print(f'Results → {args.out_json}')
-    print(f'Max |ΔE|     = {summary["max_abs_energy_err"]:.2e} Ha  (eigsh states)')
-    print(f'Max residual = {summary["max_residual"]:.2e}')
-    if random_results:
-        print(f'Max |ΔE|     = {summary["random_max_abs_energy_err"]:.2e} Ha  '
-              f'(random states, sym vs fft)')
-        print(f'In window    = {summary["random_in_window_fraction"]*100:.0f}%  '
-              f'of {len(random_results)} random states')
-    print(f'{"="*55}')
 
 
 if __name__ == '__main__':
