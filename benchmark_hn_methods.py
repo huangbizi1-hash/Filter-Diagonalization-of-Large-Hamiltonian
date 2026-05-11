@@ -508,16 +508,10 @@ def main():
             wmup_s = f'{wmup:.2f}'  if wmup  is not None else '-'
             print(f'  {k:<32} {r["Nop"]:>7}  {mspw_s:>9}  {wmup_s:>10}')
 
-    return out
-
-
-def run(args):
-    out = {'cube_dir': str(args.cube_dir), 'n_select': args.n_select, 'results_by_n': {}}
-    for n in args.n_select:
-        out['results_by_n'][str(n)] = benchmark_for_n(args.cube_dir, n, args)
-
     Path(args.out_json).write_text(json.dumps(out, indent=2))
     print(f'\nwrote {args.out_json}')
+
+    return out
 
 
 if __name__ == '__main__':
