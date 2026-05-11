@@ -380,6 +380,8 @@ def main():
                     help='SVD truncation threshold for Ritz  [default 1e-4]')
     ap.add_argument('--out_json',  type=str,   default='gaussian_explosion_test.json',
                     help='Output JSON path  [default gaussian_explosion_test.json]')
+    ap.add_argument('--fft_only', action='store_true',
+                    help='Skip symbolic Julia path; run FFT explosion + Ritz only')
     args = ap.parse_args()
 
     t_total = time.perf_counter()
@@ -400,7 +402,8 @@ def main():
 
     batch_size = args.batch_size if args.batch_size > 0 else (N3 if N3 <= 30000 else 4096)
     n_batches  = (N3 + batch_size - 1) // batch_size
-    print(f'Julia batch_size={batch_size}  n_batches={n_batches}')
+    if not args.fft_only:
+        print(f'Julia batch_size={batch_size}  n_batches={n_batches}')
 
     # ── reference: eigsh ─────────────────────────────────────────────────────
     from scipy.sparse.linalg import LinearOperator
@@ -464,77 +467,79 @@ def main():
     print(f'  rank={rank_fft}  time={t_ritz_fft:.2f}s')
     print(f'  Ritz eigenvalues: {np.round(E_ritz_fft[:args.n_levels], 6).tolist()}')
 
-    # ── symbolic H^n cache ───────────────────────────────────────────────────
-    print(f'\n[sym] Ensuring H^0..H^{args.cheb_m} pkl cache ...')
-    t0 = time.perf_counter()
-    cache_dir = ensure_h_powers(args.cheb_m, args.A, args.B, args.cache_base)
-    t_cache = time.perf_counter() - t0
-    print(f'  Cache ready in {t_cache:.1f}s  ({cache_dir})')
+    # ── symbolic path (skipped when --fft_only) ──────────────────────────────
+    t_cache = t_codegen = t_sym_filter = t_julia = t_ritz_sym = 0.0
+    sym_results = []
+    E_ritz_sym  = np.array([])
+    rank_sym    = 0
 
-    # ── build / load Julia scripts ────────────────────────────────────────────
-    print('\n[sym] Building Julia f(H) scripts ...')
-    t0 = time.perf_counter()
-    jl_sin, jl_cos = assemble_fH_julia(args.cheb_m, args.E_lo, args.E_hi, cache_dir)
-    t_codegen = time.perf_counter() - t0
-    print(f'  Codegen total time: {t_codegen:.1f}s')
-
-    # ── symbolic explosion filter ─────────────────────────────────────────────
-    print(f'\n[sym] Applying symbolic f(H) to {args.n_random} states '
-          f'(batch_size={batch_size}, n_batches={n_batches}) ...')
-    t0 = time.perf_counter()
-    with tempfile.TemporaryDirectory(prefix='gexpl_') as td:
-        fH_sym_list, t_julia = apply_fH_sym_all(
-            jl_sin, jl_cos, psi_rand_list, N, x1d,
-            args.julia, td, batch_size,
-        )
-    t_sym_filter = time.perf_counter() - t0
-    print(f'  Julia time: {t_julia:.1f}s  total: {t_sym_filter:.1f}s')
-
-    sym_filtered = []
-    sym_energies = []
-    sym_results  = []
-    print()
-    for i, psi_f in enumerate(fH_sym_list):
-        psi_fn, _ = normalize(psi_f, d)
-        if psi_fn is None:
-            print(f'  [sym] state[{i}]: negligible norm after filter, skipping')
-            sym_results.append({'idx': i, 'skipped': True})
-            continue
-        E_s = rayleigh_quotient(psi_fn, V_num, T_k, d)
-        sym_filtered.append(psi_fn)
-        sym_energies.append(E_s)
-        in_win = args.E_lo <= E_s <= args.E_hi
-        dE = abs(E_s - fft_energies[i]) if i < len(fft_energies) else float('nan')
-        print(f'  [sym] state[{i:03d}]: E_sym={E_s:.8f} Ha  '
-              f'E_fft={fft_energies[i]:.8f} Ha  '
-              f'|ΔE|={dE:.2e}  in_window={in_win}')
-        sym_results.append({
-            'idx': i,
-            'E_sym': float(E_s),
-            'E_fft': float(fft_energies[i]) if i < len(fft_energies) else None,
-            'abs_dE': float(dE),
-            'in_window': in_win,
-        })
-
-    # Ritz on symbolic-filtered subspace
-    if sym_filtered:
-        print('\n[sym] Rayleigh-Ritz ...')
+    if not args.fft_only:
+        # H^n sympy cache
+        print(f'\n[sym] Ensuring H^0..H^{args.cheb_m} pkl cache ...')
         t0 = time.perf_counter()
-        basis_sym = np.column_stack([p.ravel() for p in sym_filtered])
-        E_ritz_sym, _, rank_sym = svd_rayleigh_ritz_op(
-            basis_sym,
-            lambda v: apply_H_fft(v, V_num, T_k),
-            svd_tol=args.svd_tol,
-            max_energies=args.n_levels + 5,
-            hermitian=True,
-        )
-        t_ritz_sym = time.perf_counter() - t0
-        print(f'  rank={rank_sym}  time={t_ritz_sym:.2f}s')
-        print(f'  Ritz eigenvalues: {np.round(E_ritz_sym[:args.n_levels], 6).tolist()}')
-    else:
-        E_ritz_sym = np.array([])
-        t_ritz_sym = 0.0
-        rank_sym   = 0
+        cache_dir = ensure_h_powers(args.cheb_m, args.A, args.B, args.cache_base)
+        t_cache = time.perf_counter() - t0
+        print(f'  Cache ready in {t_cache:.1f}s  ({cache_dir})')
+
+        # build / load Julia scripts
+        print('\n[sym] Building Julia f(H) scripts ...')
+        t0 = time.perf_counter()
+        jl_sin, jl_cos = assemble_fH_julia(args.cheb_m, args.E_lo, args.E_hi, cache_dir)
+        t_codegen = time.perf_counter() - t0
+        print(f'  Codegen total time: {t_codegen:.1f}s')
+
+        # apply symbolic f(H)
+        print(f'\n[sym] Applying symbolic f(H) to {args.n_random} states '
+              f'(batch_size={batch_size}, n_batches={n_batches}) ...')
+        t0 = time.perf_counter()
+        with tempfile.TemporaryDirectory(prefix='gexpl_') as td:
+            fH_sym_list, t_julia = apply_fH_sym_all(
+                jl_sin, jl_cos, psi_rand_list, N, x1d,
+                args.julia, td, batch_size,
+            )
+        t_sym_filter = time.perf_counter() - t0
+        print(f'  Julia time: {t_julia:.1f}s  total: {t_sym_filter:.1f}s')
+
+        sym_filtered = []
+        sym_energies = []
+        print()
+        for i, psi_f in enumerate(fH_sym_list):
+            psi_fn, _ = normalize(psi_f, d)
+            if psi_fn is None:
+                print(f'  [sym] state[{i}]: negligible norm after filter, skipping')
+                sym_results.append({'idx': i, 'skipped': True})
+                continue
+            E_s = rayleigh_quotient(psi_fn, V_num, T_k, d)
+            sym_filtered.append(psi_fn)
+            sym_energies.append(E_s)
+            in_win = args.E_lo <= E_s <= args.E_hi
+            dE = abs(E_s - fft_energies[i]) if i < len(fft_energies) else float('nan')
+            print(f'  [sym] state[{i:03d}]: E_sym={E_s:.8f} Ha  '
+                  f'E_fft={fft_energies[i]:.8f} Ha  '
+                  f'|ΔE|={dE:.2e}  in_window={in_win}')
+            sym_results.append({
+                'idx': i,
+                'E_sym': float(E_s),
+                'E_fft': float(fft_energies[i]) if i < len(fft_energies) else None,
+                'abs_dE': float(dE),
+                'in_window': in_win,
+            })
+
+        # Ritz on symbolic-filtered subspace
+        if sym_filtered:
+            print('\n[sym] Rayleigh-Ritz ...')
+            t0 = time.perf_counter()
+            basis_sym = np.column_stack([p.ravel() for p in sym_filtered])
+            E_ritz_sym, _, rank_sym = svd_rayleigh_ritz_op(
+                basis_sym,
+                lambda v: apply_H_fft(v, V_num, T_k),
+                svd_tol=args.svd_tol,
+                max_energies=args.n_levels + 5,
+                hermitian=True,
+            )
+            t_ritz_sym = time.perf_counter() - t0
+            print(f'  rank={rank_sym}  time={t_ritz_sym:.2f}s')
+            print(f'  Ritz eigenvalues: {np.round(E_ritz_sym[:args.n_levels], 6).tolist()}')
 
     t_wall = time.perf_counter() - t_total
 
@@ -546,12 +551,15 @@ def main():
     print(f'\n[fft] Per-state energies:  '
           + '  '.join(f'{e:.5f}' for e in fft_energies))
     print(f'[fft] Ritz: ' + '  '.join(f'{e:.5f}' for e in E_ritz_fft[:args.n_levels]))
-    if sym_energies:
-        print(f'[sym] Per-state energies:  '
-              + '  '.join(f'{e:.5f}' for e in sym_energies))
-        print(f'[sym] Ritz: ' + '  '.join(f'{e:.5f}' for e in E_ritz_sym[:args.n_levels]))
-        max_dE = max(r['abs_dE'] for r in sym_results if not r.get('skipped'))
-        print(f'\nMax |ΔE(sym−fft)| per state = {max_dE:.2e} Ha')
+    if not args.fft_only and sym_results:
+        sym_energies_all = [r['E_sym'] for r in sym_results if not r.get('skipped')]
+        if sym_energies_all:
+            print(f'[sym] Per-state energies:  '
+                  + '  '.join(f'{e:.5f}' for e in sym_energies_all))
+            print(f'[sym] Ritz: '
+                  + '  '.join(f'{e:.5f}' for e in E_ritz_sym[:args.n_levels]))
+            max_dE = max(r['abs_dE'] for r in sym_results if not r.get('skipped'))
+            print(f'\nMax |ΔE(sym−fft)| per state = {max_dE:.2e} Ha')
     print(f'\nTotal wall time: {t_wall:.1f}s')
     print(f'{"="*60}')
 
@@ -563,15 +571,16 @@ def main():
             'n_random': args.n_random, 'n_levels': args.n_levels,
             'E_lo': args.E_lo, 'E_hi': args.E_hi, 'cheb_m': args.cheb_m,
             'seed': args.seed, 'batch_size': batch_size,
+            'fft_only': args.fft_only,
         },
         'timings': {
-            'ref_eigsh_s'  : t_ref,
+            'ref_eigsh_s'    : t_ref,
+            'fft_filter_s'   : t_fft_filter,
             'h_power_cache_s': t_cache,
-            'codegen_s'    : t_codegen,
-            'fft_filter_s' : t_fft_filter,
-            'sym_filter_s' : t_sym_filter,
-            'julia_total_s': t_julia,
-            'wall_total_s' : t_wall,
+            'codegen_s'      : t_codegen,
+            'sym_filter_s'   : t_sym_filter,
+            'julia_total_s'  : t_julia,
+            'wall_total_s'   : t_wall,
         },
         'E_ref'             : E_ref.tolist(),
         'fft_state_energies': fft_energies,
