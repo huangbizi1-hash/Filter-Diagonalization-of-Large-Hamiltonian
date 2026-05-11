@@ -355,8 +355,8 @@ def main():
                     help='Gaussian exponent (Bohr⁻²)  [default 0.5]')
     ap.add_argument('--d',         type=float, default=0.5,
                     help='Grid spacing (Bohr)  [default 0.5]')
-    ap.add_argument('--box_L',     type=float, default=6.0,
-                    help='Half-box length (Bohr)  [default 6.0]')
+    ap.add_argument('--box_L',     type=float, default=4.0,
+                    help='Half-box length (Bohr)  [default 4.0]')
     ap.add_argument('--n_levels',  type=int,   default=5,
                     help='Eigsh levels for reference  [default 5]')
     ap.add_argument('--n_random',  type=int,   default=4,
@@ -436,21 +436,31 @@ def main():
     # ── FFT explosion filter ──────────────────────────────────────────────────
     print(f'\n[fft] Chebyshev explosion filter (m={args.cheb_m}) ...')
     t0 = time.perf_counter()
-    fft_filtered = []
-    fft_energies = []
+    fft_filtered  = []
+    fft_energies  = []
+    fft_state_times = []
     for i, psi in enumerate(psi_rand_list):
+        t_si = time.perf_counter()
         psi_f = apply_chebyshev_fft(psi, V_num, T_k, args.cheb_m, args.E_lo, args.E_hi)
         psi_fn, _ = normalize(psi_f, d)
         if psi_fn is None:
             print(f'  [fft] state[{i}]: negligible norm after filter, skipping')
             continue
         E_f = rayleigh_quotient(psi_fn, V_num, T_k, d)
+        t_si = time.perf_counter() - t_si
         fft_filtered.append(psi_fn)
         fft_energies.append(E_f)
+        fft_state_times.append(t_si)
         in_win = args.E_lo <= E_f <= args.E_hi
-        print(f'  [fft] state[{i:03d}]: E = {E_f:.8f} Ha  in_window={in_win}')
+        t_per_pt = t_si / N3 * 1e6          # µs per grid point
+        print(f'  [fft] state[{i:03d}]: E={E_f:.8f} Ha  in_window={in_win}  '
+              f't={t_si:.3f}s  t/grid={t_per_pt:.3f}µs')
     t_fft_filter = time.perf_counter() - t0
-    print(f'  Filter time: {t_fft_filter:.2f}s')
+    t_fft_per_state = t_fft_filter / max(len(fft_filtered), 1)
+    t_fft_per_pt    = t_fft_per_state / N3 * 1e6
+    print(f'  Total filter time: {t_fft_filter:.3f}s  '
+          f'per state: {t_fft_per_state:.3f}s  '
+          f'per grid point: {t_fft_per_pt:.3f}µs')
 
     # Ritz on FFT-filtered subspace
     print('\n[fft] Rayleigh-Ritz ...')
@@ -464,11 +474,12 @@ def main():
         hermitian=True,
     )
     t_ritz_fft = time.perf_counter() - t0
-    print(f'  rank={rank_fft}  time={t_ritz_fft:.2f}s')
+    print(f'  rank={rank_fft}  time={t_ritz_fft:.3f}s')
     print(f'  Ritz eigenvalues: {np.round(E_ritz_fft[:args.n_levels], 6).tolist()}')
 
     # ── symbolic path (skipped when --fft_only) ──────────────────────────────
     t_cache = t_codegen = t_sym_filter = t_julia = t_ritz_sym = 0.0
+    t_sym_per_state = t_sym_per_pt = 0.0
     sym_results = []
     E_ritz_sym  = np.array([])
     rank_sym    = 0
@@ -498,7 +509,12 @@ def main():
                 args.julia, td, batch_size,
             )
         t_sym_filter = time.perf_counter() - t0
-        print(f'  Julia time: {t_julia:.1f}s  total: {t_sym_filter:.1f}s')
+        # t_julia covers n_random states; each state uses N3 k-vectors × N3 grid points
+        t_sym_per_state = t_julia / max(args.n_random, 1)
+        t_sym_per_pt    = t_sym_per_state / N3 * 1e6   # µs per grid point (Julia eval)
+        print(f'  Julia time: {t_julia:.3f}s  total (incl. I/O): {t_sym_filter:.3f}s')
+        print(f'  Per state: {t_sym_per_state:.3f}s  '
+              f'per grid point: {t_sym_per_pt:.3f}µs')
 
         sym_filtered = []
         sym_energies = []
@@ -538,7 +554,7 @@ def main():
                 hermitian=True,
             )
             t_ritz_sym = time.perf_counter() - t0
-            print(f'  rank={rank_sym}  time={t_ritz_sym:.2f}s')
+            print(f'  rank={rank_sym}  time={t_ritz_sym:.3f}s')
             print(f'  Ritz eigenvalues: {np.round(E_ritz_sym[:args.n_levels], 6).tolist()}')
 
     t_wall = time.perf_counter() - t_total
@@ -560,7 +576,21 @@ def main():
                   + '  '.join(f'{e:.5f}' for e in E_ritz_sym[:args.n_levels]))
             max_dE = max(r['abs_dE'] for r in sym_results if not r.get('skipped'))
             print(f'\nMax |ΔE(sym−fft)| per state = {max_dE:.2e} Ha')
-    print(f'\nTotal wall time: {t_wall:.1f}s')
+    # timing summary table
+    print(f'\nTiming summary:')
+    print(f'  [ref]  eigsh:                {t_ref:.3f}s')
+    print(f'  [fft]  filter total:         {t_fft_filter:.3f}s  '
+          f'(per state {t_fft_per_state:.3f}s, '
+          f'per grid pt {t_fft_per_pt:.3f}µs)')
+    print(f'  [fft]  Ritz:                 {t_ritz_fft:.3f}s')
+    if not args.fft_only:
+        print(f'  [sym]  H^n cache:            {t_cache:.3f}s')
+        print(f'  [sym]  codegen:              {t_codegen:.3f}s')
+        print(f'  [sym]  Julia filter total:   {t_julia:.3f}s  '
+              f'(per state {t_sym_per_state:.3f}s, '
+              f'per grid pt {t_sym_per_pt:.3f}µs)')
+        print(f'  [sym]  Ritz:                 {t_ritz_sym:.3f}s')
+    print(f'  Total wall time:             {t_wall:.3f}s')
     print(f'{"="*60}')
 
     # ── JSON output ───────────────────────────────────────────────────────────
@@ -574,13 +604,19 @@ def main():
             'fft_only': args.fft_only,
         },
         'timings': {
-            'ref_eigsh_s'    : t_ref,
-            'fft_filter_s'   : t_fft_filter,
-            'h_power_cache_s': t_cache,
-            'codegen_s'      : t_codegen,
-            'sym_filter_s'   : t_sym_filter,
-            'julia_total_s'  : t_julia,
-            'wall_total_s'   : t_wall,
+            'ref_eigsh_s'          : t_ref,
+            'fft_filter_s'         : t_fft_filter,
+            'fft_filter_per_state_s': t_fft_per_state,
+            'fft_filter_per_pt_us' : t_fft_per_pt,
+            'fft_ritz_s'           : t_ritz_fft,
+            'h_power_cache_s'      : t_cache,
+            'codegen_s'            : t_codegen,
+            'sym_filter_s'         : t_sym_filter,
+            'julia_total_s'        : t_julia,
+            'julia_per_state_s'    : t_julia / max(args.n_random, 1),
+            'julia_per_pt_us'      : t_julia / max(args.n_random, 1) / N3 * 1e6,
+            'sym_ritz_s'           : t_ritz_sym,
+            'wall_total_s'         : t_wall,
         },
         'E_ref'             : E_ref.tolist(),
         'fft_state_energies': fft_energies,
