@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """test_gaussian_symbolic_energy.py
 
-Chebyshev explosion filter on a 3-D Gaussian potential well
-  V(r) = -A * exp(-B * r²)
+Chebyshev explosion filter on a 3-D potential well (Gaussian or harmonic oscillator).
+
+Potentials:
+  Gaussian:  V(r) = -A * exp(-B * r²)
+  Harmonic:  V(r) = ½ ω² r²
 
 Three paths are compared:
   [ref] scipy eigsh on FFT Hamiltonian – reference eigenvalues
@@ -11,10 +14,10 @@ Three paths are compared:
   [sym] Same but the filter f(H) is assembled from symbolic H^n expressions
         (stored as sympy pkl) and evaluated at every grid point via Julia
 
-Symbolic pipeline (one-time cost per (A,B,m,E_lo,E_hi)):
-  1. Generate H^n pkl files   → H_powers_gaussian/A{A}_B{B}/H_power_{n}.pkl
+Symbolic pipeline (one-time cost per potential params + m + energy window):
+  1. Generate H^n pkl files   → H_powers_<pot>/<tag>/H_power_{n}.pkl
   2. Assemble f(H) from H^n  → Pc_total, Ps_total (envelope functions)
-  3. Build Julia scripts      → H_powers_gaussian/A{A}_B{B}/*.jl  (cached)
+  3. Build Julia scripts      → H_powers_<pot>/<tag>/*.jl  (cached)
   4. One Julia call per batch, all random states processed per batch
      (minimises per-call JIT overhead)
 
@@ -28,9 +31,9 @@ Output:
   • JSON with full results (--out_json)
 
 Usage:
-  python test_gaussian_symbolic_energy.py --n_random 4 --E_lo -3.0 --E_hi 20.0 --cheb_m 5
-  python test_gaussian_symbolic_energy.py --A 10 --B 0.5 --d 0.5 --box_L 6 \\
-      --n_random 8 --E_lo -6.0 --E_hi 20.0 --cheb_m 8 --n_levels 5
+  python test_gaussian_symbolic_energy.py --potential gaussian --n_random 4 --E_lo -3.0
+  python test_gaussian_symbolic_energy.py --potential harmonic --omega 1.0 \\
+      --d 0.5 --box_L 4.0 --n_random 4 --E_lo 1.0 --E_hi 20.0 --cheb_m 8
 """
 
 import argparse
@@ -102,21 +105,10 @@ def apply_chebyshev_fft(psi: np.ndarray, V_num: np.ndarray, T_k: np.ndarray,
 
 # ── H^n sympy cache ───────────────────────────────────────────────────────────
 
-def _sympy_ingredients(A: float, B: float):
-    x, y, z = sp.symbols('x y z', real=True)
-    kx, ky, kz = sp.symbols('kx ky kz', real=True)
-    V_sym = -A * sp.exp(-B * x**2) * sp.exp(-B * y**2) * sp.exp(-B * z**2)
-    k2 = kx**2 + ky**2 + kz**2
-    return x, y, z, kx, ky, kz, V_sym, k2
-
-
-def ensure_h_powers(n_max: int, A: float, B: float, cache_base: str) -> Path:
-    """Generate (or load from cache) H^0 … H^n_max pkl files.
-
-    Cache directory: {cache_base}/A{A:g}_B{B:g}/
-    Files: H_power_0.pkl … H_power_{n_max}.pkl
-    """
-    outdir = Path(cache_base) / f'A{A:g}_B{B:g}'
+def ensure_h_powers(n_max: int, outdir: Path,
+                    V_sym, x, y, z, kx, ky, kz) -> Path:
+    """Generate (or load from cache) H^0 … H^n_max pkl files in outdir."""
+    outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     missing = [n for n in range(n_max + 1)
@@ -125,23 +117,21 @@ def ensure_h_powers(n_max: int, A: float, B: float, cache_base: str) -> Path:
         print(f'  [cache] H^0..H^{n_max} already cached in {outdir}')
         return outdir
 
-    # Find the highest power already on disk to extend from
     cached = sorted(
         int(p.stem.split('_')[-1])
         for p in outdir.glob('H_power_*.pkl')
         if p.stem.split('_')[-1].isdigit()
     )
 
-    x, y, z, kx, ky, kz, V_sym, k2 = _sympy_ingredients(A, B)
+    k2   = kx**2 + ky**2 + kz**2
     kvec = (kx, ky, kz)
 
     if cached and cached[-1] < n_max:
-        # Extend from the last cached power
         start = cached[-1]
         print(f'  [cache] Extending from H^{start} up to H^{n_max} in {outdir}')
         with open(outdir / f'H_power_{start}.pkl', 'rb') as fh:
-            d = pickle.load(fh)
-        Ps, Pc = d['Ps'], d['Pc']
+            dat = pickle.load(fh)
+        Ps, Pc = dat['Ps'], dat['Pc']
         for n in range(start + 1, n_max + 1):
             print(f'    H^{n} ...', end=' ', flush=True)
             t0 = time.perf_counter()
@@ -152,7 +142,6 @@ def ensure_h_powers(n_max: int, A: float, B: float, cache_base: str) -> Path:
                 pickle.dump({'Ps': Ps, 'Pc': Pc}, fh)
             print(f'✓  ({time.perf_counter()-t0:.1f}s)')
     else:
-        # Generate from scratch
         print(f'  [cache] Generating H^0..H^{n_max} in {outdir}')
         generate_H_powers(
             n_max, outdir, file_format='pkl', expand=True,
@@ -347,12 +336,17 @@ def rayleigh_quotient(psi_n: np.ndarray, V_num: np.ndarray,
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Gaussian potential Chebyshev explosion filter: '
+        description='Chebyshev explosion filter (Gaussian or harmonic potential): '
                     'symbolic Julia vs FFT Hamiltonian.')
+    ap.add_argument('--potential', choices=['gaussian', 'harmonic'],
+                    default='gaussian',
+                    help='Potential type: gaussian or harmonic  [default gaussian]')
     ap.add_argument('--A',         type=float, default=10.0,
                     help='Gaussian depth (Ha)  [default 10.0]')
     ap.add_argument('--B',         type=float, default=0.5,
                     help='Gaussian exponent (Bohr⁻²)  [default 0.5]')
+    ap.add_argument('--omega',     type=float, default=1.0,
+                    help='Harmonic oscillator frequency ω  [default 1.0]')
     ap.add_argument('--d',         type=float, default=0.5,
                     help='Grid spacing (Bohr)  [default 0.5]')
     ap.add_argument('--box_L',     type=float, default=4.0,
@@ -374,8 +368,9 @@ def main():
                          '0 = auto (N³ for small grids, 4096 otherwise)  [default 0]')
     ap.add_argument('--julia',     type=str,   default='julia',
                     help='Julia executable  [default julia]')
-    ap.add_argument('--cache_base', type=str,  default='H_powers_gaussian',
-                    help='Root directory for H^n / Julia caches  [default H_powers_gaussian]')
+    ap.add_argument('--cache_base', type=str,  default='',
+                    help='Root directory for H^n / Julia caches  '
+                         '[default: H_powers_gaussian/A{A}_B{B} or H_powers_harmonic/omega{omega}]')
     ap.add_argument('--svd_tol',   type=float, default=1e-4,
                     help='SVD truncation threshold for Ritz  [default 1e-4]')
     ap.add_argument('--out_json',  type=str,   default='gaussian_explosion_test.json',
@@ -391,14 +386,37 @@ def main():
     d = float(x1d[1] - x1d[0])
     N3 = N**3
     print(f'Grid: N={N}  N³={N3}  d={d:.4f} Bohr  box_L={args.box_L} Bohr')
-    print(f'Potential: V = -{args.A} * exp(-{args.B} * r²)')
+
+    X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
+    T_k   = make_T_k(N, d)
+
+    # ── potential (numeric + symbolic) ────────────────────────────────────────
+    x_s, y_s, z_s = sp.symbols('x y z', real=True)
+    kx_s, ky_s, kz_s = sp.symbols('kx ky kz', real=True)
+
+    if args.potential == 'gaussian':
+        V_num = -args.A * np.exp(-args.B * (X**2 + Y**2 + Z**2))
+        V_sym = (-args.A
+                 * sp.exp(-args.B * x_s**2)
+                 * sp.exp(-args.B * y_s**2)
+                 * sp.exp(-args.B * z_s**2))
+        pot_tag = f'A{args.A:g}_B{args.B:g}'
+        cache_root = args.cache_base if args.cache_base else 'H_powers_gaussian'
+        cache_dir = Path(cache_root) / pot_tag
+        pot_desc = f'Gaussian  V = -{args.A} * exp(-{args.B} * r²)'
+    else:  # harmonic
+        omega = args.omega
+        V_num = 0.5 * omega**2 * (X**2 + Y**2 + Z**2)
+        V_sym = sp.Rational(1, 2) * omega**2 * (x_s**2 + y_s**2 + z_s**2)
+        pot_tag = f'omega{omega:g}'
+        cache_root = args.cache_base if args.cache_base else 'H_powers_harmonic'
+        cache_dir = Path(cache_root) / pot_tag
+        pot_desc = f'Harmonic  V = ½ × {omega}² × r²'
+
+    print(f'Potential: {pot_desc}')
     print(f'Filter: T_{args.cheb_m}(aH+b)  E_lo={args.E_lo}  E_hi={args.E_hi}')
     print(f'        a={2/(args.E_hi-args.E_lo):.4f}  '
           f'b={-(args.E_hi+args.E_lo)/(args.E_hi-args.E_lo):.4f}')
-
-    X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
-    V_num = -args.A * np.exp(-args.B * (X**2 + Y**2 + Z**2))
-    T_k   = make_T_k(N, d)
 
     batch_size = args.batch_size if args.batch_size > 0 else (N3 if N3 <= 30000 else 4096)
     n_batches  = (N3 + batch_size - 1) // batch_size
@@ -488,7 +506,8 @@ def main():
         # H^n sympy cache
         print(f'\n[sym] Ensuring H^0..H^{args.cheb_m} pkl cache ...')
         t0 = time.perf_counter()
-        cache_dir = ensure_h_powers(args.cheb_m, args.A, args.B, args.cache_base)
+        ensure_h_powers(args.cheb_m, cache_dir, V_sym,
+                        x_s, y_s, z_s, kx_s, ky_s, kz_s)
         t_cache = time.perf_counter() - t0
         print(f'  Cache ready in {t_cache:.1f}s  ({cache_dir})')
 
@@ -596,7 +615,10 @@ def main():
     # ── JSON output ───────────────────────────────────────────────────────────
     summary = {
         'params': {
-            'A': args.A, 'B': args.B, 'd': d, 'box_L': args.box_L,
+            'potential': args.potential,
+            'A': args.A, 'B': args.B,
+            'omega': args.omega,
+            'd': d, 'box_L': args.box_L,
             'N': N, 'N3': N3,
             'n_random': args.n_random, 'n_levels': args.n_levels,
             'E_lo': args.E_lo, 'E_hi': args.E_hi, 'cheb_m': args.cheb_m,
