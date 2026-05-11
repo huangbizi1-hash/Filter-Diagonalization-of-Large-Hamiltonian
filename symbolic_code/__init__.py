@@ -24,6 +24,7 @@ from .h_powers import (
     directional_derivative,
     apply_H_on_pair,
     generate_H_powers,
+    extend_H_powers_from_cache,
     generate_scaled_H_powers,
     process_all_cubes,
     process_specific_cubes,
@@ -55,7 +56,7 @@ __all__ = [
     "CubicExpressionManager",
     # H-power generation (both strategies)
     "laplacian", "directional_derivative", "apply_H_on_pair",
-    "generate_H_powers", "generate_scaled_H_powers",
+    "generate_H_powers", "extend_H_powers_from_cache", "generate_scaled_H_powers",
     "process_all_cubes", "process_specific_cubes",
     # Chebyshev filter assembly
     "load_expr_srepr", "load_H_powers", "load_H_raw_powers",

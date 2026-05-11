@@ -161,6 +161,48 @@ def generate_H_powers(
     return results
 
 
+def extend_H_powers_from_cache(
+    N_start, N_end, outdir,
+    file_format='pkl',
+    expand=True,
+    V=None, kvec=None, k2=None, pref=0.5,
+    x=None, y=None, z=None,
+):
+    """Extend cached raw H^n files from N_start to N_end (inclusive).
+
+    Expects ``H_power_{N_start}.pkl`` to already exist in ``outdir``. This is
+    intended for continuing a single cube run (e.g. existing 1..8, add 9..12)
+    without recomputing lower powers.
+    """
+    outdir = Path(outdir)
+    in_path = outdir / f'H_power_{N_start}.pkl'
+    if not in_path.exists():
+        raise FileNotFoundError(f'Missing cache seed: {in_path}')
+    if N_end < N_start:
+        raise ValueError('N_end must be >= N_start')
+
+    with open(in_path, 'rb') as f:
+        seed = pickle.load(f)
+    Ps = seed['Ps']
+    Pc = seed['Pc']
+    results = {N_start: {'Ps': Ps, 'Pc': Pc}}
+
+    for n in range(N_start + 1, N_end + 1):
+        print(f"    extend H^{n} ...", end=' ', flush=True)
+        Ps_H, Pc_H = apply_H_on_pair(Ps, Pc, V, kvec, k2, pref, x, y, z)
+        if expand:
+            Ps = sp.expand(Ps_H)
+            Pc = sp.expand(Pc_H)
+        else:
+            Ps = Ps_H
+            Pc = Pc_H
+        results[n] = {'Ps': Ps, 'Pc': Pc}
+        _save_power(outdir, n, results[n], file_format, prefix='H_power')
+        print('✓')
+
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Strategy B: (aH+b)^n  (legacy)
 # ---------------------------------------------------------------------------
