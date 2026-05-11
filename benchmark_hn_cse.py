@@ -97,7 +97,7 @@ def _hn_main_func():
 
 
 def selective_hn_cse_build(min_count, repl, red_cos, red_sin, counts,
-                            strategy_label=None):
+                            strategy_label=None, keep_scores=None):
     """Build H^n Julia keeping only CSE temps with occurrence count >= min_count.
 
     Same forward-pass inlining logic as selective_cse_build in
@@ -113,7 +113,8 @@ def selective_hn_cse_build(min_count, repl, red_cos, red_sin, counts,
     kept = []
     for sym, expr in repl:
         expr_resolved = expr.xreplace(inline_map) if inline_map else expr
-        if counts.get(sym, 0) < min_count:
+        score = keep_scores.get(sym, counts.get(sym, 0)) if keep_scores else counts.get(sym, 0)
+        if score < min_count:
             inline_map[sym] = expr_resolved
         else:
             kept.append((sym, expr_resolved))
@@ -178,7 +179,8 @@ def find_cube_by_atoms(vexpr_dir, expr_dir, n_atoms, n1, seed=0):
 def run_hn_threshold_sweep(thresholds, repl, red_cos, red_sin, counts,
                             work_dir, X, Y, Z, k_vals, b_vals,
                             outdir, julia_exe, n_reps, save_jl,
-                            reference_out, n1):
+                            reference_out, n1, keep_scores=None,
+                            score_label='count'):
     """Sweep selective_hn_cse_build thresholds; return results dict."""
     results = {}
     for min_count in thresholds:
@@ -188,7 +190,8 @@ def run_hn_threshold_sweep(thresholds, repl, red_cos, red_sin, counts,
         t_build = time.time()
         jl_src, n_kept, ops_post = selective_hn_cse_build(
             min_count, repl, red_cos, red_sin, counts,
-            strategy_label=f'hn_cse_t{min_count}')
+            strategy_label=f'hn_cse_t{min_count}_{score_label}',
+            keep_scores=keep_scores)
         t_build = time.time() - t_build
 
         jl_file = outdir / f'eval_hn_cse_n{n1}_t{min_count}.jl'
@@ -272,6 +275,9 @@ def main():
                         help='Keep generated .jl files in outdir')
     parser.add_argument('--outdir', default='benchmark_results_hn',
                         help='Output directory (default benchmark_results_hn/)')
+    parser.add_argument('--score_mode', choices=['count', 'savings'], default='count',
+                        help=('Threshold score mode: count keeps CSE temps by reuse count; '
+                              'savings keeps by estimated net op savings = count*(ops-1)-1'))
     args = parser.parse_args()
 
     outdir = Path(args.outdir)
@@ -309,10 +315,18 @@ def main():
     t0 = time.time()
     counts = count_cse_occurrences(repl, [red_cos, red_sin])
     print(f'done ({time.time()-t0:.1f}s)')
+    expr_ops = {sym: int(sp.count_ops(expr)) for sym, expr in repl}
+    savings_scores = {
+        sym: (counts.get(sym, 0) * max(expr_ops[sym] - 1, 0) - 1)
+        for sym in expr_ops
+    }
 
+    score_map = counts if args.score_mode == 'count' else savings_scores
+    score_title = 'reuse-count' if args.score_mode == 'count' else 'estimated net-op savings'
     show_count_distribution(
-        counts, thresholds,
-        title=f'H^{args.n1} CSE  (n_atoms={args.n_atoms}  cube={cube_dir.name})')
+        score_map, thresholds,
+        title=(f'H^{args.n1} CSE {score_title}  '
+               f'(n_atoms={args.n_atoms}  cube={cube_dir.name})'))
 
     if args.distribution_only:
         dist_file = outdir / f'hn_cse_dist_n{args.n1}_atoms{args.n_atoms}.json'
@@ -355,7 +369,8 @@ def main():
         print('Baseline: all CSE temps kept (min_count=1)')
         t_build = time.time()
         jl_src_base, n_kept_base, ops_base = selective_hn_cse_build(
-            1, repl, red_cos, red_sin, counts, strategy_label='hn_cse_baseline')
+            1, repl, red_cos, red_sin, counts, strategy_label='hn_cse_baseline',
+            keep_scores=score_map)
         t_build = time.time() - t_build
         jl_file = outdir / f'eval_hn_cse_n{args.n1}_baseline.jl'
         jl_file.write_text(jl_src_base)
@@ -382,7 +397,8 @@ def main():
             sweep_thresholds, repl, red_cos, red_sin, counts,
             work_dir, X, Y, Z, k_vals, b_vals,
             outdir, args.julia_exe, args.n_reps, args.save_jl,
-            reference_out, args.n1)
+            reference_out, args.n1, keep_scores=score_map,
+            score_label=args.score_mode)
         results.update(sweep_results)
 
     # ---- Summary table ----
