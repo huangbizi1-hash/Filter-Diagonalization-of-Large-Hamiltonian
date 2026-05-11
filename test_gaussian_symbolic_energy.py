@@ -48,8 +48,12 @@ from scipy.sparse.linalg import eigsh
 
 sys.path.insert(0, str(Path(__file__).parent))
 from symbolic_code.h_powers import apply_H_on_pair, generate_H_powers
-from symbolic_code.chebyshev_filter import apply_f_of_H_from_raw_powers
-from symbolic_code.julia_codegen import build_julia_hn_cse_script
+from symbolic_code.chebyshev_filter import (
+    apply_f_of_H_from_raw_powers,
+    group_by_exp_combined,
+    apply_horner,
+)
+from symbolic_code.julia_codegen import build_julia_batch_script
 from filter_core import svd_rayleigh_ritz_op
 
 
@@ -162,12 +166,18 @@ def assemble_fH_julia(cheb_m: int, E_lo: float, E_hi: float,
                        cache_dir: Path) -> tuple[Path, Path]:
     """Assemble f(H) from H^n pkl and return paths to Julia .jl files (cached).
 
+    Uses the baseline pipeline:
+      group_by_exp_combined → apply_horner → build_julia_batch_script
+
+    Gaussian exp factors are precomputed once per grid (not repeated per k-vector),
+    and polynomial parts use Horner form.  This is the fastest evaluation strategy.
+
     Returns (jl_sin_path, jl_cos_path):
-      jl_sin evaluates f(H)|sin(k·r)⟩ = Pc_total*cos_p + Ps_total*sin_p
-      jl_cos evaluates f(H)|cos(k·r)⟩ = Ps_total*cos_p − Pc_total*sin_p
-        (derived from symmetry: Pc_cos_n = Ps_sin_n, Ps_cos_n = −Pc_sin_n)
+      jl_sin: f(H)|sin(k·r)⟩ = Pc_total*cos_p + Ps_total*sin_p
+      jl_cos: f(H)|cos(k·r)⟩ = Ps_total*cos_p − Pc_total*sin_p
+        (from symmetry Pc_cos_n = Ps_sin_n, Ps_cos_n = −Pc_sin_n)
     """
-    tag = f'm{cheb_m}_Elo{E_lo:g}_Ehi{E_hi:g}'
+    tag = f'm{cheb_m}_Elo{E_lo:g}_Ehi{E_hi:g}_baseline'
     jl_sin = cache_dir / f'fH_sin_{tag}.jl'
     jl_cos = cache_dir / f'fH_cos_{tag}.jl'
 
@@ -177,26 +187,47 @@ def assemble_fH_julia(cheb_m: int, E_lo: float, E_hi: float,
 
     a = 2.0 / (E_hi - E_lo)
     b = -(E_hi + E_lo) / (E_hi - E_lo)
+
+    # ── assemble f(H) envelopes ──────────────────────────────────────────────
     print(f'  [sym] Assembling f(H) (m={cheb_m}, a={a:.4f}, b={b:.4f}) ...', flush=True)
     t0 = time.perf_counter()
-    Pc_total, Ps_total = apply_f_of_H_from_raw_powers(
+    Pc_raw, Ps_raw = apply_f_of_H_from_raw_powers(
         cache_dir, cheb_m, a, b, file_type='pkl', return_envelopes=True)
-    print(f'  [sym] Assembly done in {time.perf_counter()-t0:.1f}s  '
-          f'ops_Pc={sp.count_ops(Pc_total)}  ops_Ps={sp.count_ops(Ps_total)}')
+    print(f'  [sym] Assembly in {time.perf_counter()-t0:.1f}s  '
+          f'ops_Pc={sp.count_ops(Pc_raw)}  ops_Ps={sp.count_ops(Ps_raw)}')
 
-    print('  [sym] Building Julia scripts (CSE) ...', flush=True)
+    # ── expand so group_by_exp_combined sees flat monomial terms ─────────────
+    print('  [sym] Expanding envelopes ...', flush=True)
     t0 = time.perf_counter()
-    # sin-start: out = Pc*cos_p + Ps*sin_p  →  f(H)|sin(k·r)⟩
-    src_sin, ops_sin = build_julia_hn_cse_script(Pc_total, Ps_total)
-    # cos-start (by symmetry): out = Ps*cos_p + (-Pc)*sin_p  →  f(H)|cos(k·r)⟩
-    src_cos, ops_cos = build_julia_hn_cse_script(Ps_total, -Pc_total)
-    print(f'  [sym] Codegen done in {time.perf_counter()-t0:.1f}s  '
-          f'ops_sin={ops_sin}  ops_cos={ops_cos}')
+    Pc_total = sp.expand(Pc_raw)
+    Ps_total = sp.expand(Ps_raw)
+    print(f'  [sym] Expand in {time.perf_counter()-t0:.1f}s')
+
+    # ── baseline codegen: group exp factors, Horner polys, batch script ──────
+    def _make_script(cos_expr, sin_expr):
+        terms_cos = apply_horner(group_by_exp_combined(cos_expr))
+        terms_sin = apply_horner(group_by_exp_combined(sin_expr))
+        src = build_julia_batch_script(terms_cos, terms_sin)
+        return src, len(terms_cos), len(terms_sin)
+
+    print('  [sym] Building Julia sin-start script ...', flush=True)
+    t0 = time.perf_counter()
+    src_sin, ng_cos_sin, ng_sin_sin = _make_script(Pc_total, Ps_total)
+    print(f'  [sym] sin script in {time.perf_counter()-t0:.1f}s  '
+          f'cos_groups={ng_cos_sin}  sin_groups={ng_sin_sin}  '
+          f'bytes={len(src_sin):,}')
+
+    print('  [sym] Building Julia cos-start script ...', flush=True)
+    t0 = time.perf_counter()
+    src_cos, ng_cos_cos, ng_sin_cos = _make_script(Ps_total, -Pc_total)
+    print(f'  [sym] cos script in {time.perf_counter()-t0:.1f}s  '
+          f'cos_groups={ng_cos_cos}  sin_groups={ng_sin_cos}  '
+          f'bytes={len(src_cos):,}')
 
     jl_sin.write_text(src_sin)
     jl_cos.write_text(src_cos)
-    print(f'  [sym] Saved {jl_sin.name}  ({len(src_sin):,} bytes)')
-    print(f'  [sym] Saved {jl_cos.name}  ({len(src_cos):,} bytes)')
+    print(f'  [sym] Saved {jl_sin.name}')
+    print(f'  [sym] Saved {jl_cos.name}')
     return jl_sin, jl_cos
 
 
