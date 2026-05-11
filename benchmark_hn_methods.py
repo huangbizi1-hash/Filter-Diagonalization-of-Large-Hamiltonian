@@ -101,8 +101,8 @@ def load_expr(cube_dir, n):
     return data.get('Pc', sp.Integer(0)), data.get('Ps', sp.Integer(0))
 
 
-def run(args):
-    expr_c, expr_s = load_expr(args.cube_dir, args.n_select)
+def benchmark_for_n(cube_dir, n_select, args):
+    expr_c, expr_s = load_expr(cube_dir, n_select)
     strategies = {}
 
     # Strategy 1: raw SymPy tree -> Julia
@@ -133,7 +133,7 @@ def run(args):
     strategies['5_horner_precompute_exp_only']  = (jl5, ops5)
     strategies['6_current_baseline']            = (jl5, ops5)
 
-    out = {'cube_dir': str(args.cube_dir), 'n_select': args.n_select, 'results': {}}
+    out = {'n_select': int(n_select), 'results': {}}
 
     if args.no_timing:
         for k, (_, ops) in strategies.items():
@@ -162,6 +162,14 @@ def run(args):
                     'warmup_ms': warmup_ms,
                 }
 
+    return out
+
+
+def run(args):
+    out = {'cube_dir': str(args.cube_dir), 'n_select': args.n_select, 'results_by_n': {}}
+    for n in args.n_select:
+        out['results_by_n'][str(n)] = benchmark_for_n(args.cube_dir, n, args)
+
     Path(args.out_json).write_text(json.dumps(out, indent=2))
     print(f'wrote {args.out_json}')
 
@@ -169,7 +177,8 @@ def run(args):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--cube_dir', required=True)
-    ap.add_argument('--n_select', type=int, default=1)
+    ap.add_argument('--n_select', type=str, default='1',
+                    help='single n or comma-separated list, e.g. 1 or 1,2,3,4,5')
     ap.add_argument('--out_json', default='hn_method_benchmark.json')
     ap.add_argument('--no_timing', action='store_true')
     ap.add_argument('--n_pts', type=int, default=4000)
@@ -177,4 +186,6 @@ if __name__ == '__main__':
     ap.add_argument('--n_reps', type=int, default=3)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--julia', default='julia')
-    run(ap.parse_args())
+    args = ap.parse_args()
+    args.n_select = [int(x) for x in str(args.n_select).split(',') if x.strip()]
+    run(args)
