@@ -247,6 +247,9 @@ def main():
                          'filter T_k to prevent high-k spurious modes from being '
                          'explosively amplified.  0 = auto (E_hi - V_max).  '
                          'Does NOT affect eigsh reference or Ritz H.  [default 0]')
+    ap.add_argument('--n_print',   type=int,   default=0,
+                    help='Number of Ritz eigenvalues to print and store in JSON. '
+                         '0 = all  [default 0]')
     ap.add_argument('--svd_tol',   type=float, default=1e-4,
                     help='SVD truncation threshold for Ritz  [default 1e-4]')
     ap.add_argument('--out_json',  type=str,   default='fd_fft_explosion.json',
@@ -347,7 +350,8 @@ def main():
         T_k_exact, d, args.cheb_m, args.E_lo, args.E_hi,
         args.n_levels, args.svd_tol, label='fft',
     )
-    _print_result(res_fft, args.n_levels)
+    n_print = args.n_print if args.n_print > 0 else None   # None → all
+    _print_result(res_fft, n_print)
     method_results.append(res_fft)
 
     # ── FD explosion for each order ────────────────────────────────────────────
@@ -367,7 +371,7 @@ def main():
             args.n_levels, args.svd_tol, label=label,
         )
         method_results.append(res)
-        _print_result(res, args.n_levels)
+        _print_result(res, n_print)
 
     t_wall = time.perf_counter() - t_wall_start
 
@@ -418,20 +422,27 @@ def main():
             'wall_total_s': t_wall,
         },
         'E_ref'         : E_ref.tolist(),
-        'methods'       : method_results,
+        'methods'       : [
+            {**r, 'ritz_evals': r['ritz_evals'][:n_print]}
+            for r in method_results
+        ],
     }
     Path(args.out_json).write_text(json.dumps(summary, indent=2))
     print(f'Results → {args.out_json}')
 
 
-def _print_result(res: dict, n_levels: int):
+def _print_result(res: dict, n_print):
+    """Print filter timing and Ritz eigenvalues.
+
+    n_print: int or None.  None → print all Ritz evals.
+    """
     n = res['n_kept']
     tf = res['filter_time_s']
     tps = res['filter_per_state_s']
     tpp = res['filter_per_pt_us']
-    ritz = res['ritz_evals'][:n_levels]
+    ritz = res['ritz_evals'][:n_print]   # None slice → all
     print(f'  kept={n}  filter={tf:.3f}s  per_state={tps:.3f}s  per_pt={tpp:.3f}µs')
-    print(f'  Ritz: {np.round(ritz, 6).tolist()}')
+    print(f'  Ritz ({len(ritz)} evals): {np.round(ritz, 6).tolist()}')
 
 
 if __name__ == '__main__':
