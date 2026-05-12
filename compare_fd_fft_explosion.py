@@ -46,16 +46,26 @@ from filter_core import svd_rayleigh_ritz_op
 # ── grid helpers ───────────────────────────────────────────────────────────────
 
 def make_grid_from_N(N: int, box_L: float):
-    """Return (d, x1d) for N points spanning [-box_L, box_L)."""
+    """Return (d, x1d) matching main.py's build_grid convention.
+
+    d  = 2*box_L / N  (periodic spacing)
+    x1d = linspace(-(N-1)*d/2, (N-1)*d/2, N)  — symmetric, both endpoints kept.
+
+    The grid is symmetric about 0 so V(x_0) = V(x_{N-1}) for even-symmetric
+    potentials (HO, Gaussian).  This avoids a large potential discontinuity at
+    the FFT wrap-around boundary which would otherwise amplify high-k modes.
+    """
     d = 2.0 * box_L / N
-    x1d = np.arange(N) * d - box_L
+    L = (N - 1) * d / 2          # = (1 - 1/N) * box_L
+    x1d = np.linspace(-L, L, N)
     return d, x1d
 
 
 def make_grid_from_d(d: float, box_L: float):
-    """Return (N, x1d) rounding to even N."""
+    """Return (N, x1d), N = round(2*box_L/d), using symmetric linspace grid."""
     N = int(round(2.0 * box_L / d))
-    x1d = np.arange(N) * d - box_L
+    L = (N - 1) * d / 2
+    x1d = np.linspace(-L, L, N)
     return N, x1d
 
 
@@ -232,6 +242,11 @@ def main():
                     help='Comma-separated FD orders to test '
                          f'(available: {sorted(FD_STENCILS.keys())})  '
                          '[default 2,4,6,8,10,12]')
+    ap.add_argument('--kinetic_cut', type=float, default=0.0,
+                    help='Kinetic energy cut-off (Ha) applied to the explosion '
+                         'filter T_k to prevent high-k spurious modes from being '
+                         'explosively amplified.  0 = auto (E_hi - V_max).  '
+                         'Does NOT affect eigsh reference or Ritz H.  [default 0]')
     ap.add_argument('--svd_tol',   type=float, default=1e-4,
                     help='SVD truncation threshold for Ritz  [default 1e-4]')
     ap.add_argument('--out_json',  type=str,   default='fd_fft_explosion.json',
@@ -268,22 +283,39 @@ def main():
         V_num = 0.5 * args.omega**2 * (X**2 + Y**2 + Z**2)
         pot_desc = f'Harmonic  V = ½ × {args.omega}² × r²'
 
-    T_k = make_T_k(N, d)
+    # T_k_exact: full (unclipped) kinetic operator — used for eigsh reference and Ritz.
+    # T_k_filt:  clipped at kinetic_cut — used ONLY for the Chebyshev explosion filter.
+    #
+    # Why clip?  Without a cut, grid-corner modes have T_k ~ 59 Ha (for d=0.5).
+    # Combined with V, their total energy >> E_hi, so T_m amplifies them by factors
+    # 10^7–10^13 relative to the physical target states, completely swamping the
+    # subspace.  Matching main.py's build_k_diagonal (default kinetic_cut=30 Ha).
+    T_k_exact = make_T_k(N, d)
+    V_max      = float(np.max(V_num))
+    if args.kinetic_cut > 0:
+        kinetic_cut = args.kinetic_cut
+    else:
+        # auto: ensure T_k + V_max ≤ E_hi so high-k modes stay inside the window
+        kinetic_cut = max(args.E_hi - V_max, args.E_hi * 0.3)
+    T_k_filt = np.minimum(T_k_exact, kinetic_cut)
 
-    print(f'Grid:      N={N}  N³={N3}  d={d:.4f} Bohr  box_L={args.box_L} Bohr')
-    print(f'Potential: {pot_desc}')
-    print(f'Filter:    T_{args.cheb_m}(aH+b)  '
+    print(f'Grid:          N={N}  N³={N3}  d={d:.4f} Bohr  '
+          f'eff_L={(N-1)*d/2:.4f} Bohr  (box_L={args.box_L})')
+    print(f'Potential:     {pot_desc}  V_max={V_max:.2f} Ha')
+    print(f'Filter:        T_{args.cheb_m}(aH+b)  '
           f'E_lo={args.E_lo}  E_hi={args.E_hi}')
-    print(f'           a={2/(args.E_hi-args.E_lo):.4f}  '
+    print(f'               a={2/(args.E_hi-args.E_lo):.4f}  '
           f'b={-(args.E_hi+args.E_lo)/(args.E_hi-args.E_lo):.4f}')
-    print(f'FD orders: {fd_orders}  (max available: {max(FD_STENCILS.keys())})')
+    print(f'kinetic_cut:   {kinetic_cut:.2f} Ha  '
+          f'(T_k_max={float(np.max(T_k_exact)):.2f} Ha)')
+    print(f'FD orders:     {fd_orders}  (max available: {max(FD_STENCILS.keys())})')
 
-    # ── reference: eigsh ──────────────────────────────────────────────────────
+    # ── reference: eigsh with exact (unclipped) T_k ───────────────────────────
     print(f'\n[ref] eigsh ({args.n_levels} lowest levels) ...')
     t0 = time.perf_counter()
     H_linop = LinearOperator(
         (N3, N3),
-        matvec=lambda v: apply_H_fft(v, V_num, T_k),
+        matvec=lambda v: apply_H_fft(v, V_num, T_k_exact),
         dtype=float,
     )
     E_ref, _ = eigsh(H_linop, k=args.n_levels, which='SA')
@@ -299,20 +331,20 @@ def main():
                 for _ in range(args.n_random)]
     psi_list = [p / np.sqrt(float(np.sum(p**2) * d**3)) for p in psi_list]
 
-    # matvec for Ritz (always FFT-accurate regardless of filter discretisation)
+    # Ritz H always uses exact (unclipped) T_k for unbiased eigenvalues
     def H_matvec(v):
-        return apply_H_fft(v, V_num, T_k)
+        return apply_H_fft(v, V_num, T_k_exact)
 
     method_results = []
 
-    # ── FFT explosion ──────────────────────────────────────────────────────────
-    print(f'\n[fft] Chebyshev explosion (m={args.cheb_m}) ...')
+    # ── FFT explosion (uses T_k_filt for filter, T_k_exact for Ritz) ──────────
+    print(f'\n[fft] Chebyshev explosion (m={args.cheb_m}, kinetic_cut={kinetic_cut:.1f}) ...')
     def cheb_fft(psi, m, E_lo, E_hi):
-        return apply_chebyshev_fft(psi, V_num, T_k, m, E_lo, E_hi)
+        return apply_chebyshev_fft(psi, V_num, T_k_filt, m, E_lo, E_hi)
 
     res_fft = run_explosion(
         psi_list, V_num, H_matvec, cheb_fft,
-        T_k, d, args.cheb_m, args.E_lo, args.E_hi,
+        T_k_exact, d, args.cheb_m, args.E_lo, args.E_hi,
         args.n_levels, args.svd_tol, label='fft',
     )
     _print_result(res_fft, args.n_levels)
@@ -331,7 +363,7 @@ def main():
 
         res = run_explosion(
             psi_list, V_num, H_matvec, cheb_fd,
-            T_k, d, args.cheb_m, args.E_lo, args.E_hi,
+            T_k_exact, d, args.cheb_m, args.E_lo, args.E_hi,
             args.n_levels, args.svd_tol, label=label,
         )
         method_results.append(res)
@@ -378,6 +410,8 @@ def main():
             'cheb_m'     : args.cheb_m,
             'seed'       : args.seed,
             'fd_orders'  : fd_orders,
+            'kinetic_cut': kinetic_cut,
+            'V_max'      : V_max,
         },
         'timings': {
             'ref_eigsh_s' : t_ref,
