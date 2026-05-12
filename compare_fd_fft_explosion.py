@@ -152,7 +152,7 @@ def rayleigh_quotient(psi_n, V, T_k, d):
 
 def run_explosion(psi_list, V, apply_H_matvec, apply_cheb,
                   T_k_for_rq, d, m, E_lo, E_hi, n_levels, svd_tol,
-                  label: str):
+                  label: str, max_ritz: int = 0):
     """
     Run Chebyshev explosion on psi_list, return result dict.
 
@@ -190,9 +190,10 @@ def run_explosion(psi_list, V, apply_H_matvec, apply_cheb,
     if filtered:
         basis = np.column_stack([p.ravel() for p in filtered])
         t0 = time.perf_counter()
+        n_want = max(n_levels + 5, max_ritz)
         E_ritz, _, rank = svd_rayleigh_ritz_op(
             basis, apply_H_matvec,
-            svd_tol=svd_tol, max_energies=n_levels + 5, hermitian=True)
+            svd_tol=svd_tol, max_energies=n_want, hermitian=True)
         t_ritz = time.perf_counter() - t0
 
     return {
@@ -215,7 +216,9 @@ def run_single_N(N: int, args, fd_orders: list, n_print) -> dict:
 
     Returns a dict suitable for embedding in the sweep JSON.
     n_print: int or None (None → keep all Ritz evals).
+    max_ritz passed to run_explosion ensures at least n_print evals are computed.
     """
+    max_ritz = n_print if n_print else 0
     d, x1d = make_grid_from_N(N, args.box_L)
     N3 = N**3
     X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
@@ -272,7 +275,7 @@ def run_single_N(N: int, args, fd_orders: list, n_print) -> dict:
     res = run_explosion(
         psi_list, V_num, H_matvec, cheb_fft,
         T_k_exact, d, args.cheb_m, args.E_lo, args.E_hi,
-        args.n_levels, args.svd_tol, label='fft',
+        args.n_levels, args.svd_tol, label='fft', max_ritz=max_ritz,
     )
     _print_result(res, n_print)
     method_results.append(res)
@@ -289,7 +292,7 @@ def run_single_N(N: int, args, fd_orders: list, n_print) -> dict:
         res = run_explosion(
             psi_list, V_num, H_matvec, cheb_fd,
             T_k_exact, d, args.cheb_m, args.E_lo, args.E_hi,
-            args.n_levels, args.svd_tol, label=label,
+            args.n_levels, args.svd_tol, label=label, max_ritz=max_ritz,
         )
         method_results.append(res)
         _print_result(res, n_print)
