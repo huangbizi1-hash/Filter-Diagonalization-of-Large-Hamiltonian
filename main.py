@@ -95,6 +95,8 @@ from fft_code.grid         import build_k_diagonal
 from fft_code.wavefunction import random_sine_psi, random_pm1_psi, normalize_psi
 from fft_code.hamiltonian  import apply_H
 from fft_code.hamiltonian  import apply_chebyshev_explosion
+from scipy.ndimage         import convolve1d
+from ho3d_solvers_v2       import FD_STENCILS
 from fft_code.filter_coeff import build_filter_coefficients, make_filter_func
 from fft_code.potentials   import build_potential_from_config
 from fft_code.plotting     import (
@@ -286,9 +288,29 @@ def run(cfg: Dict[str, Any]) -> None:
 
     # H_apply_fft：3D 网格输入/输出，供滤波阶段共享基底
     H_apply_fft  = lambda psi: apply_H(psi, V, T_k_diagonal)
-    # H_apply_flat：1D flat 输入/输出，供 RR 阶段列向量运算
+    # H_apply_flat：1D flat 输入/输出，供 RR 阶段列向量运算（始终用 FFT）
     H_apply_flat = lambda psi_flat: apply_H(
         psi_flat.reshape(Nx, Ny, Nz), V, T_k_diagonal).ravel()
+
+    # FD H_apply（仅当 fd_order 指定时构建，用于 chebyshev_explosion filter）
+    fd_order = cfg.get("fd_order", None)
+    if fd_order is not None:
+        fd_order = int(fd_order)
+        if fd_order not in FD_STENCILS:
+            raise ValueError(
+                f"fd_order={fd_order} not in FD_STENCILS {sorted(FD_STENCILS)}")
+        _fd_stencil = FD_STENCILS[fd_order].astype(np.float64)
+        _fd_inv_d2  = -0.5 / (float(x[1] - x[0]) ** 2)
+
+        def H_apply_fd(psi: np.ndarray) -> np.ndarray:
+            Tpsi = (convolve1d(psi, _fd_stencil, axis=0, mode='wrap') +
+                    convolve1d(psi, _fd_stencil, axis=1, mode='wrap') +
+                    convolve1d(psi, _fd_stencil, axis=2, mode='wrap')) * _fd_inv_d2
+            return Tpsi + V * psi
+
+        print(f"   FD kinetic: order={fd_order}  (filter only; Ritz uses H_FFT)")
+    else:
+        H_apply_fd = None
 
     # ================================================================
     # 3. 构建滤波系数
@@ -332,8 +354,10 @@ def run(cfg: Dict[str, Any]) -> None:
         cheb_m = int(cfg.get("cheb_m", nc))
         cheb_E_lo = float(cfg.get("cheb_E_lo", cfg.get("Vmin", -1.0)))
         cheb_E_hi = float(cfg.get("cheb_E_hi", float(V.max()) + kinetic_cut))
-        print(f"   cheb_m = {cheb_m},  E_lo = {cheb_E_lo},  E_hi = {cheb_E_hi}")
-        filter_label = f"ChebyshevExplosion (m={cheb_m}, E_lo={cheb_E_lo}, E_hi={cheb_E_hi})"
+        _fd_tag = f", FD-{fd_order}" if fd_order is not None else ", FFT"
+        print(f"   cheb_m = {cheb_m},  E_lo = {cheb_E_lo},  E_hi = {cheb_E_hi}{_fd_tag}")
+        filter_label = (f"ChebyshevExplosion (m={cheb_m}, E_lo={cheb_E_lo}, "
+                        f"E_hi={cheb_E_hi}{_fd_tag})")
     else:
         filter_label = filter_type
     if filter_type == "chebyshev_explosion":
@@ -501,9 +525,24 @@ def run(cfg: Dict[str, Any]) -> None:
             cheb_m = int(cfg.get("cheb_m", nc))
             cheb_E_lo = float(cfg.get("cheb_E_lo", cfg.get("Vmin", -1.0)))
             cheb_E_hi = float(cfg.get("cheb_E_hi", float(V.max()) + kinetic_cut))
-            psi_f = apply_chebyshev_explosion(
-                psi_rand, V, T_k_diagonal, cheb_m, cheb_E_lo, cheb_E_hi
-            )
+            if H_apply_fd is not None:
+                # FD Chebyshev explosion: same 3-term recurrence, FD kinetic
+                a = 2.0 / (cheb_E_hi - cheb_E_lo)
+                b = -(cheb_E_hi + cheb_E_lo) / (cheb_E_hi - cheb_E_lo)
+                _Hs = lambda phi: a * H_apply_fd(phi) + b * phi
+                y_prev = psi_rand.copy()
+                if cheb_m == 0:
+                    psi_f = y_prev
+                else:
+                    y_curr = _Hs(psi_rand)
+                    for _ in range(2, cheb_m + 1):
+                        y_next = 2.0 * _Hs(y_curr) - y_prev
+                        y_prev, y_curr = y_curr, y_next
+                    psi_f = y_curr
+            else:
+                psi_f = apply_chebyshev_explosion(
+                    psi_rand, V, T_k_diagonal, cheb_m, cheb_E_lo, cheb_E_hi
+                )
             psi_filt_all = np.stack([psi_f for _ in range(ist.ms)], axis=0)
         else:
             psi_filt_all = apply_filter_H_all_op(
@@ -606,6 +645,8 @@ def run(cfg: Dict[str, Any]) -> None:
                if filter_type == "gabor" else {}),
             **({"beta": beta, "E1": E1}
                if filter_type == "bandpass" else {}),
+            "fd_order": fd_order,
+            "ritz_kinetic": "FFT",
             "El_list": El_list.tolist(),
             "E_mean":  E_mean,
             "E_std":   E_std,
