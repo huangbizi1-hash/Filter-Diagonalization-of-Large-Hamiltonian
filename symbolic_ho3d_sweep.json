@@ -1,0 +1,58 @@
+{
+  "script": "compare_symbolic_explosion_ho3d.py",
+  "datetime": "20260512_045503",
+  "params": {
+    "omega": 1.0,
+    "box_L": 5.0,
+    "N_list": [
+      10
+    ],
+    "cheb_m": 3,
+    "E_lo": 8.0,
+    "E_hi": 80.0,
+    "n_random": 4,
+    "n_print": 5,
+    "seed": 42,
+    "svd_tol": 0.0001,
+    "cache_dir": "/home/user/Filter-Diagonalization-of-Large-Hamiltonian/ho3d_symbolic_cache",
+    "julia_exe": "/nonexistent_julia",
+    "cheb_a": 0.027777777777777776,
+    "cheb_b": -1.2222222222222223,
+    "cheb_coeffs": [
+      -3.636488340192045,
+      0.4146090534979424,
+      -0.01131687242798354,
+      8.57338820301783e-05
+    ],
+    "jl_script": "/home/user/Filter-Diagonalization-of-Large-Hamiltonian/ho3d_symbolic_cache/julia_filter_m3_a0p027777778_bm1p2222222.jl"
+  },
+  "sweep": [
+    {
+      "N": 10,
+      "d": 1.0,
+      "k_max": 3.141592653589793,
+      "E_ref": [
+        1.500501528892686,
+        2.497217182094786,
+        2.4972171820947904,
+        2.497217182094791,
+        3.4939328352968704,
+        3.4939328352968855,
+        3.493932835296891,
+        3.5222917956514737,
+        3.5222917956514945,
+        3.5222917956515016
+      ],
+      "t_ref_s": 0.05480984999996963,
+      "julia_ok": false,
+      "julia_timing": {},
+      "t_julia_s": 0.0,
+      "t_ritz_s": 0.0,
+      "svd_rank": 0,
+      "ritz_evals": [],
+      "max_err_exact": NaN,
+      "mean_err_exact": NaN
+    }
+  ],
+  "wall_total_s": 1.593020566000007
+}
