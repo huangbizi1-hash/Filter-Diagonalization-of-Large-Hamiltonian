@@ -19,14 +19,22 @@ Reference eigenvalues come from scipy eigsh on the FFT Hamiltonian.
 Finite-difference orders available: 2, 4, 6, 8, 10, 12, 14, 16, 18, 20
 (central-difference stencils from ho3d_solvers_v2.FD_STENCILS)
 
-Usage examples:
-  python compare_fd_fft_explosion.py --potential harmonic --omega 1.0 \\
-      --N 20 --cheb_m 20 --E_lo 7.0 --E_hi 60.0 --n_random 400 \\
-      --fd_order 2,4,6,8,10
+Grid sweep:
+  --N_sweep START:STOP[:STEP]  — run for each N in range(START, STOP, STEP)
+                                  STOP is exclusive, default STEP=1
+  --N_sweep N1,N2,N3,...       — run for each listed N
+  All sweep results go into a single JSON under the "sweep" key.
 
-  python compare_fd_fft_explosion.py --potential gaussian --A 10 --B 0.5 \\
-      --box_L 4.0 --d 0.5 --cheb_m 8 --E_lo -3.0 --E_hi 20.0 \\
-      --fd_order 2,4,6,8
+Usage examples:
+  # Single N
+  python compare_fd_fft_explosion.py --potential harmonic --omega 1.0 \\
+      --N 20 --box_L 5.0 --cheb_m 20 --E_lo 7.0 --E_hi 60.0 \\
+      --n_random 400 --fd_order 2,4,6,8,10,12 --n_print 30
+
+  # Sweep N=14..20
+  python compare_fd_fft_explosion.py --potential harmonic --omega 1.0 \\
+      --N_sweep 14:21 --box_L 5.0 --cheb_m 20 --E_lo 7.0 --E_hi 60.0 \\
+      --n_random 400 --fd_order 2,4,6,8,10,12 --n_print 30
 """
 
 import argparse
@@ -152,18 +160,17 @@ def run_explosion(psi_list, V, apply_H_matvec, apply_cheb,
     apply_H_matvec(v_flat) → flat H|v⟩  (for Ritz)
     T_k_for_rq  used only for Rayleigh quotient (always FFT-accurate)
     """
-    N3  = psi_list[0].size
-    d3  = d**3
+    N3 = psi_list[0].size
 
-    filtered = []
-    energies = []
+    filtered    = []
+    energies    = []
     state_times = []
 
     t_filter_start = time.perf_counter()
     for psi in psi_list:
         t0 = time.perf_counter()
         psi_f = apply_cheb(psi, m, E_lo, E_hi)
-        psi_fn, norm2 = normalize(psi_f, d)
+        psi_fn, _ = normalize(psi_f, d)
         t_state = time.perf_counter() - t0
         if psi_fn is None:
             continue
@@ -173,11 +180,10 @@ def run_explosion(psi_list, V, apply_H_matvec, apply_cheb,
         state_times.append(t_state)
     t_filter = time.perf_counter() - t_filter_start
 
-    n_kept = len(filtered)
+    n_kept      = len(filtered)
     t_per_state = t_filter / max(n_kept, 1)
     t_per_pt_us = t_per_state / N3 * 1e6
 
-    # Rayleigh-Ritz
     E_ritz = np.array([])
     rank   = 0
     t_ritz = 0.0
@@ -190,16 +196,159 @@ def run_explosion(psi_list, V, apply_H_matvec, apply_cheb,
         t_ritz = time.perf_counter() - t0
 
     return {
-        'label'          : label,
-        'n_kept'         : n_kept,
-        'state_energies' : energies,
-        'ritz_evals'     : E_ritz.tolist(),
-        'ritz_rank'      : int(rank),
-        'filter_time_s'  : t_filter,
+        'label'              : label,
+        'n_kept'             : n_kept,
+        'state_energies'     : energies,
+        'ritz_evals'         : E_ritz.tolist(),
+        'ritz_rank'          : int(rank),
+        'filter_time_s'      : t_filter,
         'filter_per_state_s' : t_per_state,
         'filter_per_pt_us'   : t_per_pt_us,
-        'ritz_time_s'    : t_ritz,
+        'ritz_time_s'        : t_ritz,
     }
+
+
+# ── single-N computation ───────────────────────────────────────────────────────
+
+def run_single_N(N: int, args, fd_orders: list, n_print) -> dict:
+    """Run the full explosion comparison for one value of N.
+
+    Returns a dict suitable for embedding in the sweep JSON.
+    n_print: int or None (None → keep all Ritz evals).
+    """
+    d, x1d = make_grid_from_N(N, args.box_L)
+    N3 = N**3
+    X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
+
+    # ── potential ──────────────────────────────────────────────────────────────
+    if args.potential == 'gaussian':
+        V_num    = -args.A * np.exp(-args.B * (X**2 + Y**2 + Z**2))
+        pot_desc = f'Gaussian V=-{args.A}*exp(-{args.B}*r²)'
+    else:
+        V_num    = 0.5 * args.omega**2 * (X**2 + Y**2 + Z**2)
+        pot_desc = f'Harmonic V=½×{args.omega}²×r²'
+
+    # ── kinetic operators ──────────────────────────────────────────────────────
+    T_k_exact = make_T_k(N, d)
+    V_max     = float(np.max(V_num))
+    if args.kinetic_cut > 0:
+        kinetic_cut = args.kinetic_cut
+    else:
+        kinetic_cut = max(args.E_hi - V_max, args.E_hi * 0.3)
+    T_k_filt = np.minimum(T_k_exact, kinetic_cut)
+
+    print(f'\n{"─"*68}')
+    print(f'N={N}  N³={N3}  d={d:.5f} Bohr  eff_L={(N-1)*d/2:.4f}  '
+          f'V_max={V_max:.2f} Ha  kinetic_cut={kinetic_cut:.2f} Ha')
+
+    # ── reference: eigsh ──────────────────────────────────────────────────────
+    print(f'  [ref] eigsh ({args.n_levels} levels) ...', end=' ', flush=True)
+    t0 = time.perf_counter()
+    H_linop = LinearOperator(
+        (N3, N3),
+        matvec=lambda v: apply_H_fft(v, V_num, T_k_exact),
+        dtype=float,
+    )
+    E_ref, _ = eigsh(H_linop, k=args.n_levels, which='SA')
+    t_ref = time.perf_counter() - t0
+    E_ref = np.sort(E_ref)
+    print(f'{t_ref:.2f}s  E_ref={np.round(E_ref, 5).tolist()}')
+
+    # ── random initial states ─────────────────────────────────────────────────
+    rng      = np.random.default_rng(args.seed)
+    psi_list = [rng.standard_normal((N, N, N)).astype(np.float64)
+                for _ in range(args.n_random)]
+    psi_list = [p / np.sqrt(float(np.sum(p**2) * d**3)) for p in psi_list]
+
+    def H_matvec(v):
+        return apply_H_fft(v, V_num, T_k_exact)
+
+    method_results = []
+
+    # ── FFT explosion ──────────────────────────────────────────────────────────
+    def cheb_fft(psi, m, E_lo, E_hi):
+        return apply_chebyshev_fft(psi, V_num, T_k_filt, m, E_lo, E_hi)
+
+    res = run_explosion(
+        psi_list, V_num, H_matvec, cheb_fft,
+        T_k_exact, d, args.cheb_m, args.E_lo, args.E_hi,
+        args.n_levels, args.svd_tol, label='fft',
+    )
+    _print_result(res, n_print)
+    method_results.append(res)
+
+    # ── FD explosion ───────────────────────────────────────────────────────────
+    for order in fd_orders:
+        stencil = FD_STENCILS[order].astype(np.float64)
+        inv_d2  = -0.5 / (d ** 2)
+        label   = f'fd{order}'
+
+        def cheb_fd(psi, m, E_lo, E_hi, _s=stencil, _id2=inv_d2):
+            return apply_chebyshev_fd(psi, V_num, _s, _id2, m, E_lo, E_hi)
+
+        res = run_explosion(
+            psi_list, V_num, H_matvec, cheb_fd,
+            T_k_exact, d, args.cheb_m, args.E_lo, args.E_hi,
+            args.n_levels, args.svd_tol, label=label,
+        )
+        method_results.append(res)
+        _print_result(res, n_print)
+
+    # ── compact summary for this N ─────────────────────────────────────────────
+    E_ref0 = E_ref[0]
+    print(f'  {"Method":<10} {"Ritz[0]":>12} {"ΔE":>12} '
+          f'{"filter(s)":>10} {"per_pt(µs)":>11}')
+    for r in method_results:
+        ritz0 = r['ritz_evals'][0] if r['ritz_evals'] else float('nan')
+        print(f'  {r["label"]:<10} {ritz0:12.6f} {ritz0-E_ref0:+12.2e} '
+              f'{r["filter_time_s"]:10.3f} {r["filter_per_pt_us"]:11.3f}')
+
+    return {
+        'N'          : N,
+        'N3'         : N3,
+        'd'          : d,
+        'kinetic_cut': kinetic_cut,
+        'V_max'      : V_max,
+        't_ref_s'    : t_ref,
+        'E_ref'      : E_ref.tolist(),
+        'methods'    : [
+            {**r, 'ritz_evals': r['ritz_evals'][:n_print]}
+            for r in method_results
+        ],
+    }
+
+
+# ── CLI helpers ────────────────────────────────────────────────────────────────
+
+def _parse_N_sweep(s: str) -> list:
+    """Parse --N_sweep string into a list of N values.
+
+    Formats accepted:
+      "14:21"      → list(range(14, 21))     = [14,15,16,17,18,19,20]
+      "14:21:2"    → list(range(14, 21, 2))  = [14,16,18,20]
+      "14,16,20"   → [14, 16, 20]
+    """
+    s = s.strip()
+    if ':' in s:
+        parts = [int(x) for x in s.split(':')]
+        if len(parts) == 2:
+            return list(range(parts[0], parts[1]))
+        if len(parts) == 3:
+            return list(range(parts[0], parts[1], parts[2]))
+        raise ValueError(f'Cannot parse --N_sweep {s!r}')
+    return [int(x) for x in s.split(',') if x.strip()]
+
+
+def _print_result(res: dict, n_print):
+    """Print filter timing and Ritz eigenvalues.  n_print=None → all."""
+    n    = res['n_kept']
+    tf   = res['filter_time_s']
+    tps  = res['filter_per_state_s']
+    tpp  = res['filter_per_pt_us']
+    ritz = res['ritz_evals'][:n_print]
+    print(f'  [{res["label"]}] kept={n}  filter={tf:.3f}s  '
+          f'per_state={tps:.3f}s  per_pt={tpp:.3f}µs')
+    print(f'    Ritz ({len(ritz)} evals): {np.round(ritz, 6).tolist()}')
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -217,14 +366,17 @@ def main():
     ap.add_argument('--omega', type=float, default=1.0,
                     help='Harmonic oscillator frequency ω  [default 1.0]')
 
-    # grid: specify N or d (not both); box_L always required with d
     grp = ap.add_mutually_exclusive_group()
-    grp.add_argument('--N',     type=int,   default=None,
-                     help='Grid points per axis (overrides --d)')
-    grp.add_argument('--d',     type=float, default=0.5,
-                     help='Grid spacing (Bohr)  [default 0.5]')
-    ap.add_argument('--box_L', type=float, default=4.0,
-                    help='Half-box length (Bohr)  [default 4.0]')
+    grp.add_argument('--N',       type=int,  default=None,
+                     help='Grid points per axis (single run)')
+    grp.add_argument('--d',       type=float, default=None,
+                     help='Grid spacing in Bohr (single run)')
+    grp.add_argument('--N_sweep', type=str,  default=None,
+                     help='Sweep over N values: "14:21" (range, exclusive stop) '
+                          'or "14:21:2" (with step) or "14,16,18,20" (list). '
+                          'Overrides --N and --d.')
+    ap.add_argument('--box_L',   type=float, default=5.0,
+                    help='Half-box length (Bohr)  [default 5.0]')
 
     ap.add_argument('--n_levels',  type=int,   default=5,
                     help='Number of reference eigsh levels  [default 5]')
@@ -243,12 +395,11 @@ def main():
                          f'(available: {sorted(FD_STENCILS.keys())})  '
                          '[default 2,4,6,8,10,12]')
     ap.add_argument('--kinetic_cut', type=float, default=0.0,
-                    help='Kinetic energy cut-off (Ha) applied to the explosion '
-                         'filter T_k to prevent high-k spurious modes from being '
-                         'explosively amplified.  0 = auto (E_hi - V_max).  '
-                         'Does NOT affect eigsh reference or Ritz H.  [default 0]')
+                    help='Kinetic energy cut-off (Ha) for the explosion filter T_k. '
+                         '0 = auto (E_hi - V_max).  Does NOT affect eigsh / Ritz.  '
+                         '[default 0 = auto]')
     ap.add_argument('--n_print',   type=int,   default=0,
-                    help='Number of Ritz eigenvalues to print and store in JSON. '
+                    help='Ritz eigenvalues to print and store per method. '
                          '0 = all  [default 0]')
     ap.add_argument('--svd_tol',   type=float, default=1e-4,
                     help='SVD truncation threshold for Ritz  [default 1e-4]')
@@ -262,138 +413,71 @@ def main():
     try:
         fd_orders = [int(x.strip()) for x in args.fd_order.split(',') if x.strip()]
     except ValueError:
-        ap.error(f'--fd_order must be comma-separated integers, got: {args.fd_order}')
+        ap.error(f'--fd_order must be comma-separated integers, got: {args.fd_order!r}')
     bad = [o for o in fd_orders if o not in FD_STENCILS]
     if bad:
         ap.error(f'FD orders {bad} not available. Choose from {sorted(FD_STENCILS.keys())}')
 
-    # ── grid ──────────────────────────────────────────────────────────────────
-    if args.N is not None:
-        N = args.N
-        d, x1d = make_grid_from_N(N, args.box_L)
+    n_print = args.n_print if args.n_print > 0 else None
+
+    # ── determine N list ───────────────────────────────────────────────────────
+    if args.N_sweep is not None:
+        try:
+            N_list = _parse_N_sweep(args.N_sweep)
+        except (ValueError, TypeError) as e:
+            ap.error(f'--N_sweep parse error: {e}')
+        if not N_list:
+            ap.error('--N_sweep produced an empty list of N values')
+    elif args.N is not None:
+        N_list = [args.N]
+    elif args.d is not None:
+        N_tmp, _ = make_grid_from_d(args.d, args.box_L)
+        N_list = [N_tmp]
     else:
-        N, x1d = make_grid_from_d(args.d, args.box_L)
-        d = float(x1d[1] - x1d[0])
-    N3 = N**3
+        N_list = [20]   # fallback default
 
-    X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
+    is_sweep = len(N_list) > 1
 
-    # ── potential ──────────────────────────────────────────────────────────────
-    if args.potential == 'gaussian':
-        V_num = -args.A * np.exp(-args.B * (X**2 + Y**2 + Z**2))
-        pot_desc = f'Gaussian  V = -{args.A} * exp(-{args.B} * r²)'
-    else:
-        V_num = 0.5 * args.omega**2 * (X**2 + Y**2 + Z**2)
-        pot_desc = f'Harmonic  V = ½ × {args.omega}² × r²'
+    print(f'Potential:  {args.potential}  '
+          + (f'omega={args.omega}' if args.potential == 'harmonic'
+             else f'A={args.A}  B={args.B}'))
+    print(f'box_L={args.box_L}  n_random={args.n_random}  '
+          f'cheb_m={args.cheb_m}  E_lo={args.E_lo}  E_hi={args.E_hi}')
+    print(f'FD orders:  {fd_orders}')
+    if is_sweep:
+        print(f'N sweep:    {N_list}')
 
-    # T_k_exact: full (unclipped) kinetic operator — used for eigsh reference and Ritz.
-    # T_k_filt:  clipped at kinetic_cut — used ONLY for the Chebyshev explosion filter.
-    #
-    # Why clip?  Without a cut, grid-corner modes have T_k ~ 59 Ha (for d=0.5).
-    # Combined with V, their total energy >> E_hi, so T_m amplifies them by factors
-    # 10^7–10^13 relative to the physical target states, completely swamping the
-    # subspace.  Matching main.py's build_k_diagonal (default kinetic_cut=30 Ha).
-    T_k_exact = make_T_k(N, d)
-    V_max      = float(np.max(V_num))
-    if args.kinetic_cut > 0:
-        kinetic_cut = args.kinetic_cut
-    else:
-        # auto: ensure T_k + V_max ≤ E_hi so high-k modes stay inside the window
-        kinetic_cut = max(args.E_hi - V_max, args.E_hi * 0.3)
-    T_k_filt = np.minimum(T_k_exact, kinetic_cut)
-
-    print(f'Grid:          N={N}  N³={N3}  d={d:.4f} Bohr  '
-          f'eff_L={(N-1)*d/2:.4f} Bohr  (box_L={args.box_L})')
-    print(f'Potential:     {pot_desc}  V_max={V_max:.2f} Ha')
-    print(f'Filter:        T_{args.cheb_m}(aH+b)  '
-          f'E_lo={args.E_lo}  E_hi={args.E_hi}')
-    print(f'               a={2/(args.E_hi-args.E_lo):.4f}  '
-          f'b={-(args.E_hi+args.E_lo)/(args.E_hi-args.E_lo):.4f}')
-    print(f'kinetic_cut:   {kinetic_cut:.2f} Ha  '
-          f'(T_k_max={float(np.max(T_k_exact)):.2f} Ha)')
-    print(f'FD orders:     {fd_orders}  (max available: {max(FD_STENCILS.keys())})')
-
-    # ── reference: eigsh with exact (unclipped) T_k ───────────────────────────
-    print(f'\n[ref] eigsh ({args.n_levels} lowest levels) ...')
-    t0 = time.perf_counter()
-    H_linop = LinearOperator(
-        (N3, N3),
-        matvec=lambda v: apply_H_fft(v, V_num, T_k_exact),
-        dtype=float,
-    )
-    E_ref, _ = eigsh(H_linop, k=args.n_levels, which='SA')
-    t_ref = time.perf_counter() - t0
-    E_ref = np.sort(E_ref)
-    print(f'  Done in {t_ref:.2f}s')
-    for i, e in enumerate(E_ref):
-        print(f'  E_ref[{i}] = {e:.8f} Ha')
-
-    # ── random initial states ─────────────────────────────────────────────────
-    rng = np.random.default_rng(args.seed)
-    psi_list = [rng.standard_normal((N, N, N)).astype(np.float64)
-                for _ in range(args.n_random)]
-    psi_list = [p / np.sqrt(float(np.sum(p**2) * d**3)) for p in psi_list]
-
-    # Ritz H always uses exact (unclipped) T_k for unbiased eigenvalues
-    def H_matvec(v):
-        return apply_H_fft(v, V_num, T_k_exact)
-
-    method_results = []
-
-    # ── FFT explosion (uses T_k_filt for filter, T_k_exact for Ritz) ──────────
-    print(f'\n[fft] Chebyshev explosion (m={args.cheb_m}, kinetic_cut={kinetic_cut:.1f}) ...')
-    def cheb_fft(psi, m, E_lo, E_hi):
-        return apply_chebyshev_fft(psi, V_num, T_k_filt, m, E_lo, E_hi)
-
-    res_fft = run_explosion(
-        psi_list, V_num, H_matvec, cheb_fft,
-        T_k_exact, d, args.cheb_m, args.E_lo, args.E_hi,
-        args.n_levels, args.svd_tol, label='fft',
-    )
-    n_print = args.n_print if args.n_print > 0 else None   # None → all
-    _print_result(res_fft, n_print)
-    method_results.append(res_fft)
-
-    # ── FD explosion for each order ────────────────────────────────────────────
-    for order in fd_orders:
-        stencil = FD_STENCILS[order].astype(np.float64)
-        inv_d2  = -0.5 / (d ** 2)
-        label   = f'fd{order}'
-
-        print(f'\n[{label}] Chebyshev explosion (FD order {order}, m={args.cheb_m}) ...')
-
-        def cheb_fd(psi, m, E_lo, E_hi, _s=stencil, _id2=inv_d2):
-            return apply_chebyshev_fd(psi, V_num, _s, _id2, m, E_lo, E_hi)
-
-        res = run_explosion(
-            psi_list, V_num, H_matvec, cheb_fd,
-            T_k_exact, d, args.cheb_m, args.E_lo, args.E_hi,
-            args.n_levels, args.svd_tol, label=label,
-        )
-        method_results.append(res)
-        _print_result(res, n_print)
+    # ── run ───────────────────────────────────────────────────────────────────
+    sweep_results = []
+    for N in N_list:
+        result = run_single_N(N, args, fd_orders, n_print)
+        sweep_results.append(result)
 
     t_wall = time.perf_counter() - t_wall_start
 
-    # ── summary table ─────────────────────────────────────────────────────────
-    print(f'\n{"="*72}')
-    print(f'Reference eigenvalues (eigsh / FFT):')
-    for i, e in enumerate(E_ref):
-        print(f'  E_ref[{i}] = {e:.8f} Ha')
-    print()
-    hdr = f'{"Method":<10} {"Ritz[0]":>12} {"ΔE vs ref":>12} '
-    hdr += f'{"f(H) total":>12} {"per state":>11} {"per pt µs":>10}'
-    print(hdr)
-    print('-' * 72)
-    E_ref0 = E_ref[0]
-    for r in method_results:
-        ritz0  = r['ritz_evals'][0] if r['ritz_evals'] else float('nan')
-        dE     = ritz0 - E_ref0
-        print(f'{r["label"]:<10} {ritz0:12.8f} {dE:+12.2e} '
-              f'{r["filter_time_s"]:12.3f}s '
-              f'{r["filter_per_state_s"]:10.3f}s '
-              f'{r["filter_per_pt_us"]:9.3f}µs')
-    print(f'{"="*72}')
+    # ── final summary (sweep mode) ─────────────────────────────────────────────
+    if is_sweep:
+        method_labels = ['fft'] + [f'fd{o}' for o in fd_orders]
+        print(f'\n{"="*78}')
+        print(f'Sweep summary  (Ritz[0] vs exact E_ref[0]):')
+        hdr = f'{"N":>4} {"d":>8}'
+        for lbl in method_labels:
+            hdr += f'  {lbl:>10}'
+        print(hdr)
+        print('-' * 78)
+        for res in sweep_results:
+            E0 = res['E_ref'][0]
+            row = f'{res["N"]:>4} {res["d"]:>8.5f}'
+            mmap = {m['label']: m for m in res['methods']}
+            for lbl in method_labels:
+                m = mmap.get(lbl)
+                if m and m['ritz_evals']:
+                    dE = m['ritz_evals'][0] - E0
+                    row += f'  {dE:>+10.2e}'
+                else:
+                    row += f'  {"—":>10}'
+            print(row)
+        print(f'{"="*78}')
     print(f'Total wall time: {t_wall:.2f}s')
 
     # ── JSON output ───────────────────────────────────────────────────────────
@@ -403,10 +487,8 @@ def main():
             'A'          : args.A,
             'B'          : args.B,
             'omega'      : args.omega,
-            'N'          : N,
-            'N3'         : N3,
-            'd'          : d,
             'box_L'      : args.box_L,
+            'N_list'     : N_list,
             'n_random'   : args.n_random,
             'n_levels'   : args.n_levels,
             'E_lo'       : args.E_lo,
@@ -414,35 +496,13 @@ def main():
             'cheb_m'     : args.cheb_m,
             'seed'       : args.seed,
             'fd_orders'  : fd_orders,
-            'kinetic_cut': kinetic_cut,
-            'V_max'      : V_max,
+            'n_print'    : args.n_print,
         },
-        'timings': {
-            'ref_eigsh_s' : t_ref,
-            'wall_total_s': t_wall,
-        },
-        'E_ref'         : E_ref.tolist(),
-        'methods'       : [
-            {**r, 'ritz_evals': r['ritz_evals'][:n_print]}
-            for r in method_results
-        ],
+        'sweep'         : sweep_results,
+        'wall_total_s'  : t_wall,
     }
     Path(args.out_json).write_text(json.dumps(summary, indent=2))
     print(f'Results → {args.out_json}')
-
-
-def _print_result(res: dict, n_print):
-    """Print filter timing and Ritz eigenvalues.
-
-    n_print: int or None.  None → print all Ritz evals.
-    """
-    n = res['n_kept']
-    tf = res['filter_time_s']
-    tps = res['filter_per_state_s']
-    tpp = res['filter_per_pt_us']
-    ritz = res['ritz_evals'][:n_print]   # None slice → all
-    print(f'  kept={n}  filter={tf:.3f}s  per_state={tps:.3f}s  per_pt={tpp:.3f}µs')
-    print(f'  Ritz ({len(ritz)} evals): {np.round(ritz, 6).tolist()}')
 
 
 if __name__ == '__main__':
