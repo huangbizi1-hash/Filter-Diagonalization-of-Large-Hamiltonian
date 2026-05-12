@@ -31,6 +31,12 @@ Usage examples:
       --N 20 --box_L 5.0 --cheb_m 20 --E_lo 7.0 --E_hi 60.0 \\
       --n_random 400 --fd_order 2,4,6,8,10,12 --n_print 30
 
+  # Use H_FFT for Ritz for all methods (original behaviour — "cross" comparison)
+  python compare_fd_fft_explosion.py ... --ritz_h fft
+
+  # Use each method's own H for Ritz (default — measures true discretisation error)
+  python compare_fd_fft_explosion.py ... --ritz_h consistent
+
   # Sweep N=14..20
   python compare_fd_fft_explosion.py --potential harmonic --omega 1.0 \\
       --N_sweep 14:21 --box_L 5.0 --cheb_m 20 --E_lo 7.0 --E_hi 60.0 \\
@@ -211,11 +217,14 @@ def run_explosion(psi_list, V, apply_H_matvec, apply_cheb,
 
 # ── single-N computation ───────────────────────────────────────────────────────
 
-def run_single_N(N: int, args, fd_orders: list, n_print) -> dict:
+def run_single_N(N: int, args, fd_orders: list, n_print, ritz_h: str = 'consistent') -> dict:
     """Run the full explosion comparison for one value of N.
 
     Returns a dict suitable for embedding in the sweep JSON.
     n_print: int or None (None → keep all Ritz evals).
+    ritz_h:  'fft'        — always use H_FFT for Rayleigh-Ritz
+             'fd'         — use H_FD for FD methods, H_FFT for FFT method
+             'consistent' — same as 'fd' (each method uses its own H)
     max_ritz passed to run_explosion ensures at least n_print evals are computed.
     """
     max_ritz = n_print if n_print else 0
@@ -263,7 +272,9 @@ def run_single_N(N: int, args, fd_orders: list, n_print) -> dict:
                 for _ in range(args.n_random)]
     psi_list = [p / np.sqrt(float(np.sum(p**2) * d**3)) for p in psi_list]
 
-    def H_matvec(v):
+    # H_FFT matvec (always exact kinetic energy, used for reference eigsh and
+    # optionally for Ritz when ritz_h='fft')
+    def H_matvec_fft(v):
         return apply_H_fft(v, V_num, T_k_exact)
 
     method_results = []
@@ -273,7 +284,7 @@ def run_single_N(N: int, args, fd_orders: list, n_print) -> dict:
         return apply_chebyshev_fft(psi, V_num, T_k_filt, m, E_lo, E_hi)
 
     res = run_explosion(
-        psi_list, V_num, H_matvec, cheb_fft,
+        psi_list, V_num, H_matvec_fft, cheb_fft,
         T_k_exact, d, args.cheb_m, args.E_lo, args.E_hi,
         args.n_levels, args.svd_tol, label='fft', max_ritz=max_ritz,
     )
@@ -289,8 +300,15 @@ def run_single_N(N: int, args, fd_orders: list, n_print) -> dict:
         def cheb_fd(psi, m, E_lo, E_hi, _s=stencil, _id2=inv_d2):
             return apply_chebyshev_fd(psi, V_num, _s, _id2, m, E_lo, E_hi)
 
+        # Choose which H to use for Rayleigh-Ritz
+        if ritz_h == 'fft':
+            H_ritz = H_matvec_fft
+        else:   # 'fd' or 'consistent': use this method's own H
+            def H_ritz(v, _s=stencil, _id2=inv_d2, _N=N):
+                return apply_H_fd(v.reshape(_N, _N, _N), V_num, _s, _id2).ravel()
+
         res = run_explosion(
-            psi_list, V_num, H_matvec, cheb_fd,
+            psi_list, V_num, H_ritz, cheb_fd,
             T_k_exact, d, args.cheb_m, args.E_lo, args.E_hi,
             args.n_levels, args.svd_tol, label=label, max_ritz=max_ritz,
         )
@@ -406,6 +424,12 @@ def main():
                          '0 = all  [default 0]')
     ap.add_argument('--svd_tol',   type=float, default=1e-4,
                     help='SVD truncation threshold for Ritz  [default 1e-4]')
+    ap.add_argument('--ritz_h',   choices=['fft', 'fd', 'consistent'],
+                    default='consistent',
+                    help='Which H to use for Rayleigh-Ritz extraction. '
+                         '"fft" = always H_FFT (exact kinetic energy); '
+                         '"fd"/"consistent" = each FD method uses its own H_FD '
+                         '(measures true discretisation error).  [default consistent]')
     ap.add_argument('--out_json',  type=str,   default='fd_fft_explosion.json',
                     help='Output JSON path  [default fd_fft_explosion.json]')
     args = ap.parse_args()
@@ -453,7 +477,7 @@ def main():
     # ── run ───────────────────────────────────────────────────────────────────
     sweep_results = []
     for N in N_list:
-        result = run_single_N(N, args, fd_orders, n_print)
+        result = run_single_N(N, args, fd_orders, n_print, ritz_h=args.ritz_h)
         sweep_results.append(result)
 
     t_wall = time.perf_counter() - t_wall_start
@@ -500,6 +524,7 @@ def main():
             'seed'       : args.seed,
             'fd_orders'  : fd_orders,
             'n_print'    : args.n_print,
+            'ritz_h'     : args.ritz_h,
         },
         'sweep'         : sweep_results,
         'wall_total_s'  : t_wall,
