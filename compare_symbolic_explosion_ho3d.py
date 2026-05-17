@@ -403,7 +403,7 @@ def julia_eval_Hn_filter(jl_path: Path, x1d: np.ndarray,
         kb.ravel().tofile(str(kvals_bin))
 
         coeff_args = [repr(float(c)) for c in coeffs]
-        cmd = ([julia_exe, str(jl_path),
+        cmd = ([julia_exe, '-t', 'auto', str(jl_path),
                 str(grid_bin), str(kvals_bin), str(out_bin),
                 str(N**3), str(n_waves)]
                + coeff_args)
@@ -465,7 +465,7 @@ def julia_eval_filter(jl_path: Path, x1d: np.ndarray, k_vals: np.ndarray,
         kb = np.column_stack([k_vals, b_vals.reshape(-1, 1)]).astype('<f8')
         kb.ravel().tofile(str(kvals_bin))
 
-        cmd = [julia_exe, str(jl_path),
+        cmd = [julia_exe, '-t', 'auto', str(jl_path),
                str(grid_bin), str(kvals_bin), str(out_bin),
                str(N**3), str(n_waves)]
         t_wall0 = time.perf_counter()
