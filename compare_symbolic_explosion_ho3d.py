@@ -66,6 +66,9 @@ from symbolic_code.chebyshev_filter import (
 from symbolic_code.julia_codegen import (
     build_julia_batch_script,
     build_julia_combined_filter_script,
+    build_julia_Hn_snippet,
+    Hn_snippet_group_counts,
+    build_julia_combined_from_snippets,
 )
 from filter_core import svd_rayleigh_ritz_op
 
@@ -196,11 +199,12 @@ def ensure_julia_script(cache_dir: Path, m: int, E_lo: float, E_hi: float) -> Pa
 # ── H^n-per-order Julia script (fast, E_lo/E_hi-independent) ─────────────────
 
 def ensure_Hn_horner_cache(cache_dir: Path, n: int) -> tuple:
-    """Load or compute the Horner-reduced groups for H^n·ψ.
+    """Load or compute Horner-reduced groups for H^n·ψ, cached as pkl.
 
-    Saves result to ``H_power_{n}_horner.pkl`` so the expensive
-    group_by_exp_combined + apply_horner step runs only once per H^n,
-    independent of m or (E_lo, E_hi).
+    Saves to ``H_power_{n}_horner.pkl`` so the expensive
+    group_by_exp_combined + apply_horner step runs only once per H^n.
+    Used internally by :func:`ensure_Hn_julia_snippet` and
+    :func:`count_filter_ops`.
 
     Returns
     -------
@@ -212,12 +216,10 @@ def ensure_Hn_horner_cache(cache_dir: Path, n: int) -> tuple:
             return pickle.load(fh)
 
     if n == 0:
-        # H^0·psi = sin(θ): Ps_coefficient = 1, Pc_coefficient = 0
         terms_cos_n = []
         terms_sin_n = apply_horner(group_by_exp_combined(sp.Integer(1)))
     else:
-        pkl_path = cache_dir / f'H_power_{n}.pkl'
-        with open(pkl_path, 'rb') as fh:
+        with open(cache_dir / f'H_power_{n}.pkl', 'rb') as fh:
             data = pickle.load(fh)
         terms_cos_n = apply_horner(group_by_exp_combined(data['Pc']))
         terms_sin_n = apply_horner(group_by_exp_combined(data['Ps']))
@@ -227,20 +229,43 @@ def ensure_Hn_horner_cache(cache_dir: Path, n: int) -> tuple:
     return terms_cos_n, terms_sin_n
 
 
-def ensure_julia_Hn_script(cache_dir: Path, m: int) -> Path:
-    """Build and cache ``julia_Hn_m{m}.jl``.
+def ensure_Hn_julia_snippet(cache_dir: Path, n: int) -> Path:
+    """Build and cache ``H_power_{n}.jl`` — Julia inline functions for H^n·ψ.
 
-    Per-H^n Horner results are cached individually as
-    ``H_power_{n}_horner.pkl``, so the expensive group_by_exp + horner
-    step runs only once per order.  Assembling the combined ``.jl`` from
-    pre-cached Horner terms takes a few seconds regardless of m.
+    This is the primary per-H^n cache that users see.  The file contains
+    ``@inline`` function definitions for the cos and sin envelopes of
+    H^n·ψ, plus a metadata header with group counts so the combined
+    script can be assembled without re-reading sympy expressions.
+
+    Internally uses :func:`ensure_Hn_horner_cache` (also cached as pkl).
+
+    Returns
+    -------
+    Path  path to ``H_power_{n}.jl``
+    """
+    jl_path = cache_dir / f'H_power_{n}.jl'
+    if jl_path.exists():
+        return jl_path
+
+    terms_cos_n, terms_sin_n = ensure_Hn_horner_cache(cache_dir, n)
+    snippet = build_julia_Hn_snippet(n, terms_cos_n, terms_sin_n)
+    jl_path.write_text(snippet, encoding='utf-8')
+    return jl_path
+
+
+def ensure_julia_Hn_script(cache_dir: Path, m: int) -> Path:
+    """Build and cache ``julia_Hn_m{m}.jl`` from per-H^n Julia snippets.
+
+    Each ``H_power_{n}.jl`` is built once (and cached) via
+    :func:`ensure_Hn_julia_snippet`.  The combined script is then
+    assembled by concatenating the snippets and adding ``eval_one_wave!``
+    and ``main()``.  This whole step takes seconds regardless of m once
+    all snippets are cached.
 
     The same ``.jl`` is reused for any (E_lo, E_hi) — only the
-    Chebyshev coefficients change and are passed as CLI arguments.
+    Chebyshev coefficients change and are passed as CLI arguments::
 
-    Call convention of the generated script::
-
-        julia julia_Hn_m{m}.jl grid.bin kvals.bin out.bin N n_waves c0 c1 … cm
+        julia julia_Hn_m{m}.jl grid.bin kvals.bin out.bin N n_waves c0 … cm
 
     Parameters
     ----------
@@ -249,34 +274,33 @@ def ensure_julia_Hn_script(cache_dir: Path, m: int) -> Path:
 
     Returns
     -------
-    Path  path to the cached .jl file
+    Path  path to the cached combined .jl file
     """
     jl_path = cache_dir / f'julia_Hn_m{m}.jl'
+    snippet_paths = [cache_dir / f'H_power_{n}.jl' for n in range(m + 1)]
 
-    # Check whether all H^n Horner caches are already present
-    horner_files = [cache_dir / f'H_power_{n}_horner.pkl' for n in range(m + 1)]
-    all_horner_cached = all(p.exists() for p in horner_files)
-
-    if jl_path.exists() and all_horner_cached:
+    if jl_path.exists() and all(p.exists() for p in snippet_paths):
         print(f"  Julia Hn script cache hit → {jl_path.name}")
         return jl_path
 
-    print(f"  Building julia_Hn_m{m}.jl (per-order Horner cache + assembly) ...")
-    Hn_terms_list = []
+    print(f"  Building julia_Hn_m{m}.jl from H_power_n.jl snippets ...")
+    snippets = []
     for n in range(m + 1):
         t0 = time.perf_counter()
-        cached = horner_files[n].exists()
-        terms_cos_n, terms_sin_n = ensure_Hn_horner_cache(cache_dir, n)
+        already = snippet_paths[n].exists()
+        snip_path = ensure_Hn_julia_snippet(cache_dir, n)
+        snippet_str = snip_path.read_text(encoding='utf-8')
+        n_cos, n_sin = Hn_snippet_group_counts(snippet_str)
         elapsed = time.perf_counter() - t0
-        tag = 'loaded' if cached else 'computed+saved'
-        print(f"    H^{n}: {len(terms_cos_n)} cos groups, "
-              f"{len(terms_sin_n)} sin groups  ({elapsed:.2f}s, {tag})")
-        Hn_terms_list.append((terms_cos_n, terms_sin_n))
+        tag = 'loaded' if already else 'computed+saved'
+        print(f"    H^{n}: {n_cos} cos groups, {n_sin} sin groups  "
+              f"({elapsed:.2f}s, {tag})")
+        snippets.append((n, n_cos, n_sin, snippet_str))
 
     t0 = time.perf_counter()
-    jl_src = build_julia_combined_filter_script(Hn_terms_list)
+    jl_src = build_julia_combined_from_snippets(snippets, m)
     jl_path.write_text(jl_src, encoding='utf-8')
-    print(f"  Julia source assembled in {time.perf_counter()-t0:.2f}s "
+    print(f"  Combined script assembled in {time.perf_counter()-t0:.2f}s "
           f"→ {jl_path.name}")
     return jl_path
 

@@ -32,7 +32,6 @@ Usage
 
 import argparse
 import json
-import pickle
 import sys
 import time
 from datetime import datetime
@@ -48,19 +47,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Reuse pipeline functions from the existing symbolic script
 from compare_symbolic_explosion_ho3d import (
     ensure_H_powers_cache,
-    ensure_julia_Hn_script,        # new: H^n-per-order cache, E_lo/E_hi-free
-    julia_eval_Hn_filter,          # new: passes coefficients as CLI args
+    ensure_Hn_horner_cache,         # per-H^n Horner cache (avoids re-computing)
+    ensure_julia_Hn_script,
+    julia_eval_Hn_filter,
     ho3d_exact_levels,
     make_grid,
     make_T_k,
     apply_H_fft,
     parse_N_sweep,
 )
-from symbolic_code.chebyshev_filter import (
-    chebyshev_coeffs_transformed,
-    group_by_exp_combined,
-    apply_horner,
-)
+from symbolic_code.chebyshev_filter import chebyshev_coeffs_transformed
 from filter_core import svd_rayleigh_ritz_op
 
 
@@ -116,15 +112,13 @@ def count_filter_ops(cache_dir: Path, m: int, coeffs: list) -> dict:
                                'ADD': 1, 'MUL': 1, 'POW': 0})
             continue
 
-        pkl_path = cache_dir / f'H_power_{n}.pkl'
-        data = pickle.load(open(pkl_path, 'rb'))
+        # Use the per-H^n Horner cache (computed once, never re-run for large n)
+        terms_cos_n, terms_sin_n = ensure_Hn_horner_cache(cache_dir, n)
 
-        for key in ('Ps', 'Pc'):
-            expr = data[key]
-            if expr == 0 or expr is sp.Integer(0) or expr == sp.Integer(0):
+        for key, groups in (('Pc', terms_cos_n), ('Ps', terms_sin_n)):
+            if not groups:
                 continue
 
-            groups = apply_horner(group_by_exp_combined(expr))
             row_add = row_mul = row_pow = 0
 
             for ep, pp in groups:
