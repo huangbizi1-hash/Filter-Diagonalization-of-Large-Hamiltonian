@@ -47,9 +47,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Reuse pipeline functions from the existing symbolic script
 from compare_symbolic_explosion_ho3d import (
     ensure_H_powers_cache,
-    ensure_Hn_horner_cache,         # per-H^n Horner cache (avoids re-computing)
-    ensure_julia_Hn_script,
-    julia_eval_Hn_filter,
+    ensure_Hn_horner_cache,
+    ensure_julia_Hn_script,         # flexible runtime-c script (for reference)
+    ensure_julia_filter_script,     # fast baked-c script (default)
+    julia_eval_filter,              # calls baked-c script (no c args)
+    julia_eval_Hn_filter,           # calls runtime-c script
     ho3d_exact_levels,
     make_grid,
     make_T_k,
@@ -287,8 +289,8 @@ def run_one_N(
     print(f"  [symbolic] Julia ({n_random} waves) ...", flush=True)
     t_julia0 = time.perf_counter()
     try:
-        C_f_sym, julia_timing = julia_eval_Hn_filter(
-            jl_path, x1d, k_vals, b_vals, coeffs, julia_exe)
+        C_f_sym, julia_timing = julia_eval_filter(
+            jl_path, x1d, k_vals, b_vals, julia_exe)
         t_julia = time.perf_counter() - t_julia0
         ws = julia_timing.get('warmup_s')
         es = julia_timing.get('eval_s')
@@ -479,12 +481,14 @@ def main():
               f"sym/FFT = {ratio:.2f}x")
     print()
 
-    # ── Step 3: Julia H^n script (E_lo/E_hi-independent) ─────────────────────
-    # Uses the new per-order pipeline: group_by_exp + horner applied to each
-    # H^n separately, coefficients passed as CLI args.  No expensive symbolic
-    # assembly of the full Σ c_n H^n·ψ.
-    print("── Step 3: Julia H^n filter script ──")
-    jl_path = ensure_julia_Hn_script(cache_dir, args.cheb_m)
+    # ── Step 3: Julia filter script (baked c_n, assembled from H_power_n.jl) ──
+    # H_power_{n}.jl snippets are computed once per order (expensive for large n)
+    # and then assembled with baked-in c_n constants in seconds.  Julia LLVM
+    # folds the known coefficients and generates a single optimised polynomial,
+    # giving 10-100× faster eval than passing c_n at runtime.
+    print("── Step 3: Julia filter script (baked c_n) ──")
+    jl_path = ensure_julia_filter_script(
+        cache_dir, args.cheb_m, coeffs, args.E_lo, args.E_hi)
     print()
 
     # ── exact HO levels ───────────────────────────────────────────────────────

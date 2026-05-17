@@ -69,6 +69,7 @@ from symbolic_code.julia_codegen import (
     build_julia_Hn_snippet,
     Hn_snippet_group_counts,
     build_julia_combined_from_snippets,
+    build_julia_filter_from_snippets,
 )
 from filter_core import svd_rayleigh_ritz_op
 
@@ -302,6 +303,62 @@ def ensure_julia_Hn_script(cache_dir: Path, m: int) -> Path:
     jl_path.write_text(jl_src, encoding='utf-8')
     print(f"  Combined script assembled in {time.perf_counter()-t0:.2f}s "
           f"→ {jl_path.name}")
+    return jl_path
+
+
+def ensure_julia_filter_script(cache_dir: Path, m: int,
+                                coeffs: list,
+                                E_lo: float, E_hi: float) -> Path:
+    """Assemble a fast Julia filter script with c_n baked in as constants.
+
+    Reads ``H_power_{n}.jl`` snippets (computed once, regardless of E_lo/E_hi)
+    and inserts the specific Chebyshev coefficients directly into the
+    ``eval_one_wave!`` body.  Julia's LLVM then sees known Float64 literals
+    and can fold them into a single optimised polynomial — giving 10-100×
+    faster evaluation than passing c_n at runtime.
+
+    Assembly from snippets takes seconds even for m=10.  The result is
+    cached as ``julia_filter_m{m}_{a_key}_{b_key}.jl`` so subsequent runs
+    with the same (E_lo, E_hi) are instant.
+
+    Call convention of the generated script (no c args)::
+
+        julia julia_filter_m{m}_*.jl grid.bin kvals.bin out.bin N n_waves
+
+    Parameters
+    ----------
+    cache_dir : Path
+    m : int
+    coeffs : list of float   [c_0, c_1, …, c_m]
+    E_lo, E_hi : float
+
+    Returns
+    -------
+    Path  path to the cached .jl file
+    """
+    a    =  2.0 / (E_hi - E_lo)
+    b_sc = -(E_hi + E_lo) / (E_hi - E_lo)
+
+    def _key(v):
+        return f'{v:.10g}'.replace('.', 'p').replace('-', 'm').replace('+', '')
+
+    jl_path = cache_dir / f'julia_filter_m{m}_a{_key(a)}_b{_key(b_sc)}.jl'
+    if jl_path.exists():
+        print(f"  Filter script cache hit → {jl_path.name}")
+        return jl_path
+
+    print(f"  Assembling julia_filter_m{m}_*.jl (baked c_n, from H_power_n.jl) ...")
+    snippets = []
+    for n in range(m + 1):
+        snip_path = ensure_Hn_julia_snippet(cache_dir, n)
+        snippet_str = snip_path.read_text(encoding='utf-8')
+        n_cos, n_sin = Hn_snippet_group_counts(snippet_str)
+        snippets.append((n, n_cos, n_sin, snippet_str))
+
+    t0 = time.perf_counter()
+    jl_src = build_julia_filter_from_snippets(snippets, m, coeffs)
+    jl_path.write_text(jl_src, encoding='utf-8')
+    print(f"  Assembled in {time.perf_counter()-t0:.2f}s → {jl_path.name}")
     return jl_path
 
 
