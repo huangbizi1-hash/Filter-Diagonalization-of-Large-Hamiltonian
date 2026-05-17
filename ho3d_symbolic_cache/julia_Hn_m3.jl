@@ -79,7 +79,7 @@ function eval_one_wave!(out::AbstractVector{Float64},
 end
 
 function main()
-    length(ARGS) == 10 || error(
+    length(ARGS) == 9 || error(
         "Usage: julia script.jl grid.bin kvals.bin out.bin N n_waves c0…c3")
     grid_file  = ARGS[1]
     kvals_file = ARGS[2]

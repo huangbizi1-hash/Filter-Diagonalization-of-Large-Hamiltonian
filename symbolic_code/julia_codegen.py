@@ -531,7 +531,7 @@ def build_julia_combined_filter_script(Hn_terms_list: list) -> str:
 
     # ── main ──────────────────────────────────────────────────────────────────
     L += ['function main()',
-          f'    length(ARGS) == {m + 7} || error(',
+          f'    length(ARGS) == {m + 6} || error(',
           f'        "Usage: julia script.jl grid.bin kvals.bin out.bin'
           f' N n_waves c0…c{m}")',
           '    grid_file  = ARGS[1]',
