@@ -32,12 +32,14 @@ Usage
 
 import argparse
 import json
+import pickle
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+import sympy as sp
 from scipy.sparse.linalg import eigsh, LinearOperator
 
 # ── project imports ────────────────────────────────────────────────────────────
@@ -54,8 +56,156 @@ from compare_symbolic_explosion_ho3d import (
     apply_H_fft,
     parse_N_sweep,
 )
-from symbolic_code.chebyshev_filter import chebyshev_coeffs_transformed
+from symbolic_code.chebyshev_filter import (
+    chebyshev_coeffs_transformed,
+    group_by_exp_combined,
+    apply_horner,
+)
 from filter_core import svd_rayleigh_ritz_op
+
+
+# ── FLOP counter ──────────────────────────────────────────────────────────────
+
+def _extract_ops(expr):
+    """Return (ADD, MUL, POW) from sp.count_ops(expr, visual=True)."""
+    ADD = sp.Symbol('ADD')
+    MUL = sp.Symbol('MUL')
+    POW = sp.Symbol('POW')
+    ops = sp.count_ops(expr, visual=True)
+    if ops == 0 or not hasattr(ops, 'coeff'):
+        return 0, 0, 0
+    return (int(ops.coeff(ADD)), int(ops.coeff(MUL)), int(ops.coeff(POW)))
+
+
+def count_filter_ops(cache_dir: Path, m: int, coeffs: list) -> dict:
+    """Count symbolic arithmetic ops in f(H)*psi = Σ_n c_n H^n psi.
+
+    Counts ADD, MUL, POW per grid point per wave, after group_by_exp +
+    apply_horner reduction.  POW(x,k) is left as-is in the POW tally;
+    a separate 'effective_MUL' column treats each POW(x,k) as k-1 MULs.
+
+    Overhead modelled
+    -----------------
+    Per group    : 1 MUL (exp_part × poly_part)
+    Per (n, key) : 1 MUL (c_n × envelope), 1 ADD (accumulate into total)
+    Final        : 2 MUL (Ps×sin θ, Pc×cos θ)  +  1 ADD  +  2 trig calls
+
+    Returns
+    -------
+    dict with keys:
+        per_point   : {ADD, MUL, POW, total, effective_total}  per grid point per wave
+        breakdown   : list of {n, key, n_groups, ADD, MUL, POW}
+        n_nonzero   : number of (n,key) pairs with non-zero ops
+    """
+    total_add = 0
+    total_mul = 0
+    total_pow = 0
+    total_pow_deg_sum = 0   # sum of all exponents (for effective MUL count)
+    breakdown = []
+
+    for n in range(m + 1):
+        c_n = float(coeffs[n])
+        if c_n == 0:
+            continue
+
+        if n == 0:
+            # H^0 * psi = sin(θ):  just one scalar multiply (c_0 × sin θ)
+            total_mul += 1
+            total_add += 1  # accumulate into Ps_total
+            breakdown.append({'n': 0, 'key': 'Ps', 'n_groups': 0,
+                               'ADD': 1, 'MUL': 1, 'POW': 0})
+            continue
+
+        pkl_path = cache_dir / f'H_power_{n}.pkl'
+        data = pickle.load(open(pkl_path, 'rb'))
+
+        for key in ('Ps', 'Pc'):
+            expr = data[key]
+            if expr == 0 or expr is sp.Integer(0) or expr == sp.Integer(0):
+                continue
+
+            groups = apply_horner(group_by_exp_combined(expr))
+            row_add = row_mul = row_pow = 0
+
+            for ep, pp in groups:
+                a, m_, p = _extract_ops(pp)
+                row_add += a;  row_mul += m_;  row_pow += p
+
+                ae, me, pe = _extract_ops(ep)
+                row_add += ae; row_mul += me;  row_pow += pe
+
+                # estimate effective MUL from POW in polynomial part
+                for factor in sp.Mul.make_args(pp):
+                    if factor.is_Pow:
+                        deg = int(factor.exp) if factor.exp.is_Integer else 1
+                        total_pow_deg_sum += max(0, deg - 1) - 1  # subtract counted POW
+                for factor in sp.Mul.make_args(ep):
+                    if factor.is_Pow:
+                        deg = int(factor.exp) if factor.exp.is_Integer else 1
+                        total_pow_deg_sum += max(0, deg - 1) - 1
+
+                row_mul += 1  # ep × pp
+
+            row_mul += 1   # c_n × envelope-sum
+            row_add += 1   # accumulate into Ps_total / Pc_total
+
+            total_add += row_add
+            total_mul += row_mul
+            total_pow += row_pow
+            breakdown.append({'n': n, 'key': key, 'n_groups': len(groups),
+                               'ADD': row_add, 'MUL': row_mul, 'POW': row_pow})
+
+    # Final assembly: Ps_total*sin(θ) + Pc_total*cos(θ)
+    total_mul += 2
+    total_add += 1
+    # + 2 trig evaluations (not counted as integer FLOPs here, noted separately)
+
+    total = total_add + total_mul + total_pow
+    # effective total: treat each POW(x,k) as k-1 MULs instead of 1 POW
+    eff_mul = total_mul + total_pow + total_pow_deg_sum
+    eff_total = total_add + eff_mul
+
+    return {
+        'per_point': {
+            'ADD': total_add,
+            'MUL': total_mul,
+            'POW': total_pow,
+            'total': total,
+            'effective_MUL': eff_mul,
+            'effective_total': eff_total,
+        },
+        'breakdown': breakdown,
+        'n_nonzero': len(breakdown),
+        'note': '+2 trig (sin/cos) per point not included in totals',
+    }
+
+
+def fft_flop_estimate(m: int, N: int) -> dict:
+    """Estimate FLOPs for one wave via FFT Chebyshev recurrence T_m(aH+b).
+
+    Model per H_FFT application:
+        forward FFT (real): 2.5 N³ log2(N³) ≈ 7.5 N³ log2(N)
+        backward FFT:       7.5 N³ log2(N)
+        element-wise ops:   4 N³  (mult + add for T_k and V)
+    One Hs(φ) = a*H*φ + b_sc*φ: 1 H_FFT + 3 N³ (scale + shift)
+    T_m recurrence: m Hs calls + (m-1)×3 N³ (2y_curr - y_prev)
+
+    Returns dict with 'flops_per_wave' and 'flops_per_wave_per_point'.
+    """
+    N3 = N ** 3
+    log2N = np.log2(N)
+    flops_fft = 2 * 7.5 * N3 * log2N   # one H_FFT: fwd + bwd
+    flops_fft += 4 * N3                  # elementwise mult+add
+    flops_Hs  = flops_fft + 3 * N3      # Hs = aH + b_sc*I
+    # Total recurrence:  m Hs  +  (m-1) * (2*Hs + 3N³ for "2*y-prev")
+    # Simplified: m Hs + (m-1)*3N³
+    flops_total = m * flops_Hs + max(0, m - 1) * 3 * N3
+    return {
+        'N': N,
+        'm': m,
+        'flops_per_wave': float(flops_total),
+        'flops_per_wave_per_point': float(flops_total / N3),
+    }
 
 
 # ── Chebyshev 3-term recurrence (FFT path) ────────────────────────────────────
@@ -300,6 +450,41 @@ def main():
         print(f"    c_{n} = {float(c):.10g}")
     print()
 
+    # ── Step 2.5: FLOP analysis ────────────────────────────────────────────────
+    print("── Step 2.5: Symbolic FLOP count ──")
+    t0 = time.perf_counter()
+    ops_info = count_filter_ops(cache_dir, args.cheb_m, coeffs)
+    t_ops = time.perf_counter() - t0
+    pp = ops_info['per_point']
+    print(f"  Per grid point per wave (after group_by_exp + Horner):")
+    print(f"    ADD = {pp['ADD']:>6d}")
+    print(f"    MUL = {pp['MUL']:>6d}  (symbolic MUL, excl. POW)")
+    print(f"    POW = {pp['POW']:>6d}  (each POW(x,k) counted as 1 op)")
+    print(f"    eff_MUL = {pp['effective_MUL']:>6d}  (POW(x,k) → k-1 MULs)")
+    print(f"    total (raw)       = {pp['total']:>6d}  ops/point/wave")
+    print(f"    total (effective) = {pp['effective_total']:>6d}  ops/point/wave")
+    print(f"    (+2 trig sin/cos not included)")
+    print(f"  Breakdown by (n, key):")
+    for row in ops_info['breakdown']:
+        sub = row['ADD'] + row['MUL'] + row['POW']
+        print(f"    H^{row['n']:>2d}.{row['key']}: "
+              f"{row['n_groups']} group(s)  "
+              f"ADD={row['ADD']:>4d}  MUL={row['MUL']:>4d}  POW={row['POW']:>4d}  "
+              f"subtotal={sub:>4d}")
+    print(f"  (counted in {t_ops:.2f}s)")
+    print()
+    print("  FFT Chebyshev recurrence FLOP estimates (per wave):")
+    for N_ex in [10, 14, 20]:
+        fe = fft_flop_estimate(args.cheb_m, N_ex)
+        sym_total_wave = pp['effective_total'] * N_ex**3
+        ratio = sym_total_wave / fe['flops_per_wave'] if fe['flops_per_wave'] > 0 else float('nan')
+        print(f"    N={N_ex:>2d}:  FFT ~{fe['flops_per_wave']:.2e} FLOPs/wave "
+              f"({fe['flops_per_wave_per_point']:.1f}/pt)  |  "
+              f"sym ~{sym_total_wave:.2e} FLOPs/wave "
+              f"({pp['effective_total']}/pt)  |  "
+              f"sym/FFT = {ratio:.2f}x")
+    print()
+
     # ── Step 3: Julia H^n script (E_lo/E_hi-independent) ─────────────────────
     # Uses the new per-order pipeline: group_by_exp + horner applied to each
     # H^n separately, coefficients passed as CLI args.  No expensive symbolic
@@ -343,6 +528,12 @@ def main():
     output = {
         "script":   "compare_symbolic_fft_ho3d.py",
         "datetime": datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "flop_analysis": {
+            "per_point": ops_info['per_point'],
+            "breakdown": ops_info['breakdown'],
+            "note":      ops_info['note'],
+            "fft_estimates": [fft_flop_estimate(args.cheb_m, N) for N in N_list],
+        },
         "params": {
             "N_list":    N_list,
             "box_L":     args.box_L,
