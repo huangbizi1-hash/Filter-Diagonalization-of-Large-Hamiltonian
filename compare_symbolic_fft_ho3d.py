@@ -48,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from compare_symbolic_explosion_ho3d import (
     ensure_H_powers_cache,
     ensure_Hn_horner_cache,
+    ensure_julia_script,                 # original fast monolithic pipeline
     ensure_julia_Hn_script,              # flexible runtime-c script (for reference)
     ensure_julia_filter_script,          # snippet-based baked-c script
     ensure_julia_cse_filter_script,      # CSE-based baked-c script (fast, default)
@@ -419,6 +420,13 @@ def main():
     ap.add_argument('--cache_dir', type=str,   default='ho3d_symbolic_cache')
     ap.add_argument('--julia_exe', type=str,   default='julia')
     ap.add_argument('--out_json',  type=str,   default='symbolic_fft_ho3d.json')
+    ap.add_argument('--original_fast_mode', type=lambda s: s.lower() != 'false',
+                    default=False, metavar='BOOL',
+                    help='Use original monolithic pipeline (apply_f_of_H + '
+                         'group_by_exp + Horner + build_julia_batch_script) '
+                         'instead of the CSE-based approach. '
+                         'Slower to build but produces the most compact Julia '
+                         'expression. Default: False.')
     args = ap.parse_args()
 
     N_list    = parse_N_sweep(args.N_sweep)
@@ -432,6 +440,8 @@ def main():
     print(f"cheb_m={args.cheb_m}  E_lo={args.E_lo}  E_hi={args.E_hi}")
     print(f"a={a:.8f}  b_sc={b_sc:.8f}")
     print(f"n_random={args.n_random}  seed={args.seed}  svd_tol={args.svd_tol}")
+    mode_str = "original_fast (monolithic)" if args.original_fast_mode else "CSE (sp.cse on Σ c_n H^n)"
+    print(f"julia_mode={mode_str}")
     print()
 
     # ── Step 1: H^n pkl ───────────────────────────────────────────────────────
@@ -482,14 +492,22 @@ def main():
               f"sym/FFT = {ratio:.2f}x")
     print()
 
-    # ── Step 3: Julia filter script (CSE, baked c_n) ─────────────────────────
-    # Loads raw H_power_{n}.pkl, forms Σ c_n H^n without expanding, applies
-    # sp.cse() to extract shared subexpressions, then generates Julia with a
-    # single combined expression per grid point + @inbounds @simd + Threads.
-    # This recovers the ~0.04 s/wave speed of the original monolithic pipeline.
-    print("── Step 3: Julia CSE filter script (baked c_n, sp.cse on Σ c_n H^n) ──")
-    jl_path = ensure_julia_cse_filter_script(
-        cache_dir, args.cheb_m, coeffs, args.E_lo, args.E_hi)
+    # ── Step 3: Julia filter script ───────────────────────────────────────────
+    if args.original_fast_mode:
+        # Original monolithic pipeline: assembles Σ c_n H^n as one sympy expr,
+        # applies group_by_exp_combined + apply_horner, then build_julia_batch_script.
+        # Slow to build for large m (can take minutes) but has precompute_exp!
+        # and all optimisations from the original Julia notebook.
+        print("── Step 3: Julia filter script (original fast mode) ──")
+        jl_path = ensure_julia_script(
+            cache_dir, args.cheb_m, args.E_lo, args.E_hi)
+    else:
+        # CSE pipeline: loads raw H_power_{n}.pkl, forms Σ c_n H^n without
+        # expand(), applies sp.cse() to extract shared subexpressions, generates
+        # Julia with @inbounds @simd + Threads.@threads.
+        print("── Step 3: Julia CSE filter script (baked c_n, sp.cse on Σ c_n H^n) ──")
+        jl_path = ensure_julia_cse_filter_script(
+            cache_dir, args.cheb_m, coeffs, args.E_lo, args.E_hi)
     print()
 
     # ── exact HO levels ───────────────────────────────────────────────────────
