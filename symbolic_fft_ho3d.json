@@ -1,0 +1,91 @@
+{
+  "script": "compare_symbolic_fft_ho3d.py",
+  "datetime": "20260517_093313",
+  "flop_analysis": {
+    "per_point": {
+      "ADD": 91,
+      "MUL": 162,
+      "POW": 122,
+      "total": 375,
+      "effective_MUL": 284,
+      "effective_total": 375
+    },
+    "breakdown": [
+      {
+        "n": 0,
+        "key": "Ps",
+        "n_groups": 0,
+        "ADD": 1,
+        "MUL": 1,
+        "POW": 0
+      },
+      {
+        "n": 1,
+        "key": "Ps",
+        "n_groups": 1,
+        "ADD": 6,
+        "MUL": 8,
+        "POW": 6
+      },
+      {
+        "n": 2,
+        "key": "Ps",
+        "n_groups": 1,
+        "ADD": 21,
+        "MUL": 28,
+        "POW": 26
+      },
+      {
+        "n": 2,
+        "key": "Pc",
+        "n_groups": 1,
+        "ADD": 1,
+        "MUL": 5,
+        "POW": 0
+      },
+      {
+        "n": 3,
+        "key": "Ps",
+        "n_groups": 1,
+        "ADD": 56,
+        "MUL": 79,
+        "POW": 77
+      },
+      {
+        "n": 3,
+        "key": "Pc",
+        "n_groups": 1,
+        "ADD": 5,
+        "MUL": 39,
+        "POW": 13
+      }
+    ],
+    "note": "+2 trig (sin/cos) per point not included in totals",
+    "fft_estimates": []
+  },
+  "params": {
+    "N_list": [],
+    "box_L": 5.0,
+    "cheb_m": 3,
+    "E_lo": -3.0,
+    "E_hi": 20.0,
+    "a": 0.08695652173913043,
+    "b_sc": -0.7391304347826086,
+    "coeffs": [
+      0.6022026793786475,
+      0.30919700830114233,
+      -0.06706665570806279,
+      0.0026300649297279523
+    ],
+    "n_random": 10,
+    "n_print": 5,
+    "seed": 42,
+    "svd_tol": 0.0001,
+    "k_max_arg": 0.0,
+    "cache_dir": "/home/user/Filter-Diagonalization-of-Large-Hamiltonian/ho3d_symbolic_cache",
+    "julia_exe": "julia",
+    "jl_script": "/home/user/Filter-Diagonalization-of-Large-Hamiltonian/ho3d_symbolic_cache/julia_Hn_m3.jl"
+  },
+  "sweep": [],
+  "wall_total_s": 7.830000186004327e-07
+}
