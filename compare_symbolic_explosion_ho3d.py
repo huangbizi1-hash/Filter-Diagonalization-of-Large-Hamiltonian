@@ -42,6 +42,7 @@ Usage
 
 import argparse
 import json
+import pickle
 import subprocess
 import sys
 import tempfile
@@ -138,7 +139,6 @@ def ensure_H_powers_cache(cache_dir: Path, m: int, omega: float = 1.0):
         )
     else:
         # Extend from the highest cached power
-        import pickle
         max_cached = max(existing)
         start_from = max_cached
         with open(cache_dir / f'H_power_{start_from}.pkl', 'rb') as fh:
@@ -195,12 +195,48 @@ def ensure_julia_script(cache_dir: Path, m: int, E_lo: float, E_hi: float) -> Pa
 
 # ── H^n-per-order Julia script (fast, E_lo/E_hi-independent) ─────────────────
 
+def ensure_Hn_horner_cache(cache_dir: Path, n: int) -> tuple:
+    """Load or compute the Horner-reduced groups for H^n·ψ.
+
+    Saves result to ``H_power_{n}_horner.pkl`` so the expensive
+    group_by_exp_combined + apply_horner step runs only once per H^n,
+    independent of m or (E_lo, E_hi).
+
+    Returns
+    -------
+    (terms_cos_n, terms_sin_n)  lists of (exp_part, poly_horner) tuples
+    """
+    horner_path = cache_dir / f'H_power_{n}_horner.pkl'
+    if horner_path.exists():
+        with open(horner_path, 'rb') as fh:
+            return pickle.load(fh)
+
+    if n == 0:
+        # H^0·psi = sin(θ): Ps_coefficient = 1, Pc_coefficient = 0
+        terms_cos_n = []
+        terms_sin_n = apply_horner(group_by_exp_combined(sp.Integer(1)))
+    else:
+        pkl_path = cache_dir / f'H_power_{n}.pkl'
+        with open(pkl_path, 'rb') as fh:
+            data = pickle.load(fh)
+        terms_cos_n = apply_horner(group_by_exp_combined(data['Pc']))
+        terms_sin_n = apply_horner(group_by_exp_combined(data['Ps']))
+
+    with open(horner_path, 'wb') as fh:
+        pickle.dump((terms_cos_n, terms_sin_n), fh)
+    return terms_cos_n, terms_sin_n
+
+
 def ensure_julia_Hn_script(cache_dir: Path, m: int) -> Path:
     """Build and cache ``julia_Hn_m{m}.jl``.
 
-    Groups and Horner-reduces each H^n expression **separately** (fast),
-    then emits a combined Julia script where Chebyshev coefficients are
-    CLI arguments.  The same ``.jl`` is reused for any (E_lo, E_hi).
+    Per-H^n Horner results are cached individually as
+    ``H_power_{n}_horner.pkl``, so the expensive group_by_exp + horner
+    step runs only once per order.  Assembling the combined ``.jl`` from
+    pre-cached Horner terms takes a few seconds regardless of m.
+
+    The same ``.jl`` is reused for any (E_lo, E_hi) — only the
+    Chebyshev coefficients change and are passed as CLI arguments.
 
     Call convention of the generated script::
 
@@ -215,36 +251,32 @@ def ensure_julia_Hn_script(cache_dir: Path, m: int) -> Path:
     -------
     Path  path to the cached .jl file
     """
-    import pickle
-
     jl_path = cache_dir / f'julia_Hn_m{m}.jl'
-    if jl_path.exists():
+
+    # Check whether all H^n Horner caches are already present
+    horner_files = [cache_dir / f'H_power_{n}_horner.pkl' for n in range(m + 1)]
+    all_horner_cached = all(p.exists() for p in horner_files)
+
+    if jl_path.exists() and all_horner_cached:
         print(f"  Julia Hn script cache hit → {jl_path.name}")
         return jl_path
 
-    print(f"  Building julia_Hn_m{m}.jl (per-order grouping, m={m}) ...")
+    print(f"  Building julia_Hn_m{m}.jl (per-order Horner cache + assembly) ...")
     Hn_terms_list = []
     for n in range(m + 1):
         t0 = time.perf_counter()
-        if n == 0:
-            # H^0·psi = sin(theta): Ps=1, Pc=0
-            terms_cos_n = []
-            terms_sin_n = apply_horner(group_by_exp_combined(sp.Integer(1)))
-        else:
-            pkl_path = cache_dir / f'H_power_{n}.pkl'
-            with open(pkl_path, 'rb') as fh:
-                data = pickle.load(fh)
-            terms_cos_n = apply_horner(group_by_exp_combined(data['Pc']))
-            terms_sin_n = apply_horner(group_by_exp_combined(data['Ps']))
+        cached = horner_files[n].exists()
+        terms_cos_n, terms_sin_n = ensure_Hn_horner_cache(cache_dir, n)
         elapsed = time.perf_counter() - t0
+        tag = 'loaded' if cached else 'computed+saved'
         print(f"    H^{n}: {len(terms_cos_n)} cos groups, "
-              f"{len(terms_sin_n)} sin groups  ({elapsed:.2f}s)")
+              f"{len(terms_sin_n)} sin groups  ({elapsed:.2f}s, {tag})")
         Hn_terms_list.append((terms_cos_n, terms_sin_n))
 
     t0 = time.perf_counter()
     jl_src = build_julia_combined_filter_script(Hn_terms_list)
     jl_path.write_text(jl_src, encoding='utf-8')
-    print(f"  Julia source generated in {time.perf_counter()-t0:.2f}s "
+    print(f"  Julia source assembled in {time.perf_counter()-t0:.2f}s "
           f"→ {jl_path.name}")
     return jl_path
 
