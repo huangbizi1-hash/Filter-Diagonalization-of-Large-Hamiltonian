@@ -71,10 +71,12 @@ def load_H_powers(folder, n_max, file_type='sym.gz', prefix='H_scaled_power'):
     else:
         raise ValueError(f"Unsupported file_type: {file_type!r}")
 
+    def _n(p):
+        return int(p.name.replace('.sym.gz', '').replace('.pkl', '').split('_')[-1])
+
     results = {}
-    for fpath in sorted(folder.glob(pattern)):
-        stem = fpath.name.replace('.sym.gz', '').replace('.pkl', '')
-        n = int(stem.split('_')[-1])
+    for fpath in sorted(folder.glob(pattern), key=_n):
+        n = _n(fpath)
         if file_type == 'pkl':
             with open(fpath, 'rb') as fh:
                 data = pickle.load(fh)
