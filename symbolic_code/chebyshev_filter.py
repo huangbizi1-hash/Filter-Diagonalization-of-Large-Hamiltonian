@@ -74,8 +74,16 @@ def load_H_powers(folder, n_max, file_type='sym.gz', prefix='H_scaled_power'):
     def _n(p):
         return int(p.name.replace('.sym.gz', '').replace('.pkl', '').split('_')[-1])
 
+    def _is_plain(p):
+        """Return True only for files like H_power_3.pkl (not H_power_3_horner.pkl)."""
+        try:
+            _n(p)
+            return True
+        except ValueError:
+            return False
+
     results = {}
-    for fpath in sorted(folder.glob(pattern), key=_n):
+    for fpath in sorted(filter(_is_plain, folder.glob(pattern)), key=_n):
         n = _n(fpath)
         if file_type == 'pkl':
             with open(fpath, 'rb') as fh:
