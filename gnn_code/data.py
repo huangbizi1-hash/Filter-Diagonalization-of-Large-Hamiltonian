@@ -2,95 +2,81 @@
 data.py — 波函数生成
 
 提供三种波函数类型（高斯波包叠加 / 正弦波叠加 / 格点随机 ±1）及统一接口。
-所有函数返回 (psi_sparse, H_psi_target)：
-  psi_sparse   : 稀疏网格上的波函数值  (N_sparse, N_sparse, N_sparse)
-  H_psi_target : 精确 H|ψ⟩ 在稀疏网格上的值（用 FFT 精细网格计算后下采样）
+所有函数返回 (psi, H_psi_target)，均在单一网格（d=0.5）上，无下采样。
+GNN 输入已通过 generate_chain 归一化，保证训练稳定。
 """
 
 import numpy as np
 from .physics import (
-    X_f, Y_f, Z_f, L, fft_hamiltonian, d_fine,
+    X, Y, Z, L, fft_hamiltonian, d, N,
 )
 
 
 def gen_gaussian_wavefunction():
     """
-    3 个随机高斯波包叠加（fine grid），
-    返回 (psi_sparse, H_psi_target)。
+    3 个随机高斯波包叠加，返回 (psi, H_psi_target)。
     """
-    psi_fine = np.zeros_like(X_f, dtype=np.float64)
+    psi = np.zeros_like(X, dtype=np.float64)
     for _ in range(3):
         cx, cy, cz = (np.random.rand(3) - 0.5) * L * 0.5
         width      = 0.5 + np.random.rand() * 0.5
-        psi_fine  += np.exp(
-            -((X_f - cx)**2 + (Y_f - cy)**2 + (Z_f - cz)**2)
+        psi       += np.exp(
+            -((X - cx)**2 + (Y - cy)**2 + (Z - cz)**2)
             / (2 * width**2))
 
-    H_psi_fine   = fft_hamiltonian(psi_fine)
-    psi_sparse   = psi_fine[::2, ::2, ::2]
-    H_psi_target = H_psi_fine[::2, ::2, ::2]
-    return psi_sparse, H_psi_target
+    H_psi = fft_hamiltonian(psi)
+    return psi, H_psi
 
 
 def gen_sine_wavefunction(k_max: int = 2):
     """
     3–6 个正弦模式叠加：sin(k·r + b)，
     k 分量为 [-k_max, k_max] 内的整数倍 2π/L。
-    返回 (psi_sparse, H_psi_target)。
+    返回 (psi, H_psi_target)。
     """
-    psi_fine = np.zeros_like(X_f, dtype=np.float64)
-    n_modes  = np.random.randint(3, 7)
-    dk       = 2 * np.pi / L
+    psi    = np.zeros_like(X, dtype=np.float64)
+    n_modes = np.random.randint(3, 7)
+    dk      = 2 * np.pi / L
 
     for _ in range(n_modes):
         kx = np.random.randint(-k_max, k_max + 1) * dk
         ky = np.random.randint(-k_max, k_max + 1) * dk
         kz = np.random.randint(-k_max, k_max + 1) * dk
         b  = np.random.rand() * 2 * np.pi
-        psi_fine += np.sin(kx * X_f + ky * Y_f + kz * Z_f + b)
+        psi += np.sin(kx * X + ky * Y + kz * Z + b)
 
-    H_psi_fine   = fft_hamiltonian(psi_fine)
-    psi_sparse   = psi_fine[::2, ::2, ::2]
-    H_psi_target = H_psi_fine[::2, ::2, ::2]
-    return psi_sparse, H_psi_target
+    H_psi = fft_hamiltonian(psi)
+    return psi, H_psi
 
 
 def gen_pm1_wavefunction(rng: np.random.Generator = None):
     """
-    细网格格点独立随机 ±1 波函数（flat 随机态），
-    返回 (psi_sparse, H_psi_target)。
-
-    每个细网格格点独立取 ±1，通过 FFT 精确计算 H|ψ⟩，
-    再下采样到稀疏网格。稀疏格点上的值仍为 ±1（细网格每隔一点取一个）。
+    格点独立随机 ±1 波函数（flat 随机态），返回 (psi, H_psi_target)。
     """
     if rng is not None:
-        signs = rng.choice(np.array([-1.0, 1.0]), size=X_f.shape)
+        signs = rng.choice(np.array([-1.0, 1.0]), size=X.shape)
     else:
-        signs = np.random.choice([-1.0, 1.0], size=X_f.shape)
-    psi_fine     = signs.astype(np.float64)
-    H_psi_fine   = fft_hamiltonian(psi_fine)
-    psi_sparse   = psi_fine[::2, ::2, ::2]
-    H_psi_target = H_psi_fine[::2, ::2, ::2]
-    return psi_sparse, H_psi_target
+        signs = np.random.choice([-1.0, 1.0], size=X.shape)
+    psi   = signs.astype(np.float64)
+    H_psi = fft_hamiltonian(psi)
+    return psi, H_psi
 
 
 def gen_fine_wavefunction(wf_type: str = 'gaussian', k_max: int = 2,
                           rng: np.random.Generator = None) -> np.ndarray:
     """
-    Generate a wavefunction on the fine grid (N_fine³) without downsampling.
-    Returns psi_fine of shape (N_fine, N_fine, N_fine).
-    Used when the FFT reference energy series (fine grid) is needed separately.
+    生成初始波函数（形状 (N, N, N)），不归一化，用于 generate_chain 的起点。
     """
     if wf_type == 'gaussian':
-        psi_fine = np.zeros_like(X_f, dtype=np.float64)
+        psi = np.zeros_like(X, dtype=np.float64)
         for _ in range(3):
             cx, cy, cz = (np.random.rand(3) - 0.5) * L * 0.5
             width = 0.5 + np.random.rand() * 0.5
-            psi_fine += np.exp(
-                -((X_f - cx)**2 + (Y_f - cy)**2 + (Z_f - cz)**2)
+            psi += np.exp(
+                -((X - cx)**2 + (Y - cy)**2 + (Z - cz)**2)
                 / (2 * width**2))
     elif wf_type == 'sine':
-        psi_fine = np.zeros_like(X_f, dtype=np.float64)
+        psi = np.zeros_like(X, dtype=np.float64)
         n_modes = np.random.randint(3, 7)
         dk = 2 * np.pi / L
         for _ in range(n_modes):
@@ -98,56 +84,51 @@ def gen_fine_wavefunction(wf_type: str = 'gaussian', k_max: int = 2,
             ky = np.random.randint(-k_max, k_max + 1) * dk
             kz = np.random.randint(-k_max, k_max + 1) * dk
             b = np.random.rand() * 2 * np.pi
-            psi_fine += np.sin(kx * X_f + ky * Y_f + kz * Z_f + b)
+            psi += np.sin(kx * X + ky * Y + kz * Z + b)
     elif wf_type == 'pm1':
         gen = rng if rng is not None else np.random.default_rng()
-        psi_fine = gen.choice(np.array([-1.0, 1.0]),
-                              size=X_f.shape).astype(np.float64)
+        psi = gen.choice(np.array([-1.0, 1.0]),
+                         size=X.shape).astype(np.float64)
     else:
         raise ValueError(f"Unknown wf_type: {wf_type!r}. Choose 'gaussian', 'sine', or 'pm1'.")
-    return psi_fine
+    return psi
 
 
-def generate_chain(psi_0_fine: np.ndarray,
-                   chain_len: int = 1,
+def generate_chain(psi_0: np.ndarray,
+                   chain_len: int = 10,
                    kinetic_cutoff: float = 30.0) -> list:
     """
-    Generate a chain of (psi_k_sparse, target_k_sparse) training pairs.
+    生成 chain_len 步的 (psi_k, target_k) 训练对。
 
-    Starting from psi_0_fine, repeatedly applies H_FFT and normalises to
-    produce the next input, matching the GNN inference loop exactly.
-
-    Step k:
-      input  = psi_k_fine[::2,::2,::2]          (normalised, on sparse grid)
-      target = H_FFT(psi_k_fine)[::2,::2,::2]   (unnormalised H·psi_k)
-      psi_{k+1}_fine = H_FFT(psi_k_fine) / ‖H_FFT(psi_k_fine)‖
+    输入波函数先 L2 归一化（保证 GNN 输入始终为归一化波函数），
+    每步：
+      input  = psi_k                    （归一化，直接用于 GNN 输入）
+      target = H_FFT(psi_k)             （未归一化的 H·psi_k）
+      psi_{k+1} = H_FFT(psi_k) / ‖H_FFT(psi_k)‖
 
     Parameters
     ----------
-    psi_0_fine     : initial wavefunction on fine grid (will be L2-normalised)
-    chain_len      : number of steps; returns list of length ≤ chain_len
-    kinetic_cutoff : forwarded to fft_hamiltonian (Ha, default 30.0)
+    psi_0          : 初始波函数，形状 (N, N, N)，将被 L2 归一化
+    chain_len      : 链长（步数），默认 10
+    kinetic_cutoff : 传递给 fft_hamiltonian（Ha，默认 30.0）
 
     Returns
     -------
-    list of (psi_sparse, target_sparse) numpy arrays, length = chain_len
-    (may be shorter if norm collapses to zero)
+    list of (psi, target) numpy arrays，长度 ≤ chain_len
     """
     pairs = []
-    psi = psi_0_fine.copy()
-    # L2-normalise on fine grid
-    nrm = np.sqrt(np.sum(psi**2) * d_fine**3)
+    psi = psi_0.copy()
+    nrm = np.sqrt(np.sum(psi**2) * d**3)
     if nrm > 1e-30:
         psi /= nrm
 
     for _ in range(chain_len):
         H_psi = fft_hamiltonian(psi, kinetic_cutoff=kinetic_cutoff)
-        pairs.append((psi[::2, ::2, ::2].copy(),
-                      H_psi[::2, ::2, ::2].copy()))
-        nrm = np.sqrt(np.sum(H_psi**2) * d_fine**3)
+        pairs.append((psi.copy(), H_psi.copy()))
+        nrm = np.sqrt(np.sum(H_psi**2) * d**3)
         if nrm < 1e-30 or not np.isfinite(nrm):
             break
-        psi = H_psi / nrm      # normalise for next step
+        psi = H_psi / nrm
 
     return pairs
 
@@ -156,7 +137,7 @@ def generate_wavefunction_and_target(wf_type: str = 'gaussian', k_max: int = 2,
                                      rng: np.random.Generator = None):
     """
     统一接口：wf_type ∈ {'gaussian', 'sine', 'pm1'}
-    返回 (psi_sparse, H_psi_target)。
+    返回 (psi, H_psi_target)。
     """
     if wf_type == 'gaussian':
         return gen_gaussian_wavefunction()

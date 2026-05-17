@@ -113,9 +113,9 @@ def main():
                         help="Number of independent psi's averaged per optimizer step")
     parser.add_argument("--save_every",      type=int,   default=500)
     parser.add_argument("--lr",              type=float, default=1e-3)
-    parser.add_argument("--chain_len",       type=int,   default=1,
+    parser.add_argument("--chain_len",       type=int,   default=10,
                         help="H-application chain length per training sample "
-                             "(1 = original single-step; >1 = chain training)")
+                             "(1 = single-step; default 10 = chain training)")
     parser.add_argument("--chain_mode",     type=str,   default="teacher",
                         choices=["teacher", "auto"],
                         help="teacher: each step uses FFT reference input (teacher forcing); "

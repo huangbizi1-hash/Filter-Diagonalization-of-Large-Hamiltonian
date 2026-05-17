@@ -20,7 +20,8 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from .physics import (
-    d_fine, d_sparse, V_sparse, fft_hamiltonian,
+    d, V, fft_hamiltonian,
+    d_fine, d_sparse, V_sparse,  # 兼容别名
 )
 from .data  import gen_fine_wavefunction
 from .graph import build_graph, build_star_graph
@@ -131,11 +132,10 @@ def test_baseline(
     fd_energies_list  = []
 
     for _ in range(n_test):
-        psi_fine   = gen_fine_wavefunction(wf_type, k_max)  # (N_fine,)^3
-        psi_sparse = psi_fine[::2, ::2, ::2]                # (N_sparse,)^3
+        psi = gen_fine_wavefunction(wf_type, k_max)
 
-        fft_energies_list.append(_fft_energy_series(psi_fine,   n_steps))
-        fd_energies_list.append(_gnn_energy_series( psi_sparse, fd_ham, n_steps, device))
+        fft_energies_list.append(_fft_energy_series(psi, n_steps))
+        fd_energies_list.append(_gnn_energy_series(psi, fd_ham, n_steps, device))
 
     fft_e = np.array(fft_energies_list)   # (n_test, n_steps+1)
     fd_e  = np.array(fd_energies_list)
@@ -232,8 +232,8 @@ def test_gnn_from_run(
     test_sparse_list = []
     test_fine_list   = []
     for _ in range(n_test):
-        psi_fine = gen_fine_wavefunction(wf_type, k_max)  # (N_fine,)^3
-        test_sparse_list.append(psi_fine[::2, ::2, ::2])  # (N_sparse,)^3
+        psi_fine = gen_fine_wavefunction(wf_type, k_max)
+        test_sparse_list.append(psi_fine)
         test_fine_list.append(psi_fine)
 
     # ── FFT 参考（与 checkpoint 无关）──

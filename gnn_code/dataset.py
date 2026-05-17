@@ -29,7 +29,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .physics import X_f, Y_f, Z_f, L, N_sparse
+from .physics import X, Y, Z, L, N, N_sparse
 from .data import generate_chain, gen_fine_wavefunction
 
 
@@ -65,7 +65,7 @@ def generate_k_grid_dataset(
     for kx in k_vals:
         for ky in k_vals:
             for kz in k_vals:
-                psi_fine = np.sin(kx * X_f + ky * Y_f + kz * Z_f)
+                psi_fine = np.sin(kx * X + ky * Y + kz * Z)
                 if np.max(np.abs(psi_fine)) < 1e-10:   # identically zero → skip
                     continue
 
@@ -86,7 +86,7 @@ def generate_k_grid_dataset(
     meta = dict(
         k_max=k_max, n_k=n_k, k_shift=k_shift,
         chain_len=chain_len, kinetic_cutoff=kinetic_cutoff,
-        n_samples=count, N_sparse=N_sparse,
+        n_samples=count, N=N,
     )
     with open(os.path.join(out_dir, "metadata.json"), "w") as f:
         json.dump(meta, f, indent=2)
@@ -159,7 +159,7 @@ def generate_random_dataset(
     meta = dict(
         wf_type=wf_type, n_samples=count,
         chain_len=chain_len, kinetic_cutoff=kinetic_cutoff,
-        seed=seed, N_sparse=N_sparse,
+        seed=seed, N=N,
     )
     with open(os.path.join(out_dir, "metadata.json"), "w") as f:
         json.dump(meta, f, indent=2)

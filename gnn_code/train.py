@@ -22,7 +22,9 @@ import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from .physics import (
-    L, d_fine, d_sparse, N_fine, N_sparse, A_pot, sigma_pot, V_sparse,
+    L, d, N, omega, V,
+    # 兼容别名
+    d_sparse, N_sparse, V_sparse,
 )
 from .data    import generate_wavefunction_and_target, generate_chain, gen_fine_wavefunction
 from .graph   import build_graph, build_star_graph
@@ -40,7 +42,7 @@ def train(
     batch_size:      int   = 1,
     save_every:      int   = 500,
     lr:              float = 1e-3,
-    chain_len:       int   = 1,
+    chain_len:       int   = 10,
     chain_mode:      str   = 'teacher',  # 'teacher' | 'auto'
     chain_bptt:      bool  = False,      # True: no detach in auto → full BPTT across steps
     kinetic_cutoff:  float = 30.0,
@@ -84,9 +86,8 @@ def train(
         dataset_dir=dataset_dir,
         graph_type=graph_type, fd_order=fd_order, n_co=n_co,
         model_type=model_type, radial_hidden_dim=radial_hidden_dim,
-        L=L, d_fine=d_fine, d_sparse=d_sparse,
-        N_fine=N_fine, N_sparse=N_sparse,
-        A_pot=A_pot, sigma_pot=sigma_pot,
+        L=L, d=d, N=N, omega=omega,
+        d_sparse=d_sparse, N_sparse=N_sparse,
         timestamp=timestamp,
     )
     with open(os.path.join(run_dir, "config.json"), "w") as f:
