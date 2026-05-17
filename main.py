@@ -430,7 +430,8 @@ def run(cfg: Dict[str, Any]) -> None:
                               filter_func=filter_func, filter_label=filter_label,
                               samp_ref=samp_ref_nodes,
                               samp_ref_label=f"plain Chebyshev (nc={nc_true})",
-                              extra_components=extra_comps)
+                              extra_components=extra_comps,
+                              plot_style=cfg.get('plot_filter_interpolation_style'))
 
     # 多种窗函数形状对比图（帮助直观比较 gaussian / gabor 宽度差异）
     bands     = cfg.get("plot_window_bands", {})
