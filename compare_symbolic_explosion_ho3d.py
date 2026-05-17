@@ -62,7 +62,10 @@ from symbolic_code.chebyshev_filter import (
     group_by_exp_combined,
     apply_horner,
 )
-from symbolic_code.julia_codegen import build_julia_batch_script
+from symbolic_code.julia_codegen import (
+    build_julia_batch_script,
+    build_julia_combined_filter_script,
+)
 from filter_core import svd_rayleigh_ritz_op
 
 
@@ -188,6 +191,134 @@ def ensure_julia_script(cache_dir: Path, m: int, E_lo: float, E_hi: float) -> Pa
     print(f"    done in {elapsed:.1f}s → {jl_path.name}")
 
     return jl_path
+
+
+# ── H^n-per-order Julia script (fast, E_lo/E_hi-independent) ─────────────────
+
+def ensure_julia_Hn_script(cache_dir: Path, m: int) -> Path:
+    """Build and cache ``julia_Hn_m{m}.jl``.
+
+    Groups and Horner-reduces each H^n expression **separately** (fast),
+    then emits a combined Julia script where Chebyshev coefficients are
+    CLI arguments.  The same ``.jl`` is reused for any (E_lo, E_hi).
+
+    Call convention of the generated script::
+
+        julia julia_Hn_m{m}.jl grid.bin kvals.bin out.bin N n_waves c0 c1 … cm
+
+    Parameters
+    ----------
+    cache_dir : Path   directory with H_power_*.pkl files
+    m : int            Chebyshev polynomial order (H^0..H^m must exist)
+
+    Returns
+    -------
+    Path  path to the cached .jl file
+    """
+    import pickle
+
+    jl_path = cache_dir / f'julia_Hn_m{m}.jl'
+    if jl_path.exists():
+        print(f"  Julia Hn script cache hit → {jl_path.name}")
+        return jl_path
+
+    print(f"  Building julia_Hn_m{m}.jl (per-order grouping, m={m}) ...")
+    Hn_terms_list = []
+    for n in range(m + 1):
+        t0 = time.perf_counter()
+        if n == 0:
+            # H^0·psi = sin(theta): Ps=1, Pc=0
+            terms_cos_n = []
+            terms_sin_n = apply_horner(group_by_exp_combined(sp.Integer(1)))
+        else:
+            pkl_path = cache_dir / f'H_power_{n}.pkl'
+            with open(pkl_path, 'rb') as fh:
+                data = pickle.load(fh)
+            terms_cos_n = apply_horner(group_by_exp_combined(data['Pc']))
+            terms_sin_n = apply_horner(group_by_exp_combined(data['Ps']))
+        elapsed = time.perf_counter() - t0
+        print(f"    H^{n}: {len(terms_cos_n)} cos groups, "
+              f"{len(terms_sin_n)} sin groups  ({elapsed:.2f}s)")
+        Hn_terms_list.append((terms_cos_n, terms_sin_n))
+
+    t0 = time.perf_counter()
+    jl_src = build_julia_combined_filter_script(Hn_terms_list)
+    jl_path.write_text(jl_src, encoding='utf-8')
+    print(f"  Julia source generated in {time.perf_counter()-t0:.2f}s "
+          f"→ {jl_path.name}")
+    return jl_path
+
+
+def julia_eval_Hn_filter(jl_path: Path, x1d: np.ndarray,
+                          k_vals: np.ndarray, b_vals: np.ndarray,
+                          coeffs: list, julia_exe: str) -> tuple:
+    """Call the H^n-combined Julia script to evaluate f(H)·sin(k·r+b).
+
+    Equivalent to ``julia_eval_filter`` but passes Chebyshev coefficients
+    as CLI arguments instead of having them baked into the script.
+
+    Parameters
+    ----------
+    jl_path  : Path to julia_Hn_m{m}.jl
+    x1d      : 1-D grid array (N,)
+    k_vals   : (n_waves, 3)
+    b_vals   : (n_waves,)
+    coeffs   : list [c_0, c_1, …, c_m] from chebyshev_coeffs_transformed
+    julia_exe: Julia binary
+
+    Returns
+    -------
+    C_f    : np.ndarray  (n_waves, N, N, N)
+    timing : dict
+    """
+    N       = len(x1d)
+    n_waves = len(k_vals)
+    X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
+
+    with tempfile.TemporaryDirectory(prefix='hn_filter_') as tmp:
+        tmp = Path(tmp)
+        grid_bin  = tmp / 'grid.bin'
+        kvals_bin = tmp / 'kvals.bin'
+        out_bin   = tmp / 'out.bin'
+
+        with open(grid_bin, 'wb') as f:
+            X.ravel().astype('<f8').tofile(f)
+            Y.ravel().astype('<f8').tofile(f)
+            Z.ravel().astype('<f8').tofile(f)
+
+        kb = np.column_stack([k_vals, b_vals.reshape(-1, 1)]).astype('<f8')
+        kb.ravel().tofile(str(kvals_bin))
+
+        coeff_args = [repr(float(c)) for c in coeffs]
+        cmd = ([julia_exe, str(jl_path),
+                str(grid_bin), str(kvals_bin), str(out_bin),
+                str(N**3), str(n_waves)]
+               + coeff_args)
+
+        t_wall0 = time.perf_counter()
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        total_wall_s = time.perf_counter() - t_wall0
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Julia exited with code {proc.returncode}.\n"
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+
+        timing = {'warmup_s': None, 'eval_s': None,
+                  'n_eval_waves': None, 'total_wall_s': total_wall_s}
+        for line in reversed(proc.stdout.splitlines()):
+            line = line.strip()
+            if line.startswith('{') and line.endswith('}'):
+                try:
+                    timing.update(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+                break
+
+        raw = np.fromfile(str(out_bin), dtype='<f8')
+
+    C_f = raw.reshape(n_waves, N, N, N)
+    return C_f, timing
 
 
 # ── run Julia batch evaluation ─────────────────────────────────────────────────

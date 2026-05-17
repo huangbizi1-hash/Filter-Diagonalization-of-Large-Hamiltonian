@@ -46,8 +46,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 # Reuse pipeline functions from the existing symbolic script
 from compare_symbolic_explosion_ho3d import (
     ensure_H_powers_cache,
-    ensure_julia_script,
-    julia_eval_filter,
+    ensure_julia_Hn_script,        # new: H^n-per-order cache, E_lo/E_hi-free
+    julia_eval_Hn_filter,          # new: passes coefficients as CLI args
     ho3d_exact_levels,
     make_grid,
     make_T_k,
@@ -89,6 +89,7 @@ def run_one_N(
     cheb_m: int,
     a: float,
     b_sc: float,
+    coeffs: list,
     n_random: int,
     k_max_arg: float,
     seed: int,
@@ -142,8 +143,8 @@ def run_one_N(
     print(f"  [symbolic] Julia ({n_random} waves) ...", flush=True)
     t_julia0 = time.perf_counter()
     try:
-        C_f_sym, julia_timing = julia_eval_filter(
-            jl_path, x1d, k_vals, b_vals, julia_exe)
+        C_f_sym, julia_timing = julia_eval_Hn_filter(
+            jl_path, x1d, k_vals, b_vals, coeffs, julia_exe)
         t_julia = time.perf_counter() - t_julia0
         ws = julia_timing.get('warmup_s')
         es = julia_timing.get('eval_s')
@@ -299,9 +300,12 @@ def main():
         print(f"    c_{n} = {float(c):.10g}")
     print()
 
-    # ── Step 3: Julia .jl script ──────────────────────────────────────────────
-    print("── Step 3: Julia filter script ──")
-    jl_path = ensure_julia_script(cache_dir, args.cheb_m, args.E_lo, args.E_hi)
+    # ── Step 3: Julia H^n script (E_lo/E_hi-independent) ─────────────────────
+    # Uses the new per-order pipeline: group_by_exp + horner applied to each
+    # H^n separately, coefficients passed as CLI args.  No expensive symbolic
+    # assembly of the full Σ c_n H^n·ψ.
+    print("── Step 3: Julia H^n filter script ──")
+    jl_path = ensure_julia_Hn_script(cache_dir, args.cheb_m)
     print()
 
     # ── exact HO levels ───────────────────────────────────────────────────────
@@ -314,6 +318,7 @@ def main():
         res = run_one_N(
             N=N, box_L=args.box_L,
             cheb_m=args.cheb_m, a=a, b_sc=b_sc,
+            coeffs=coeffs,
             n_random=args.n_random, k_max_arg=args.k_max,
             seed=args.seed, svd_tol=args.svd_tol, n_print=args.n_print,
             jl_path=jl_path, julia_exe=args.julia_exe,
