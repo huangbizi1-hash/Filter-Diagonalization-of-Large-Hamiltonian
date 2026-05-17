@@ -2,7 +2,7 @@
 绘图函数集合。所有函数均将图像保存为文件，不调用 plt.show()。
 """
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import matplotlib
@@ -31,7 +31,7 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
                                samp_ref: Optional[np.ndarray] = None,
                                samp_ref_label: str = "ref nodes",
                                extra_components: Optional[list] = None,
-                               plot_style: Optional[Dict] = None) -> None:
+                               plot_style: Optional[Mapping[str, Any]] = None) -> None:
     """
     真实窗函数 vs Newton 多项式插值。
 
@@ -52,6 +52,9 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
         用于 split_bandpass 等需要同时展示多个分量插值质量的场景。
         每个分量用独立颜色对（实线=真实，虚线=Newton 插值）绘制。
         extra_components 中的分量不参与 rug plot（共用主 samp）。
+    plot_style       : 可选，绘图样式字典。
+        支持键：title, figsize, title_fontsize, label_fontsize,
+        tick_fontsize, legend_fontsize。
     """
     has_nodes = samp is not None      # False → chebyshev_explosion 等无节点模式
 
@@ -76,7 +79,8 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
 
     x_plot = np.linspace(interval[0], interval[1], 1000)
     style = plot_style or {}
-    figsize = tuple(style.get('figsize', (10, 6)))
+    figsize_raw = style.get('figsize', (10, 6))
+    figsize = tuple(figsize_raw) if isinstance(figsize_raw, (list, tuple)) else (10, 6)
     title_fontsize = style.get('title_fontsize', None)
     label_fontsize = style.get('label_fontsize', None)
     tick_fontsize = style.get('tick_fontsize', None)
@@ -317,7 +321,8 @@ def plot_filter_monomial(El_list, cn, par: PhysParams,
 
     x_plot = np.linspace(interval[0], interval[1], 1000)
     style = plot_style or {}
-    figsize = tuple(style.get('figsize', (10, 6)))
+    figsize_raw = style.get('figsize', (10, 6))
+    figsize = tuple(figsize_raw) if isinstance(figsize_raw, (list, tuple)) else (10, 6)
     title_fontsize = style.get('title_fontsize', None)
     label_fontsize = style.get('label_fontsize', None)
     tick_fontsize = style.get('tick_fontsize', None)
@@ -354,7 +359,8 @@ def plot_filtered_energies(El_list, E_mean_all, E_std_all, N_values,
                             out_dir: Path) -> None:
     """误差棒图：滤波能量期望值 vs 滤波中心 El。"""
     style = plot_style or {}
-    figsize = tuple(style.get('figsize', (10, 6)))
+    figsize_raw = style.get('figsize', (10, 6))
+    figsize = tuple(figsize_raw) if isinstance(figsize_raw, (list, tuple)) else (10, 6)
     title_fontsize = style.get('title_fontsize', None)
     label_fontsize = style.get('label_fontsize', None)
     tick_fontsize = style.get('tick_fontsize', None)
