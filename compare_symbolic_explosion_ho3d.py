@@ -70,6 +70,7 @@ from symbolic_code.julia_codegen import (
     Hn_snippet_group_counts,
     build_julia_combined_from_snippets,
     build_julia_filter_from_snippets,
+    build_julia_cse_filter_script,
 )
 from filter_core import svd_rayleigh_ritz_op
 
@@ -359,6 +360,56 @@ def ensure_julia_filter_script(cache_dir: Path, m: int,
     jl_src = build_julia_filter_from_snippets(snippets, m, coeffs)
     jl_path.write_text(jl_src, encoding='utf-8')
     print(f"  Assembled in {time.perf_counter()-t0:.2f}s → {jl_path.name}")
+    return jl_path
+
+
+def ensure_julia_cse_filter_script(cache_dir: Path, m: int,
+                                    coeffs: list,
+                                    E_lo: float, E_hi: float) -> Path:
+    """Assemble a fast Julia filter script via CSE on the combined Σ c_n H^n.
+
+    Unlike :func:`ensure_julia_filter_script` (which calls separate @inline
+    functions per H^n per grid point), this function applies ``sp.cse()``
+    to the full combined raw expression Σ c_n H^n·ψ, so Julia sees a single
+    expression per grid point with explicit common-subexpression temps.  This
+    recovers the ~0.04 s/wave performance of the original monolithic pipeline.
+
+    The script has c_n baked in as Float64 literals, so it is specific to
+    (E_lo, E_hi) and is cached as
+    ``julia_filter_cse_m{m}_a{a_key}_b{b_key}.jl``.
+
+    Call convention (no c args)::
+
+        julia julia_filter_cse_m{m}_*.jl grid.bin kvals.bin out.bin N n_waves
+
+    Parameters
+    ----------
+    cache_dir : Path
+    m : int
+    coeffs : list of float   [c_0, c_1, …, c_m]
+    E_lo, E_hi : float
+
+    Returns
+    -------
+    Path  path to the cached .jl file
+    """
+    a    =  2.0 / (E_hi - E_lo)
+    b_sc = -(E_hi + E_lo) / (E_hi - E_lo)
+
+    def _key(v):
+        return f'{v:.10g}'.replace('.', 'p').replace('-', 'm').replace('+', '')
+
+    jl_path = cache_dir / f'julia_filter_cse_m{m}_a{_key(a)}_b{_key(b_sc)}.jl'
+    if jl_path.exists():
+        print(f"  CSE filter script cache hit → {jl_path.name}")
+        return jl_path
+
+    print(f"  Building julia_filter_cse_m{m}_*.jl via sp.cse() on Σ c_n H^n ...")
+    t0 = time.perf_counter()
+    jl_src = build_julia_cse_filter_script(m, coeffs, cache_dir)
+    elapsed = time.perf_counter() - t0
+    jl_path.write_text(jl_src, encoding='utf-8')
+    print(f"  CSE filter script built in {elapsed:.1f}s → {jl_path.name}")
     return jl_path
 
 

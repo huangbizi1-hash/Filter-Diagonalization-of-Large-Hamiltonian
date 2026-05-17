@@ -48,10 +48,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 from compare_symbolic_explosion_ho3d import (
     ensure_H_powers_cache,
     ensure_Hn_horner_cache,
-    ensure_julia_Hn_script,         # flexible runtime-c script (for reference)
-    ensure_julia_filter_script,     # fast baked-c script (default)
-    julia_eval_filter,              # calls baked-c script (no c args)
-    julia_eval_Hn_filter,           # calls runtime-c script
+    ensure_julia_Hn_script,              # flexible runtime-c script (for reference)
+    ensure_julia_filter_script,          # snippet-based baked-c script
+    ensure_julia_cse_filter_script,      # CSE-based baked-c script (fast, default)
+    julia_eval_filter,                   # calls any baked-c script (no c args)
+    julia_eval_Hn_filter,                # calls runtime-c script
     ho3d_exact_levels,
     make_grid,
     make_T_k,
@@ -481,13 +482,13 @@ def main():
               f"sym/FFT = {ratio:.2f}x")
     print()
 
-    # ── Step 3: Julia filter script (baked c_n, assembled from H_power_n.jl) ──
-    # H_power_{n}.jl snippets are computed once per order (expensive for large n)
-    # and then assembled with baked-in c_n constants in seconds.  Julia LLVM
-    # folds the known coefficients and generates a single optimised polynomial,
-    # giving 10-100× faster eval than passing c_n at runtime.
-    print("── Step 3: Julia filter script (baked c_n) ──")
-    jl_path = ensure_julia_filter_script(
+    # ── Step 3: Julia filter script (CSE, baked c_n) ─────────────────────────
+    # Loads raw H_power_{n}.pkl, forms Σ c_n H^n without expanding, applies
+    # sp.cse() to extract shared subexpressions, then generates Julia with a
+    # single combined expression per grid point + @inbounds @simd + Threads.
+    # This recovers the ~0.04 s/wave speed of the original monolithic pipeline.
+    print("── Step 3: Julia CSE filter script (baked c_n, sp.cse on Σ c_n H^n) ──")
+    jl_path = ensure_julia_cse_filter_script(
         cache_dir, args.cheb_m, coeffs, args.E_lo, args.E_hi)
     print()
 
