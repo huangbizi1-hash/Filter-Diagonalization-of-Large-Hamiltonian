@@ -233,14 +233,30 @@ def _phs_lap_at_center(r: np.ndarray, p: int) -> np.ndarray:
     return p * (p + 1) * np.where(r > 1e-14, r ** (p - 2), 0.0)
 
 
+def _gaussian_phi_mat(r_mat: np.ndarray, eps: float) -> np.ndarray:
+    """Gaussian RBF: φ(r) = exp(-(eps*r)^2)."""
+    return np.exp(-(eps * r_mat) ** 2)
+
+
+def _gaussian_lap_at_center(r: np.ndarray, eps: float) -> np.ndarray:
+    """3-D Laplacian of φ(|x-x_α|) = exp(-eps²|x-x_α|²) at x = x_i.
+
+    ∇²φ(r) = (4ε⁴r² - 6ε²) · exp(-ε²r²)
+    """
+    e2 = eps * eps
+    return (4.0 * e2 * e2 * r * r - 6.0 * e2) * np.exp(-e2 * r * r)
+
+
 def rbf_fd_laplacian(
     nodes: np.ndarray,
     interior_idx: np.ndarray,
     k_neighbors: int = 40,
-    phi_order: int = 3,
+    kernel: str = "phs",        # "phs" | "gaussian"
+    phi_order: int = 3,         # PHS exponent (used when kernel="phs")
+    eps: float = 0.5,           # shape parameter (used when kernel="gaussian")
     poly_degree: int = 2,
 ) -> sp.csr_matrix:
-    """PHS-augmented RBF-FD Laplacian, Dirichlet BCs on boundary."""
+    """PHS- or Gaussian-RBF-FD Laplacian, Dirichlet BCs on boundary."""
     n_total    = len(nodes)
     n_interior = len(interior_idx)
     monomials  = _monomials_3d(poly_degree)
@@ -262,16 +278,26 @@ def rbf_fd_laplacian(
 
         diff = nodes[nbr][:, None, :] - nodes[nbr][None, :, :]
         r_mat = np.sqrt(np.sum(diff**2, axis=2))
-        Phi = r_mat ** phi_order
+        if kernel == "phs":
+            Phi = r_mat ** phi_order
+        elif kernel == "gaussian":
+            Phi = _gaussian_phi_mat(r_mat, eps)
+        else:
+            raise ValueError(f"Unknown kernel: {kernel!r}")
 
-        P = _eval_poly(dx, monomials)
+        P = _eval_poly(dx, monomials) if M > 0 else np.zeros((k, 0))
         A = np.zeros((k + M, k + M))
         A[:k, :k] = Phi
-        A[:k, k:] = P
-        A[k:, :k] = P.T
+        if M > 0:
+            A[:k, k:] = P
+            A[k:, :k] = P.T
 
         r_xi = np.sqrt(np.sum(dx**2, axis=1))
-        b = np.concatenate([_phs_lap_at_center(r_xi, phi_order), b_poly])
+        if kernel == "phs":
+            b_rbf = _phs_lap_at_center(r_xi, phi_order)
+        else:
+            b_rbf = _gaussian_lap_at_center(r_xi, eps)
+        b = np.concatenate([b_rbf, b_poly]) if M > 0 else b_rbf
 
         try:
             w = np.linalg.solve(A, b)[:k]
@@ -292,10 +318,13 @@ def rbf_fd_laplacian(
     )
 
 
-def build_H_rbf(nodes, interior_idx, k_neighbors, phi_order, poly_degree, omega=1.0):
+def build_H_rbf(nodes, interior_idx, k_neighbors, kernel, phi_order, eps,
+                poly_degree, omega=1.0):
     L = rbf_fd_laplacian(nodes, interior_idx,
                          k_neighbors=k_neighbors,
+                         kernel=kernel,
                          phi_order=phi_order,
+                         eps=eps,
                          poly_degree=poly_degree)
     pts = nodes[interior_idx]
     V   = 0.5 * omega**2 * np.sum(pts**2, axis=1)
@@ -417,14 +446,17 @@ def run_single(
     seed: int,
     # rbf-fd params
     k_neighbors: int,
+    kernel: str,
     phi_order: int,
+    eps: float,
     poly_degree: int,
     omega: float,
     boundary_margin_frac: float,
     sphere_subdivide: int,
     n_print: int,
 ) -> dict:
-    print(f"  method={method}  spacing={spacing:.3f}")
+    print(f"  method={method}  spacing={spacing:.3f}  k={k_neighbors}  "
+          f"kernel={kernel}")
 
     # 1. Generate nodes
     t0 = time.perf_counter()
@@ -454,7 +486,8 @@ def run_single(
     # 2. Build H
     t0 = time.perf_counter()
     try:
-        H = build_H_rbf(nodes, interior_idx, k_neighbors, phi_order, poly_degree, omega)
+        H = build_H_rbf(nodes, interior_idx, k_neighbors,
+                        kernel, phi_order, eps, poly_degree, omega)
     except Exception as exc:
         print(f"  [SKIP] H build failed: {exc}")
         return {"method": method, "spacing": spacing, "n_interior": n_interior,
@@ -473,7 +506,9 @@ def run_single(
     for _ in range(_mv_reps):
         H.dot(_psi_bm)
     t_matvec_avg = (time.perf_counter() - _t_mv0) / _mv_reps
-    print(f"  H matvec avg ({_mv_reps} reps): {t_matvec_avg*1e3:.4f} ms")
+    t_matvec_per_node = t_matvec_avg / max(1, n_interior)
+    print(f"  H matvec avg ({_mv_reps} reps): {t_matvec_avg*1e3:.4f} ms  "
+          f"(per node: {t_matvec_per_node*1e9:.2f} ns)")
 
     # 3. Solve
     if solver == 'arnoldi':
@@ -515,25 +550,31 @@ def run_single(
         print(f"    [{k:3d}]  {evals[k]:10.6f}  {ref[k]:10.6f}  {errs[k]:.3e}")
 
     return {
-        "method":     method,
-        "spacing":    spacing,
-        "n_total":    int(n_total),
-        "n_interior": int(n_interior),
-        "n_boundary": int(n_boundary),
-        "H_nnz":      int(H.nnz),
-        "energies":   evals.tolist(),
-        "exact":      ref.tolist(),
-        "abs_errors": errs.tolist(),
-        "solver":     solver,
-        "target":     target,
-        "max_imag":   None if not np.isfinite(max_im) else float(max_im),
-        "rank":       int(rank) if rank >= 0 else None,
+        "method":      method,
+        "spacing":     spacing,
+        "k_neighbors": int(k_neighbors),
+        "kernel":      kernel,
+        "eps":         float(eps),
+        "phi_order":   int(phi_order),
+        "poly_degree": int(poly_degree),
+        "n_total":     int(n_total),
+        "n_interior":  int(n_interior),
+        "n_boundary":  int(n_boundary),
+        "H_nnz":       int(H.nnz),
+        "energies":    evals.tolist(),
+        "exact":       ref.tolist(),
+        "abs_errors":  errs.tolist(),
+        "solver":      solver,
+        "target":      target,
+        "max_imag":    None if not np.isfinite(max_im) else float(max_im),
+        "rank":        int(rank) if rank >= 0 else None,
         "timings": {
-            "nodes_s":       t_nodes,
-            "build_s":       t_build,
-            "matvec_avg_s":  t_matvec_avg,
-            "solve_s":       t_solve,
-            "total_s":       t_nodes + t_build + t_solve,
+            "nodes_s":            t_nodes,
+            "build_s":            t_build,
+            "matvec_avg_s":       t_matvec_avg,
+            "matvec_per_node_s":  t_matvec_per_node,
+            "solve_s":            t_solve,
+            "total_s":            t_nodes + t_build + t_solve,
         },
         "skipped": False,
     }
@@ -657,11 +698,20 @@ def main():
     ap.add_argument('--omega',         type=float, default=1.0)
 
     # RBF-FD
-    ap.add_argument('--k_neighbors', type=int,   default=40)
-    ap.add_argument('--phi_order',   type=int,   default=3,
-                    help='PHS exponent (3 → r³)')
-    ap.add_argument('--poly_degree', type=int,   default=2,
-                    help='Polynomial augmentation degree')
+    ap.add_argument('--k_neighbors',   type=int, default=40,
+                    help='Stencil size (used when --stencil_sweep is empty)')
+    ap.add_argument('--stencil_sweep', type=str, default='',
+                    help='Comma-separated stencil sizes to sweep, e.g. 12,18,42. '
+                         'If set, overrides --k_neighbors.')
+    ap.add_argument('--rbf_kernel',    type=str, default='phs',
+                    choices=['phs', 'gaussian'],
+                    help='RBF kernel: phs (default) or gaussian')
+    ap.add_argument('--phi_order',     type=int, default=3,
+                    help='PHS exponent (3 → r³); used when --rbf_kernel=phs')
+    ap.add_argument('--rbf_eps',       type=float, default=0.5,
+                    help='Gaussian shape parameter; used when --rbf_kernel=gaussian')
+    ap.add_argument('--poly_degree',   type=int, default=2,
+                    help='Polynomial augmentation degree (0 = no polynomial)')
 
     # Solver
     ap.add_argument('--solver', type=str, default='arnoldi',
@@ -699,11 +749,16 @@ def main():
 
     methods  = [m.strip() for m in args.node_methods.split(',')]
     spacings = _parse_float_sweep(args.spacing_sweep)
+    if args.stencil_sweep.strip():
+        stencils = [int(x) for x in args.stencil_sweep.split(',')]
+    else:
+        stencils = [args.k_neighbors]
 
     print("RBF-FD node method comparison — HO3D (non-Hermitian)")
     print(f"  box_L={args.box_L}  omega={args.omega}")
     print(f"  methods: {methods}")
     print(f"  spacing sweep: {spacings}")
+    print(f"  stencil sweep: {stencils}")
     print(f"  solver: {args.solver}")
     if args.solver == 'arnoldi':
         tgt = "lowest" if args.target is None else f"near target={args.target}"
@@ -711,8 +766,10 @@ def main():
     else:
         print(f"  cheb_m={args.cheb_m}  E_lo={args.E_lo}  E_hi={args.E_hi}  "
               f"n_random={args.n_random}")
-    print(f"  k_neighbors={args.k_neighbors}  phi=phs{args.phi_order}  "
-          f"poly_deg={args.poly_degree}\n")
+    if args.rbf_kernel == 'phs':
+        print(f"  kernel=phs{args.phi_order}  poly_deg={args.poly_degree}\n")
+    else:
+        print(f"  kernel=gaussian(eps={args.rbf_eps})  poly_deg={args.poly_degree}\n")
 
     results_by_method: dict[str, list] = {m: [] for m in methods}
     all_results = []
@@ -721,47 +778,53 @@ def main():
         print(f"{'='*60}")
         print(f"NODE METHOD: {method}")
         for sp in spacings:
-            print(f"  --- spacing={sp} ---")
-            res = run_single(
-                method=method,
-                box_L=args.box_L,
-                spacing=sp,
-                solver=args.solver,
-                n_levels=args.n_levels,
-                arnoldi_tol=args.arnoldi_tol,
-                max_matvecs=args.max_matvecs,
-                target=args.target,
-                cheb_m=args.cheb_m,
-                E_lo=args.E_lo,
-                E_hi=args.E_hi,
-                n_random=args.n_random,
-                svd_tol=args.svd_tol,
-                seed=args.seed,
-                k_neighbors=args.k_neighbors,
-                phi_order=args.phi_order,
-                poly_degree=args.poly_degree,
-                omega=args.omega,
-                boundary_margin_frac=args.boundary_margin_frac,
-                sphere_subdivide=args.sphere_subdivide,
-                n_print=args.n_print,
-            )
-            results_by_method[method].append(res)
-            all_results.append(res)
+            for k in stencils:
+                print(f"  --- spacing={sp}  k={k} ---")
+                res = run_single(
+                    method=method,
+                    box_L=args.box_L,
+                    spacing=sp,
+                    solver=args.solver,
+                    n_levels=args.n_levels,
+                    arnoldi_tol=args.arnoldi_tol,
+                    max_matvecs=args.max_matvecs,
+                    target=args.target,
+                    cheb_m=args.cheb_m,
+                    E_lo=args.E_lo,
+                    E_hi=args.E_hi,
+                    n_random=args.n_random,
+                    svd_tol=args.svd_tol,
+                    seed=args.seed,
+                    k_neighbors=k,
+                    kernel=args.rbf_kernel,
+                    phi_order=args.phi_order,
+                    eps=args.rbf_eps,
+                    poly_degree=args.poly_degree,
+                    omega=args.omega,
+                    boundary_margin_frac=args.boundary_margin_frac,
+                    sphere_subdivide=args.sphere_subdivide,
+                    n_print=args.n_print,
+                )
+                results_by_method[method].append(res)
+                all_results.append(res)
 
     # Summary table
     print(f"\n{'='*80}")
     print("── Summary (MAE on first n_print levels) ──")
-    print(f"{'method':>12}  {'spacing':>8}  {'n_int':>8}  {'n_eigs':>7}  "
-          f"{'MAE':>12}  {'mv_avg_ms':>11}  {'total_s':>9}")
+    print(f"{'method':>12}  {'spacing':>8}  {'k':>4}  {'n_int':>8}  {'n_eigs':>7}  "
+          f"{'MAE':>12}  {'mv_avg_ms':>11}  {'mv/node_ns':>11}  {'total_s':>9}")
     for r in all_results:
         if r.get('skipped'):
             print(f"{r['method']:>12}  {r['spacing']:8.3f}  SKIPPED  ({r.get('reason','')})")
             continue
         errs = np.array(r['abs_errors'][:args.n_print])
         mae  = float(np.mean(errs)) if len(errs) else float('nan')
-        mv_ms = r['timings']['matvec_avg_s'] * 1e3
-        print(f"{r['method']:>12}  {r['spacing']:8.3f}  {r['n_interior']:8d}  "
-              f"{len(r['energies']):7d}  {mae:12.4e}  {mv_ms:11.4f}  "
+        mv_ms      = r['timings']['matvec_avg_s'] * 1e3
+        mv_node_ns = r['timings']['matvec_per_node_s'] * 1e9
+        k_val      = r.get('k_neighbors', -1)
+        print(f"{r['method']:>12}  {r['spacing']:8.3f}  {k_val:4d}  "
+              f"{r['n_interior']:8d}  {len(r['energies']):7d}  {mae:12.4e}  "
+              f"{mv_ms:11.4f}  {mv_node_ns:11.2f}  "
               f"{r['timings']['total_s']:9.2f}s")
 
     # Save JSON
@@ -770,6 +833,9 @@ def main():
             "node_methods":    methods,
             "box_L":           args.box_L,
             "spacing_sweep":   spacings,
+            "stencil_sweep":   stencils,
+            "rbf_kernel":      args.rbf_kernel,
+            "rbf_eps":         args.rbf_eps,
             "solver":          args.solver,
             "n_levels":        args.n_levels,
             "target":          args.target,
