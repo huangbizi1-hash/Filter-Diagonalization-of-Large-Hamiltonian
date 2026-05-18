@@ -16,8 +16,14 @@ No unit-cell tiling is needed or supported (HO3D is a single-domain problem).
 
 Solver options (--solver)
 --------------------------
-jdqmr     : PRIMME JDQMR, directly on the sparse H matrix.
-explosion : Chebyshev explosion filter T_m(aH+b) + Rayleigh-Ritz.
+arnoldi   : scipy.sparse.linalg.eigs (ARPACK, non-Hermitian Arnoldi).
+            If --target is set, uses shift-invert mode (sigma=target);
+            otherwise computes the n_levels smallest-real-part eigenvalues.
+explosion : Chebyshev explosion filter T_m(aH+b) + non-Hermitian Rayleigh-Ritz.
+
+Note: The RBF-FD discretisation is non-symmetric, so we use non-Hermitian
+solvers (Arnoldi instead of Lanczos, eig() instead of eigh() in Ritz).
+Reported energies are sorted by real part; max |Im(λ)| is logged.
 
 Spacing sweep
 -------------
@@ -28,18 +34,29 @@ For 'fcc' the spacing value is used as the lattice parameter a.
 
 Usage examples
 --------------
+  # Lowest 20 eigenvalues, non-Hermitian Arnoldi
   python compare_rbf_nodes_ho3d.py \\
       --node_methods regular,sphere,fcc,poisson_box \\
       --box_L 5.0 --spacing_sweep 1.4,1.2,1.0,0.8 \\
-      --solver jdqmr --n_levels 30 \\
+      --solver arnoldi --n_levels 20 \\
       --k_neighbors 40 --phi_order 3 --poly_degree 2 \\
-      --out_json rbf_nodes_ho3d_jdqmr.json
+      --out_json rbf_nodes_ho3d_arnoldi.json
 
+  # 20 eigenvalues near target (shift-invert)
   python compare_rbf_nodes_ho3d.py \\
-      --node_methods sphere,fcc \\
-      --box_L 5.0 --spacing_sweep 1.4,1.2,1.0 \\
+      --node_methods regular,sphere,fcc,poisson_box \\
+      --box_L 5.0 --spacing_sweep 1.4,1.2,1.0,0.8 \\
+      --solver arnoldi --target 10.0 --n_levels 20 \\
+      --k_neighbors 40 --phi_order 3 --poly_degree 2 \\
+      --out_json rbf_nodes_ho3d_target.json
+
+  # Chebyshev explosion filter
+  python compare_rbf_nodes_ho3d.py \\
+      --node_methods regular,sphere,fcc,poisson_box \\
+      --box_L 5.0 --spacing_sweep 1.4,1.2,1.0,0.8 \\
       --solver explosion \\
-      --cheb_m 5 --E_lo 1.5 --E_hi 80.0 --n_random 300 \\
+      --cheb_m 12 --E_lo 7.0 --E_hi 50.0 \\
+      --n_random 1000 --n_print 20 \\
       --k_neighbors 40 --phi_order 3 --poly_degree 2 \\
       --out_json rbf_nodes_ho3d_explosion.json
 """
@@ -55,6 +72,7 @@ from pathlib import Path
 
 import numpy as np
 import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 from scipy.spatial import cKDTree
 import matplotlib
 matplotlib.use('Agg')
@@ -62,12 +80,6 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).parent))
 from filter_core import svd_rayleigh_ritz_op
-
-try:
-    import primme
-    HAS_PRIMME = True
-except ImportError:
-    HAS_PRIMME = False
 
 try:
     from rbf.pde.nodes import poisson_disc_nodes
@@ -292,30 +304,56 @@ def build_H_rbf(nodes, interior_idx, k_neighbors, phi_order, poly_degree, omega=
 
 # ── solvers ───────────────────────────────────────────────────────────────────
 
-def solve_jdqmr(H_sparse, n_levels: int, tol: float, max_matvecs: int):
-    if not HAS_PRIMME:
-        raise ImportError("primme not installed. pip install primme")
+def solve_arnoldi(
+    H_sparse,
+    n_levels: int,
+    tol: float,
+    max_matvecs: int,
+    target: float | None = None,
+):
+    """Non-Hermitian Arnoldi (scipy ARPACK) eigensolver.
+
+    target=None  → smallest real-part eigenvalues (which='SR').
+    target=float → shift-invert mode (sigma=target, which='LM').
+    """
     n = H_sparse.shape[0]
-    ncv = max(4 * n_levels, 40)
+    ncv = min(max(4 * n_levels, 40), n - 1)
+    n_levels_eff = min(n_levels, n - 2)
+    if n_levels_eff < 1:
+        return np.array([]), 0.0, 0.0, -1, False, "matrix too small"
+
     t0 = time.perf_counter()
     try:
-        evals, _, stats = primme.eigsh(
-            H_sparse,
-            k=n_levels,
-            which='SA',
-            method='PRIMME_JDQMR',
-            ncv=ncv,
-            tol=tol,
-            maxMatvecs=max_matvecs,
-            return_stats=True,
-            return_history=False,
-        )
+        if target is None:
+            evals_c = spla.eigs(
+                H_sparse,
+                k=n_levels_eff,
+                which='SR',
+                ncv=ncv,
+                tol=tol,
+                maxiter=max_matvecs,
+                return_eigenvectors=False,
+            )
+        else:
+            evals_c = spla.eigs(
+                H_sparse,
+                k=n_levels_eff,
+                sigma=float(target),
+                which='LM',
+                ncv=ncv,
+                tol=tol,
+                maxiter=max_matvecs,
+                return_eigenvectors=False,
+            )
         t_wall = time.perf_counter() - t0
-        evals = np.sort(evals.real)
-        return evals, t_wall, int(stats['numMatvecs']), True, ""
+        order = np.argsort(evals_c.real)
+        evals_c = evals_c[order]
+        max_im = float(np.max(np.abs(evals_c.imag))) if len(evals_c) else 0.0
+        return evals_c.real, t_wall, max_im, -1, True, ""
     except Exception as exc:
         t_wall = time.perf_counter() - t0
-        return np.full(n_levels, np.nan), t_wall, -1, False, str(exc)
+        return (np.full(n_levels, np.nan), t_wall, float('nan'), -1,
+                False, str(exc))
 
 
 def _chebyshev_explosion(H_apply, psi, m, E_lo, E_hi):
@@ -331,6 +369,7 @@ def _chebyshev_explosion(H_apply, psi, m, E_lo, E_hi):
 
 
 def solve_explosion(H_sparse, n_interior, cheb_m, E_lo, E_hi, n_random, svd_tol, seed):
+    """Chebyshev explosion + non-Hermitian Rayleigh-Ritz."""
     rng = np.random.default_rng(seed)
     H_apply = H_sparse.dot
     t0 = time.perf_counter()
@@ -340,17 +379,21 @@ def solve_explosion(H_sparse, n_interior, cheb_m, E_lo, E_hi, n_random, svd_tol,
         psi /= np.linalg.norm(psi)
         pf = _chebyshev_explosion(H_apply, psi, cheb_m, E_lo, E_hi)
         nf = np.linalg.norm(pf)
-        if nf > 1e-14:
+        if nf > 1e-14 and np.all(np.isfinite(pf)):
             cols.append(pf / nf)
     t_filter = time.perf_counter() - t0
     if not cols:
-        return np.array([]), t_filter, 0, False, "all filtered states vanished"
+        return (np.array([]), t_filter, float('nan'), 0,
+                False, "all filtered states vanished or non-finite")
     basis = np.column_stack(cols)
     energies, _, rank = svd_rayleigh_ritz_op(
-        basis, H_apply, svd_tol=svd_tol, max_energies=min(n_random, 200), hermitian=True
+        basis, H_apply, svd_tol=svd_tol, max_energies=min(n_random, 200),
+        hermitian=False,
     )
     t_wall = time.perf_counter() - t0
-    return energies, t_wall, rank, True, ""
+    # svd_rayleigh_ritz_op already returns sorted real parts; max_im is not
+    # surfaced by that helper, so we set NaN as a placeholder.
+    return energies, t_wall, float('nan'), int(rank), True, ""
 
 
 # ── single (method, spacing) run ─────────────────────────────────────────────
@@ -360,10 +403,11 @@ def run_single(
     box_L: float,
     spacing: float,
     solver: str,
-    # jdqmr params
+    # arnoldi params
     n_levels: int,
-    jdqmr_tol: float,
+    arnoldi_tol: float,
     max_matvecs: int,
+    target: float | None,
     # explosion params
     cheb_m: int,
     E_lo: float,
@@ -419,27 +463,43 @@ def run_single(
     print(f"  H nnz={H.nnz}  ({t_build:.2f}s)")
 
     # 3. Solve
-    if solver == 'jdqmr':
-        evals, t_solve, n_mv, ok, msg = solve_jdqmr(H, n_levels, jdqmr_tol, max_matvecs)
+    if solver == 'arnoldi':
+        evals, t_solve, max_im, rank, ok, msg = solve_arnoldi(
+            H, n_levels, arnoldi_tol, max_matvecs, target=target)
     else:  # explosion
-        evals, t_solve, rank, ok, msg = solve_explosion(
+        evals, t_solve, max_im, rank, ok, msg = solve_explosion(
             H, n_interior, cheb_m, E_lo, E_hi, n_random, svd_tol, seed)
-        n_mv = rank
 
     if not ok:
         print(f"  [SKIP] solver failed: {msg}")
         return {"method": method, "spacing": spacing, "n_interior": n_interior,
                 "skipped": True, "reason": f"solver: {msg}"}
 
-    print(f"  solver={solver}  n_eigs={len(evals)}  t_solve={t_solve:.2f}s")
+    if np.isfinite(max_im):
+        print(f"  solver={solver}  n_eigs={len(evals)}  t_solve={t_solve:.2f}s  "
+              f"max|Im(λ)|={max_im:.2e}")
+    else:
+        print(f"  solver={solver}  n_eigs={len(evals)}  t_solve={t_solve:.2f}s")
 
     # 4. Compare with exact
-    exact = exact_ho3d_levels(max(len(evals), n_print), omega=omega)
-    n_cmp = min(n_print, len(evals), len(exact))
-    errs  = np.abs(evals[:n_cmp] - exact[:n_cmp])
+    # In target mode the user is interested in levels nearest target, so we
+    # match each computed eigenvalue to the closest exact level individually.
+    n_ref = max(len(evals), n_print, 200)
+    exact_pool = exact_ho3d_levels(n_ref, omega=omega)
+    if target is None:
+        n_cmp = min(n_print, len(evals), len(exact_pool))
+        ref = exact_pool[:n_cmp]
+        errs = np.abs(evals[:n_cmp] - ref)
+    else:
+        n_cmp = min(n_print, len(evals))
+        # nearest exact level for each computed value
+        ref = np.array([exact_pool[np.argmin(np.abs(exact_pool - e))]
+                        for e in evals[:n_cmp]])
+        errs = np.abs(evals[:n_cmp] - ref)
+
     print(f"  First {n_cmp} eigenvalues  (computed / exact / |err|):")
     for k in range(n_cmp):
-        print(f"    [{k:3d}]  {evals[k]:10.6f}  {exact[k]:10.6f}  {errs[k]:.3e}")
+        print(f"    [{k:3d}]  {evals[k]:10.6f}  {ref[k]:10.6f}  {errs[k]:.3e}")
 
     return {
         "method":     method,
@@ -449,10 +509,12 @@ def run_single(
         "n_boundary": int(n_boundary),
         "H_nnz":      int(H.nnz),
         "energies":   evals.tolist(),
-        "exact":      exact[:len(evals)].tolist(),
+        "exact":      ref.tolist(),
         "abs_errors": errs.tolist(),
         "solver":     solver,
-        "n_mv_or_rank": int(n_mv),
+        "target":     target,
+        "max_imag":   None if not np.isfinite(max_im) else float(max_im),
+        "rank":       int(rank) if rank >= 0 else None,
         "timings": {
             "nodes_s":  t_nodes,
             "build_s":  t_build,
@@ -588,14 +650,17 @@ def main():
                     help='Polynomial augmentation degree')
 
     # Solver
-    ap.add_argument('--solver', type=str, default='jdqmr',
-                    choices=['jdqmr', 'explosion'],
-                    help='Eigenvalue solver: jdqmr or explosion')
+    ap.add_argument('--solver', type=str, default='arnoldi',
+                    choices=['arnoldi', 'explosion'],
+                    help='Eigenvalue solver (non-Hermitian): arnoldi or explosion')
 
-    # JDQMR params
-    ap.add_argument('--n_levels',    type=int,   default=30,
-                    help='(jdqmr) number of lowest eigenvalues to compute')
-    ap.add_argument('--jdqmr_tol',   type=float, default=1e-6)
+    # Arnoldi params (non-Hermitian ARPACK)
+    ap.add_argument('--n_levels',    type=int,   default=20,
+                    help='(arnoldi) number of eigenvalues to compute')
+    ap.add_argument('--target',      type=float, default=None,
+                    help='(arnoldi) target energy: if set, shift-invert near '
+                         'this value; else compute smallest-real-part eigs')
+    ap.add_argument('--arnoldi_tol', type=float, default=1e-6)
     ap.add_argument('--max_matvecs', type=int,   default=10000)
 
     # Explosion params
@@ -621,22 +686,19 @@ def main():
     methods  = [m.strip() for m in args.node_methods.split(',')]
     spacings = _parse_float_sweep(args.spacing_sweep)
 
-    print("RBF-FD node method comparison — HO3D")
+    print("RBF-FD node method comparison — HO3D (non-Hermitian)")
     print(f"  box_L={args.box_L}  omega={args.omega}")
     print(f"  methods: {methods}")
     print(f"  spacing sweep: {spacings}")
     print(f"  solver: {args.solver}")
-    if args.solver == 'jdqmr':
-        print(f"  n_levels={args.n_levels}  tol={args.jdqmr_tol}")
+    if args.solver == 'arnoldi':
+        tgt = "lowest" if args.target is None else f"near target={args.target}"
+        print(f"  n_levels={args.n_levels}  mode={tgt}  tol={args.arnoldi_tol}")
     else:
         print(f"  cheb_m={args.cheb_m}  E_lo={args.E_lo}  E_hi={args.E_hi}  "
               f"n_random={args.n_random}")
     print(f"  k_neighbors={args.k_neighbors}  phi=phs{args.phi_order}  "
           f"poly_deg={args.poly_degree}\n")
-
-    if args.solver == 'jdqmr' and not HAS_PRIMME:
-        print("ERROR: primme not installed. pip install primme")
-        sys.exit(1)
 
     results_by_method: dict[str, list] = {m: [] for m in methods}
     all_results = []
@@ -652,8 +714,9 @@ def main():
                 spacing=sp,
                 solver=args.solver,
                 n_levels=args.n_levels,
-                jdqmr_tol=args.jdqmr_tol,
+                arnoldi_tol=args.arnoldi_tol,
                 max_matvecs=args.max_matvecs,
+                target=args.target,
                 cheb_m=args.cheb_m,
                 E_lo=args.E_lo,
                 E_hi=args.E_hi,
@@ -694,7 +757,8 @@ def main():
             "spacing_sweep":   spacings,
             "solver":          args.solver,
             "n_levels":        args.n_levels,
-            "jdqmr_tol":       args.jdqmr_tol,
+            "target":          args.target,
+            "arnoldi_tol":     args.arnoldi_tol,
             "max_matvecs":     args.max_matvecs,
             "cheb_m":          args.cheb_m,
             "E_lo":            args.E_lo,
