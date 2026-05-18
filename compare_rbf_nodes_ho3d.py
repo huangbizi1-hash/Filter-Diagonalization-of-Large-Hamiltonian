@@ -462,6 +462,19 @@ def run_single(
     t_build = time.perf_counter() - t0
     print(f"  H nnz={H.nnz}  ({t_build:.2f}s)")
 
+    # 2b. Benchmark a single H matvec (100 warm-up + 100 timed applications)
+    _mv_warmup = 10
+    _mv_reps   = 100
+    _psi_bm    = np.ones(n_interior, dtype=np.float64)
+    _psi_bm   /= np.linalg.norm(_psi_bm)
+    for _ in range(_mv_warmup):
+        H.dot(_psi_bm)
+    _t_mv0 = time.perf_counter()
+    for _ in range(_mv_reps):
+        H.dot(_psi_bm)
+    t_matvec_avg = (time.perf_counter() - _t_mv0) / _mv_reps
+    print(f"  H matvec avg ({_mv_reps} reps): {t_matvec_avg*1e3:.4f} ms")
+
     # 3. Solve
     if solver == 'arnoldi':
         evals, t_solve, max_im, rank, ok, msg = solve_arnoldi(
@@ -516,10 +529,11 @@ def run_single(
         "max_imag":   None if not np.isfinite(max_im) else float(max_im),
         "rank":       int(rank) if rank >= 0 else None,
         "timings": {
-            "nodes_s":  t_nodes,
-            "build_s":  t_build,
-            "solve_s":  t_solve,
-            "total_s":  t_nodes + t_build + t_solve,
+            "nodes_s":       t_nodes,
+            "build_s":       t_build,
+            "matvec_avg_s":  t_matvec_avg,
+            "solve_s":       t_solve,
+            "total_s":       t_nodes + t_build + t_solve,
         },
         "skipped": False,
     }
@@ -738,15 +752,16 @@ def main():
     print(f"\n{'='*80}")
     print("── Summary (MAE on first n_print levels) ──")
     print(f"{'method':>12}  {'spacing':>8}  {'n_int':>8}  {'n_eigs':>7}  "
-          f"{'MAE':>12}  {'total_s':>9}")
+          f"{'MAE':>12}  {'mv_avg_ms':>11}  {'total_s':>9}")
     for r in all_results:
         if r.get('skipped'):
             print(f"{r['method']:>12}  {r['spacing']:8.3f}  SKIPPED  ({r.get('reason','')})")
             continue
         errs = np.array(r['abs_errors'][:args.n_print])
         mae  = float(np.mean(errs)) if len(errs) else float('nan')
+        mv_ms = r['timings']['matvec_avg_s'] * 1e3
         print(f"{r['method']:>12}  {r['spacing']:8.3f}  {r['n_interior']:8d}  "
-              f"{len(r['energies']):7d}  {mae:12.4e}  "
+              f"{len(r['energies']):7d}  {mae:12.4e}  {mv_ms:11.4f}  "
               f"{r['timings']['total_s']:9.2f}s")
 
     # Save JSON
