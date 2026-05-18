@@ -370,6 +370,98 @@ def julia_eval_filter(jl_path: Path, x1d: np.ndarray,
     return raw.reshape(n_waves, N_grid, N_grid, N_grid), timing
 
 
+# ── H^n Julia scripts (for accumulation filter mode) ─────────────────────────
+
+def ensure_Hn_julia_scripts(cache_dir: Path, m: int,
+                              force_rebuild: bool = False) -> dict:
+    """Build (or load from cache) a Julia script for each H^n (n=0..m).
+
+    Each script has the same binary I/O convention as the combined filter
+    script, so julia_eval_filter() can evaluate it directly.
+
+    Returns dict  n (int) -> Path.
+    """
+    H_data  = _load_H_powers(cache_dir, m)
+    scripts = {}
+    for n in range(m + 1):
+        jl_path = cache_dir / f'julia_Hn_{n}.jl'
+        if force_rebuild and jl_path.exists():
+            print(f"  --force_rebuild: deleting {jl_path.name}")
+            jl_path.unlink()
+        if jl_path.exists():
+            scripts[n] = jl_path
+            continue
+        t0 = time.perf_counter()
+        print(f"  Building julia_Hn_{n}.jl ...", end=' ', flush=True)
+        if n == 0:
+            Pc_n = sp.Integer(0)
+            Ps_n = sp.Integer(1)
+        else:
+            entry = H_data.get(n)
+            if entry is None:
+                raise KeyError(f"H^{n} pkl missing in {cache_dir}")
+            Pc_n = entry['Pc']
+            Ps_n = entry['Ps']
+        src = _build_julia_script(Pc_n, Ps_n)
+        jl_path.write_text(src, encoding='utf-8')
+        scripts[n] = jl_path
+        print(f"{time.perf_counter()-t0:.2f}s")
+    return scripts
+
+
+def _eval_hn_accumulate(hn_scripts: dict, coeffs_full: list,
+                         x1d: np.ndarray, k_vals: np.ndarray,
+                         b_vals: np.ndarray, julia_exe: str,
+                         N: int, m: int) -> tuple:
+    """Evaluate f(H)*psi = Σ c_n H^n*psi via individual H^n Julia scripts.
+
+    n=0 is handled in Python (H^0*sin = sin).  n=1..m each call Julia.
+
+    Returns (C_f, timing_dict) where C_f has shape (n_waves, N, N, N).
+    timing_dict.eval_s is the sum over n >= 1 of timed Julia evaluations.
+    """
+    n_waves = len(k_vals)
+    X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
+
+    # n=0 term: H^0 * sin(k·r+b) = sin(k·r+b)
+    c0  = float(coeffs_full[0])
+    C_f = np.empty((n_waves, N, N, N), dtype=float)
+    for i in range(n_waves):
+        kx, ky, kz = k_vals[i]
+        C_f[i] = c0 * np.sin(kx * X + ky * Y + kz * Z + b_vals[i])
+
+    total_eval_s   = 0.0
+    total_warmup_s = 0.0
+    total_nw       = 0
+    hn_timings     = {}
+
+    for n in range(1, m + 1):
+        c_n = float(coeffs_full[n])
+        if abs(c_n) < 1e-15:
+            continue
+        C_n, jt = julia_eval_filter(hn_scripts[n], x1d, k_vals, b_vals, julia_exe)
+        C_f += c_n * C_n
+
+        es_n = jt.get('eval_s') or 0.0
+        nw_n = jt.get('n_eval_waves') or 1
+        total_eval_s   += es_n
+        total_warmup_s += jt.get('warmup_s') or 0.0
+        total_nw       += nw_n
+        hn_timings[n]   = {'eval_s': es_n, 'n_waves': nw_n, 'c_n': c_n}
+        print(f"    H^{n}: c_n={c_n:+.6g}  "
+              f"eval={es_n:.4f}s/{nw_n}w  "
+              f"({es_n/nw_n*1e3:.3f} ms/wave)")
+
+    timing = {
+        'warmup_s':     total_warmup_s,
+        'eval_s':       total_eval_s,
+        'n_eval_waves': max(total_nw, 1),
+        'hn_timings':   hn_timings,
+        'mode':         'hn_accumulate',
+    }
+    return C_f, timing
+
+
 # ── grid helpers ──────────────────────────────────────────────────────────────
 
 def make_grid(N: int, box_L: float):
@@ -425,7 +517,13 @@ def chebyshev_recurrence(H_apply, psi0, a, b_sc, m):
 
 def run_one_N(N, box_L, cheb_m, a, b_sc,
               n_random, k_max_arg, seed, svd_tol, n_print,
-              jl_path, julia_exe, exact_all) -> dict:
+              jl_path, julia_exe, exact_all,
+              hn_scripts=None, coeffs_full=None) -> dict:
+    """Per-grid-size comparison.
+
+    Pass hn_scripts (dict n->Path) and coeffs_full to use H^n accumulation mode.
+    Leave both None to use the default combined-expression mode.
+    """
 
     d, x1d = make_grid(N, box_L)
     X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
@@ -453,18 +551,31 @@ def run_one_N(N, box_L, cheb_m, a, b_sc,
     b_vals = rng.uniform(0.0, 2*np.pi, n_random)
 
     # ── symbolic path ─────────────────────────────────────────────────────────
+    use_accumulate = hn_scripts is not None
+    mode_tag = "H^n-accum" if use_accumulate else "combined"
     sym_result = {"ok": False, "julia_timing": {}, "t_julia_s": 0.0,
-                  "ritz_evals": [], "rank": 0, "t_ritz_s": 0.0}
-    print(f"  [sym]  Julia  ({n_random} waves) ...", flush=True)
+                  "ritz_evals": [], "rank": 0, "t_ritz_s": 0.0,
+                  "mode": mode_tag}
+    print(f"  [sym]  Julia [{mode_tag}]  ({n_random} waves) ...", flush=True)
     t0 = time.perf_counter()
     try:
-        C_sym, jtiming = julia_eval_filter(jl_path, x1d, k_vals, b_vals, julia_exe)
-        t_julia = time.perf_counter() - t0
-        es = jtiming.get('eval_s') or 0.0
-        nw = jtiming.get('n_eval_waves') or 1
+        if use_accumulate:
+            C_sym, jtiming = _eval_hn_accumulate(
+                hn_scripts, coeffs_full, x1d, k_vals, b_vals,
+                julia_exe, N, cheb_m)
+        else:
+            C_sym, jtiming = julia_eval_filter(
+                jl_path, x1d, k_vals, b_vals, julia_exe)
+        t_julia  = time.perf_counter() - t0
+        es       = jtiming.get('eval_s') or 0.0
+        nw       = jtiming.get('n_eval_waves') or 1
+        ms_wave  = es / nw * 1e3
+        ns_point = es / nw / N3 * 1e9
+        jtiming.update({'N3': N3, 'ms_per_wave': ms_wave, 'ns_per_point': ns_point})
         print(f"    warmup={jtiming.get('warmup_s','?'):.4f}s  "
               f"eval={es:.4f}s/{nw} waves  "
-              f"({es/nw*1e3:.3f} ms/wave)  wall={t_julia:.1f}s")
+              f"({ms_wave:.3f} ms/wave  {ns_point:.3f} ns/point  N3={N3})  "
+              f"wall={t_julia:.1f}s")
 
         nan_count = int(np.isnan(C_sym).any(axis=(1,2,3)).sum())
         if nan_count:
@@ -561,8 +672,10 @@ def main():
     ap.add_argument('--cache_dir',     default='ho3d_symbolic_cache')
     ap.add_argument('--julia_exe',     default='julia')
     ap.add_argument('--out_json',      default='symbolic_fft_ho3d_restored.json')
-    ap.add_argument('--force_rebuild', action='store_true',
-                    help='Delete and rebuild the cached .jl script')
+    ap.add_argument('--force_rebuild',     action='store_true',
+                    help='Delete and rebuild cached .jl scripts')
+    ap.add_argument('--use_hn_accumulate', action='store_true',
+                    help='Filter via Σ c_n H^n scripts instead of combined expression')
     args = ap.parse_args()
 
     N_list    = parse_N_sweep(args.N_sweep)
@@ -574,7 +687,8 @@ def main():
     print(f"  cheb_m={args.cheb_m}  E_lo={args.E_lo}  E_hi={args.E_hi}")
     print(f"  a={a:.8f}  b_sc={b_sc:.8f}")
     print(f"  box_L={args.box_L}  N_sweep={N_list}  n_random={args.n_random}")
-    print(f"  force_rebuild={args.force_rebuild}")
+    print(f"  force_rebuild={args.force_rebuild}  "
+          f"use_hn_accumulate={args.use_hn_accumulate}")
     print()
 
     # Step 1: H^n pkl cache
@@ -589,11 +703,20 @@ def main():
         print(f"  c_{n:2d} = {float(c):+.10g}")
     print()
 
-    # Step 3: Julia script
-    print("-- Step 3: Julia filter script --")
-    jl_path = ensure_julia_filter_script(
-        cache_dir, args.cheb_m, args.E_lo, args.E_hi,
-        force_rebuild=args.force_rebuild)
+    # Step 3: Julia script(s)
+    if args.use_hn_accumulate:
+        print("-- Step 3: H^n Julia scripts (accumulation mode) --")
+        jl_path    = None
+        hn_scripts = ensure_Hn_julia_scripts(
+            cache_dir, args.cheb_m, force_rebuild=args.force_rebuild)
+        coeffs_full = coeffs
+    else:
+        print("-- Step 3: combined Julia filter script --")
+        jl_path     = ensure_julia_filter_script(
+            cache_dir, args.cheb_m, args.E_lo, args.E_hi,
+            force_rebuild=args.force_rebuild)
+        hn_scripts  = None
+        coeffs_full = None
     print()
 
     exact_all = ho3d_exact_levels()
@@ -608,7 +731,8 @@ def main():
             n_random=args.n_random, k_max_arg=args.k_max,
             seed=args.seed, svd_tol=args.svd_tol, n_print=args.n_print,
             jl_path=jl_path, julia_exe=args.julia_exe,
-            exact_all=exact_all))
+            exact_all=exact_all,
+            hn_scripts=hn_scripts, coeffs_full=coeffs_full))
     wall = time.perf_counter() - t0
 
     print(f"\n{'='*70}")
@@ -631,7 +755,8 @@ def main():
                       "seed": args.seed, "svd_tol": args.svd_tol,
                       "cache_dir": str(cache_dir.resolve()),
                       "julia_exe": args.julia_exe,
-                      "jl_script": str(jl_path.resolve()),
+                      "jl_script": str(jl_path.resolve()) if jl_path else None,
+                      "use_hn_accumulate": args.use_hn_accumulate,
                       "force_rebuild": args.force_rebuild},
            "sweep": sweep, "wall_total_s": wall}
     Path(args.out_json).write_text(json.dumps(out, indent=2))
