@@ -441,7 +441,8 @@ def run(cfg: Dict[str, Any]) -> None:
                                   filter_func=filter_func, filter_label=filter_label,
                                   samp_ref=samp_ref_nodes,
                                   samp_ref_label=f"plain Chebyshev (nc={nc_true})",
-                                  extra_components=extra_comps)
+                                  extra_components=extra_comps,
+                                  style=cfg.get("plot_filter_interpolation_style"))
     else:
         cheb_m = int(cfg.get("cheb_m", nc))
         cheb_E_lo = float(cfg.get("cheb_E_lo", cfg.get("Vmin", -1.0)))
