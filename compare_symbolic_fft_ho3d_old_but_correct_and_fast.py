@@ -56,6 +56,29 @@ def _float_key(v: float) -> str:
     return f'{v:.8g}'.replace('.', 'p').replace('-', 'm').replace('+', '')
 
 
+def _nops_path(jl_path: Path) -> Path:
+    """Companion .nops.json path for a .jl script."""
+    return jl_path.parent / (jl_path.stem + '.nops.json')
+
+
+def _save_nops(jl_path: Path, cos_expr, sin_expr) -> dict:
+    """Compute sp.count_ops for cos/sin envelopes and save to companion file."""
+    ops_cos = int(sp.count_ops(cos_expr))
+    ops_sin = int(sp.count_ops(sin_expr))
+    nops = {'ops_cos': ops_cos, 'ops_sin': ops_sin,
+            'ops_total': ops_cos + ops_sin}
+    _nops_path(jl_path).write_text(json.dumps(nops, indent=2), encoding='utf-8')
+    return nops
+
+
+def _load_nops(jl_path: Path) -> dict:
+    """Load companion .nops.json; return empty dict if missing."""
+    p = _nops_path(jl_path)
+    if p.exists():
+        return json.loads(p.read_text(encoding='utf-8'))
+    return {}
+
+
 # ── H^n pkl loader (numeric sort, skip *_horner.pkl) ──────────────────────────
 
 def _load_H_powers(cache_dir: Path, n_max: int) -> dict:
@@ -293,9 +316,12 @@ def ensure_julia_filter_script(cache_dir: Path, m: int,
     if force_rebuild and jl_path.exists():
         print(f"  --force_rebuild: deleting {jl_path.name}")
         jl_path.unlink()
+        _nops_path(jl_path).unlink(missing_ok=True)
 
     if jl_path.exists():
-        print(f"  Julia script cache hit: {jl_path.name}")
+        print(f"  Julia script cache hit: {jl_path.name}"
+              + (f"  (ops={_load_nops(jl_path).get('ops_total','?')})"
+                 if _nops_path(jl_path).exists() else ''))
         return jl_path
 
     print(f"  Building Julia filter script"
@@ -333,12 +359,14 @@ def ensure_julia_filter_script(cache_dir: Path, m: int,
         poly_sin = poly_sin.subs(subs)
         print(f"{time.perf_counter()-t0s:.1f}s")
 
-    # 3. Generate and cache the Julia script
+    # 3. Generate and cache the Julia script + companion n_ops file
     t0 = time.perf_counter()
     print("    3/3  generating Julia source ...", end=' ', flush=True)
     jl_src = _build_julia_script(poly_cos, poly_sin)
     jl_path.write_text(jl_src, encoding='utf-8')
-    print(f"{time.perf_counter()-t0:.1f}s  ->  {jl_path.name}")
+    nops = _save_nops(jl_path, poly_cos, poly_sin)
+    print(f"{time.perf_counter()-t0:.1f}s  ->  {jl_path.name}  "
+          f"(ops_total={nops['ops_total']})")
 
     return jl_path
 
@@ -429,7 +457,12 @@ def ensure_Hn_julia_scripts(cache_dir: Path, m: int,
         if force_rebuild and jl_path.exists():
             print(f"  --force_rebuild: deleting {jl_path.name}")
             jl_path.unlink()
+            _nops_path(jl_path).unlink(missing_ok=True)
         if jl_path.exists():
+            nops_info = _load_nops(jl_path)
+            print(f"  H^{n} Julia script cache hit: {jl_path.name}"
+                  + (f"  (ops={nops_info.get('ops_total','?')})"
+                     if nops_info else ''))
             scripts[n] = jl_path
             continue
         t0 = time.perf_counter()
@@ -448,8 +481,9 @@ def ensure_Hn_julia_scripts(cache_dir: Path, m: int,
             Ps_n = Ps_n.subs(subs)
         src = _build_julia_script(Pc_n, Ps_n)
         jl_path.write_text(src, encoding='utf-8')
+        nops = _save_nops(jl_path, Pc_n, Ps_n)
         scripts[n] = jl_path
-        print(f"{time.perf_counter()-t0:.2f}s")
+        print(f"{time.perf_counter()-t0:.2f}s  (ops_total={nops['ops_total']})")
     return scripts
 
 
@@ -847,6 +881,37 @@ def main():
         print(row)
     print(f"\nTotal wall time: {wall:.1f}s")
 
+    # ── collect n_ops from companion .nops.json files ────────────────────────
+    nops_combined = _load_nops(jl_path) if jl_path else {}
+    nops_hn = {}
+    if hn_scripts:
+        for n, p in hn_scripts.items():
+            d = _load_nops(p)
+            if d:
+                nops_hn[n] = d
+    # Also compute per-H^n n_ops directly from pkl (always available)
+    # even when only combined mode was used, so user can compare
+    print("\n-- N_ops per H^n (from pkl, before combination) --")
+    nops_hn_raw = {}
+    try:
+        H_data_nops = _load_H_powers(cache_dir, args.cheb_m)
+        for n in range(args.cheb_m + 1):
+            if n == 0:
+                nops_hn_raw[n] = {'ops_cos': 0, 'ops_sin': 0, 'ops_total': 0}
+            else:
+                entry = H_data_nops.get(n, {})
+                Pc_n  = entry.get('Pc', sp.Integer(0))
+                Ps_n  = entry.get('Ps', sp.Integer(0))
+                oc = int(sp.count_ops(Pc_n))
+                os = int(sp.count_ops(Ps_n))
+                nops_hn_raw[n] = {'ops_cos': oc, 'ops_sin': os,
+                                   'ops_total': oc + os}
+            print(f"  H^{n:2d}: ops_total={nops_hn_raw[n]['ops_total']:6d}"
+                  f"  (cos={nops_hn_raw[n]['ops_cos']}, "
+                  f"sin={nops_hn_raw[n]['ops_sin']})")
+    except Exception as e:
+        print(f"  (could not compute per-H^n nops: {e})")
+
     out = {"script": Path(__file__).name,
            "datetime": datetime.now().strftime("%Y%m%d_%H%M%S"),
            "params": {"N_list": N_list, "box_L": args.box_L,
@@ -861,7 +926,14 @@ def main():
                       "julia_exe": args.julia_exe,
                       "jl_script": str(jl_path.resolve()) if jl_path else None,
                       "use_hn_accumulate": args.use_hn_accumulate,
+                      "fft_only": args.fft_only,
                       "force_rebuild": args.force_rebuild},
+           "nops": {
+               "note": "ops = sp.count_ops() per grid point (before trig)",
+               "combined_fH": nops_combined,
+               "per_Hn_julia": {str(n): v for n, v in nops_hn.items()},
+               "per_Hn_raw_pkl": {str(n): v for n, v in nops_hn_raw.items()},
+           },
            "sweep": sweep, "wall_total_s": wall}
     Path(args.out_json).write_text(json.dumps(out, indent=2))
     print(f"JSON -> {args.out_json}")
