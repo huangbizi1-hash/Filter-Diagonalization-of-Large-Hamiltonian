@@ -53,6 +53,12 @@ import numpy as np
 from scipy.ndimage import convolve1d
 from scipy.sparse.linalg import eigsh, LinearOperator
 
+try:
+    import primme
+    HAS_PRIMME = True
+except ImportError:
+    HAS_PRIMME = False
+
 sys.path.insert(0, str(Path(__file__).parent))
 from ho3d_solvers_v2 import FD_STENCILS
 from filter_core import svd_rayleigh_ritz_op
@@ -339,6 +345,70 @@ def run_single_N(N: int, args, fd_orders: list, n_print, ritz_h: str = 'consiste
     }
 
 
+
+
+def exact_n_plus_half(n_levels: int, omega: float = 1.0) -> np.ndarray:
+    """Return exact reference values E_n = omega*(n + 0.5)."""
+    n = np.arange(n_levels, dtype=float)
+    return omega * (n + 0.5)
+
+
+def benchmark_h_apply_time(H_matvec, N3: int, n_repeat: int = 500) -> float:
+    """Average wall-time (seconds) per H application over n_repeat calls."""
+    rng = np.random.default_rng(12345)
+    v = rng.standard_normal(N3).astype(np.float64)
+    t0 = time.perf_counter()
+    for _ in range(n_repeat):
+        v = H_matvec(v)
+    return (time.perf_counter() - t0) / max(n_repeat, 1)
+
+
+def run_jdqmr_single_N(N: int, args, fd_orders: list) -> dict:
+    if not HAS_PRIMME:
+        raise RuntimeError('primme is required for --solver jdqmr. Please install primme.')
+
+    d, x1d = make_grid_from_N(N, args.box_L)
+    N3 = N**3
+    X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
+    V_num = 0.5 * args.omega**2 * (X**2 + Y**2 + Z**2)
+    T_k_exact = make_T_k(N, d)
+
+    def H_fft(v):
+        return apply_H_fft(v, V_num, T_k_exact)
+
+    methods = []
+    for label, H in [('fft', H_fft)]:
+        t_avg = benchmark_h_apply_time(H, N3, n_repeat=args.h_repeat)
+        evals, _, stats = primme.eigsh(
+            LinearOperator((N3, N3), matvec=H, dtype=float),
+            k=args.n_levels, which='SA', method='PRIMME_JDQMR',
+            tol=args.jdqmr_tol, maxMatvecs=args.max_matvecs,
+            ncv=max(4 * args.n_levels, 40), return_stats=True, return_history=False,
+        )
+        evals = np.sort(evals.real)
+        exact = exact_n_plus_half(len(evals), omega=args.omega)
+        err = np.abs(evals - exact)
+        methods.append({'label':label,'evals':evals.tolist(),'exact_n_plus_half':exact.tolist(),'abs_err':err.tolist(),'mean_abs_err':float(np.mean(err)),'max_abs_err':float(np.max(err)),'avg_h_apply_s':float(t_avg),'num_matvecs':int(stats.get('numMatvecs',-1))})
+
+    for order in fd_orders:
+        stencil = FD_STENCILS[order].astype(np.float64)
+        inv_d2  = -0.5 / (d ** 2)
+        def H_fd(v, _s=stencil, _id2=inv_d2, _N=N):
+            return apply_H_fd(v.reshape(_N, _N, _N), V_num, _s, _id2).ravel()
+        t_avg = benchmark_h_apply_time(H_fd, N3, n_repeat=args.h_repeat)
+        evals, _, stats = primme.eigsh(
+            LinearOperator((N3, N3), matvec=H_fd, dtype=float),
+            k=args.n_levels, which='SA', method='PRIMME_JDQMR',
+            tol=args.jdqmr_tol, maxMatvecs=args.max_matvecs,
+            ncv=max(4 * args.n_levels, 40), return_stats=True, return_history=False,
+        )
+        evals = np.sort(evals.real)
+        exact = exact_n_plus_half(len(evals), omega=args.omega)
+        err = np.abs(evals - exact)
+        methods.append({'label':f'fd{order}','evals':evals.tolist(),'exact_n_plus_half':exact.tolist(),'abs_err':err.tolist(),'mean_abs_err':float(np.mean(err)),'max_abs_err':float(np.max(err)),'avg_h_apply_s':float(t_avg),'num_matvecs':int(stats.get('numMatvecs',-1))})
+
+    return {'N':N,'N3':N3,'d':d,'solver':'jdqmr','methods':methods}
+
 # ── CLI helpers ────────────────────────────────────────────────────────────────
 
 def _parse_N_sweep(s: str) -> list:
@@ -430,6 +500,14 @@ def main():
                          '"fft" = always H_FFT (exact kinetic energy); '
                          '"fd"/"consistent" = each FD method uses its own H_FD '
                          '(measures true discretisation error).  [default consistent]')
+    ap.add_argument('--solver', choices=['explosion','jdqmr'], default='explosion',
+                    help='Eigen solver mode: explosion (Chebyshev filter) or jdqmr')
+    ap.add_argument('--jdqmr_tol', type=float, default=1e-8,
+                    help='JDQMR tolerance [default 1e-8]')
+    ap.add_argument('--max_matvecs', type=int, default=50000,
+                    help='JDQMR max matvecs [default 50000]')
+    ap.add_argument('--h_repeat', type=int, default=500,
+                    help='Average H-apply time over this many repeats [default 500]')
     ap.add_argument('--out_json',  type=str,   default='fd_fft_explosion.json',
                     help='Output JSON path  [default fd_fft_explosion.json]')
     args = ap.parse_args()
@@ -471,19 +549,22 @@ def main():
     print(f'box_L={args.box_L}  n_random={args.n_random}  '
           f'cheb_m={args.cheb_m}  E_lo={args.E_lo}  E_hi={args.E_hi}')
     print(f'FD orders:  {fd_orders}')
-    if is_sweep:
+    if is_sweep and args.solver == 'explosion':
         print(f'N sweep:    {N_list}')
 
     # ── run ───────────────────────────────────────────────────────────────────
     sweep_results = []
     for N in N_list:
-        result = run_single_N(N, args, fd_orders, n_print, ritz_h=args.ritz_h)
+        if args.solver == 'jdqmr':
+            result = run_jdqmr_single_N(N, args, fd_orders)
+        else:
+            result = run_single_N(N, args, fd_orders, n_print, ritz_h=args.ritz_h)
         sweep_results.append(result)
 
     t_wall = time.perf_counter() - t_wall_start
 
     # ── final summary (sweep mode) ─────────────────────────────────────────────
-    if is_sweep:
+    if is_sweep and args.solver == 'explosion':
         method_labels = ['fft'] + [f'fd{o}' for o in fd_orders]
         print(f'\n{"="*78}')
         print(f'Sweep summary  (Ritz[0] vs exact E_ref[0]):')
@@ -525,6 +606,10 @@ def main():
             'fd_orders'  : fd_orders,
             'n_print'    : args.n_print,
             'ritz_h'     : args.ritz_h,
+            'solver'     : args.solver,
+            'jdqmr_tol'  : args.jdqmr_tol,
+            'max_matvecs': args.max_matvecs,
+            'h_repeat'   : args.h_repeat,
         },
         'sweep'         : sweep_results,
         'wall_total_s'  : t_wall,
