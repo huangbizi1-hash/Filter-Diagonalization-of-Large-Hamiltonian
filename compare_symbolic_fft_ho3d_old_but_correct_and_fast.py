@@ -51,6 +51,11 @@ from symbolic_code.h_powers import generate_H_powers
 from filter_core import svd_rayleigh_ritz_op
 
 
+def _float_key(v: float) -> str:
+    """Float → safe filename component  (1.5 → '1p5', -0.5 → 'm0p5')."""
+    return f'{v:.8g}'.replace('.', 'p').replace('-', 'm').replace('+', '')
+
+
 # ── H^n pkl loader (numeric sort, skip *_horner.pkl) ──────────────────────────
 
 def _load_H_powers(cache_dir: Path, n_max: int) -> dict:
@@ -224,8 +229,15 @@ main()
 
 # ── H^n cache & Julia script cache ────────────────────────────────────────────
 
-def ensure_H_powers_cache(cache_dir: Path, m: int):
-    """Generate H_power_0.pkl .. H_power_m.pkl if not already present."""
+def ensure_H_powers_cache(cache_dir: Path, m: int, V_sym=None):
+    """Generate H_power_0.pkl .. H_power_m.pkl if not already present.
+
+    V_sym : sympy expression in x, y, z (and possibly symbolic A, B).
+            None → 3-D harmonic oscillator  V = ½(x²+y²+z²).
+
+    Note: different potentials must use different cache_dir to avoid
+    conflicts between H^n pkl files.
+    """
     cache_dir.mkdir(parents=True, exist_ok=True)
     existing = set()
     for f in cache_dir.glob('H_power_*.pkl'):
@@ -239,9 +251,10 @@ def ensure_H_powers_cache(cache_dir: Path, m: int):
         print(f"  H^n cache OK: H^0..H^{m} present in {cache_dir}")
         return
     print(f"  H^n cache: computing {missing} ...")
-    x, y, z   = sp.symbols('x y z')
+    x, y, z    = sp.symbols('x y z')
     kx, ky, kz = sp.symbols('kx ky kz')
-    V_sym = sp.Rational(1, 2) * (x**2 + y**2 + z**2)
+    if V_sym is None:
+        V_sym = sp.Rational(1, 2) * (x**2 + y**2 + z**2)
     generate_H_powers(
         m, cache_dir, file_format='pkl',
         V=V_sym, kvec=(kx, ky, kz), k2=kx**2 + ky**2 + kz**2,
@@ -250,19 +263,32 @@ def ensure_H_powers_cache(cache_dir: Path, m: int):
 
 def ensure_julia_filter_script(cache_dir: Path, m: int,
                                 E_lo: float, E_hi: float,
-                                force_rebuild: bool = False) -> Path:
+                                force_rebuild: bool = False,
+                                subs: dict = None) -> Path:
     """Build (or load from cache) the Julia filter script.
 
-    The script is cached as  julia_filter_m{m}_a{a_key}_b{b_key}.jl
-    in cache_dir.  Pass force_rebuild=True to delete and rebuild.
+    subs : dict  {sympy_symbol: float_value}  e.g. {A: 2.0, B: 1.0}.
+           Symbolic parameters (e.g. A, B for Gaussian potential) are
+           substituted with their numerical values before Julia codegen.
+           The substitution values are included in the cache filename so
+           different parameter sets get separate cached scripts.
+
+    The script is cached as
+        julia_filter_m{m}_a{}_b{b}[_{sym}{val}...].jl
+    in cache_dir.
     """
     a    =  2.0 / (E_hi - E_lo)
     b_sc = -(E_hi + E_lo) / (E_hi - E_lo)
 
-    def _key(v):
-        return f'{v:.8g}'.replace('.', 'p').replace('-', 'm').replace('+', '')
+    subs_part = ''
+    if subs:
+        subs_part = '_' + '_'.join(
+            f'{sym.name}{_float_key(float(val))}'
+            for sym, val in sorted(subs.items(), key=lambda kv: str(kv[0])))
 
-    jl_path = cache_dir / f'julia_filter_m{m}_a{_key(a)}_b{_key(b_sc)}.jl'
+    jl_path = (cache_dir /
+               f'julia_filter_m{m}_a{_float_key(a)}_b{_float_key(b_sc)}'
+               f'{subs_part}.jl')
 
     if force_rebuild and jl_path.exists():
         print(f"  --force_rebuild: deleting {jl_path.name}")
@@ -273,7 +299,8 @@ def ensure_julia_filter_script(cache_dir: Path, m: int,
         return jl_path
 
     print(f"  Building Julia filter script"
-          f"  (m={m}, E_lo={E_lo}, E_hi={E_hi}) ...")
+          f"  (m={m}, E_lo={E_lo}, E_hi={E_hi}"
+          f"{', subs='+str({str(k):v for k,v in subs.items()}) if subs else ''}) ...")
 
     # 1. Assemble cos/sin envelope polynomials
     t0 = time.perf_counter()
@@ -281,7 +308,7 @@ def ensure_julia_filter_script(cache_dir: Path, m: int,
     expr_cos, expr_sin = _assemble_filter_envelopes(cache_dir, m, a, b_sc)
     print(f"{time.perf_counter()-t0:.1f}s")
 
-    # 2. Group by Gaussian factor + Horner reduction
+    # 2. Group by exp factor + Horner reduction
     t0 = time.perf_counter()
     print("    2/3  group_by_exp + apply_horner ...", end=' ', flush=True)
     terms_cos = apply_horner(group_by_exp_combined(expr_cos))
@@ -289,8 +316,6 @@ def ensure_julia_filter_script(cache_dir: Path, m: int,
     print(f"{time.perf_counter()-t0:.1f}s")
     print(f"         cos groups={len(terms_cos)}  sin groups={len(terms_sin)}")
 
-    # For the plane-wave + HO case there should be exactly 1 group each
-    # with trivial exp_part = 1.  If there are multiple groups, sum them.
     def _sum_groups(terms) -> sp.Expr:
         total = sp.Integer(0)
         for ep, pp in terms:
@@ -299,6 +324,14 @@ def ensure_julia_filter_script(cache_dir: Path, m: int,
 
     poly_cos = _sum_groups(terms_cos) if terms_cos else sp.Integer(0)
     poly_sin = _sum_groups(terms_sin) if terms_sin else sp.Integer(0)
+
+    # Substitute symbolic parameters (A, B, …) with numerical values
+    if subs:
+        t0s = time.perf_counter()
+        print("         substituting symbolic params ...", end=' ', flush=True)
+        poly_cos = poly_cos.subs(subs)
+        poly_sin = poly_sin.subs(subs)
+        print(f"{time.perf_counter()-t0s:.1f}s")
 
     # 3. Generate and cache the Julia script
     t0 = time.perf_counter()
@@ -373,18 +406,26 @@ def julia_eval_filter(jl_path: Path, x1d: np.ndarray,
 # ── H^n Julia scripts (for accumulation filter mode) ─────────────────────────
 
 def ensure_Hn_julia_scripts(cache_dir: Path, m: int,
-                              force_rebuild: bool = False) -> dict:
+                              force_rebuild: bool = False,
+                              subs: dict = None) -> dict:
     """Build (or load from cache) a Julia script for each H^n (n=0..m).
 
-    Each script has the same binary I/O convention as the combined filter
-    script, so julia_eval_filter() can evaluate it directly.
+    subs : dict  {sympy_symbol: float_value}  — same as in
+           ensure_julia_filter_script; substituted into Pc_n/Ps_n before
+           Julia codegen and included in the cache filename.
 
     Returns dict  n (int) -> Path.
     """
-    H_data  = _load_H_powers(cache_dir, m)
+    H_data    = _load_H_powers(cache_dir, m)
+    subs_part = ''
+    if subs:
+        subs_part = '_' + '_'.join(
+            f'{sym.name}{_float_key(float(val))}'
+            for sym, val in sorted(subs.items(), key=lambda kv: str(kv[0])))
+
     scripts = {}
     for n in range(m + 1):
-        jl_path = cache_dir / f'julia_Hn_{n}.jl'
+        jl_path = cache_dir / f'julia_Hn_{n}{subs_part}.jl'
         if force_rebuild and jl_path.exists():
             print(f"  --force_rebuild: deleting {jl_path.name}")
             jl_path.unlink()
@@ -392,7 +433,7 @@ def ensure_Hn_julia_scripts(cache_dir: Path, m: int,
             scripts[n] = jl_path
             continue
         t0 = time.perf_counter()
-        print(f"  Building julia_Hn_{n}.jl ...", end=' ', flush=True)
+        print(f"  Building {jl_path.name} ...", end=' ', flush=True)
         if n == 0:
             Pc_n = sp.Integer(0)
             Ps_n = sp.Integer(1)
@@ -402,6 +443,9 @@ def ensure_Hn_julia_scripts(cache_dir: Path, m: int,
                 raise KeyError(f"H^{n} pkl missing in {cache_dir}")
             Pc_n = entry['Pc']
             Ps_n = entry['Ps']
+        if subs:
+            Pc_n = Pc_n.subs(subs)
+            Ps_n = Ps_n.subs(subs)
         src = _build_julia_script(Pc_n, Ps_n)
         jl_path.write_text(src, encoding='utf-8')
         scripts[n] = jl_path
@@ -518,16 +562,22 @@ def chebyshev_recurrence(H_apply, psi0, a, b_sc, m):
 def run_one_N(N, box_L, cheb_m, a, b_sc,
               n_random, k_max_arg, seed, svd_tol, n_print,
               jl_path, julia_exe, exact_all,
-              hn_scripts=None, coeffs_full=None) -> dict:
+              hn_scripts=None, coeffs_full=None,
+              fft_only=False, V_func=None) -> dict:
     """Per-grid-size comparison.
 
-    Pass hn_scripts (dict n->Path) and coeffs_full to use H^n accumulation mode.
-    Leave both None to use the default combined-expression mode.
+    fft_only : if True, skip the symbolic Julia path entirely (fast parameter
+               tuning before the expensive symbolic expression build).
+    V_func   : callable (X, Y, Z) -> V3  (ndarray, same shape as X).
+               None → harmonic oscillator  V = ½(x²+y²+z²).
+    exact_all: 1-D array of analytic eigenvalues for error reporting, or
+               None to skip vs-exact metrics (e.g. for Gaussian potential).
+    hn_scripts, coeffs_full: H^n accumulation mode (see ensure_Hn_julia_scripts).
     """
 
     d, x1d = make_grid(N, box_L)
     X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
-    V3   = 0.5 * (X**2 + Y**2 + Z**2)
+    V3   = V_func(X, Y, Z) if V_func is not None else 0.5 * (X**2 + Y**2 + Z**2)
     T_k  = make_T_k(N, d)
     N3   = N**3
     k_max = k_max_arg if k_max_arg > 0 else np.pi / d
@@ -555,56 +605,59 @@ def run_one_N(N, box_L, cheb_m, a, b_sc,
     mode_tag = "H^n-accum" if use_accumulate else "combined"
     sym_result = {"ok": False, "julia_timing": {}, "t_julia_s": 0.0,
                   "ritz_evals": [], "rank": 0, "t_ritz_s": 0.0,
-                  "mode": mode_tag}
-    print(f"  [sym]  Julia [{mode_tag}]  ({n_random} waves) ...", flush=True)
-    t0 = time.perf_counter()
-    try:
-        if use_accumulate:
-            C_sym, jtiming = _eval_hn_accumulate(
-                hn_scripts, coeffs_full, x1d, k_vals, b_vals,
-                julia_exe, N, cheb_m)
-        else:
-            C_sym, jtiming = julia_eval_filter(
-                jl_path, x1d, k_vals, b_vals, julia_exe)
-        t_julia  = time.perf_counter() - t0
-        es       = jtiming.get('eval_s') or 0.0
-        nw       = jtiming.get('n_eval_waves') or 1
-        ms_wave  = es / nw * 1e3
-        ns_point = es / nw / N3 * 1e9
-        jtiming.update({'N3': N3, 'ms_per_wave': ms_wave, 'ns_per_point': ns_point})
-        print(f"    warmup={jtiming.get('warmup_s','?'):.4f}s  "
-              f"eval={es:.4f}s/{nw} waves  "
-              f"({ms_wave:.3f} ms/wave  {ns_point:.3f} ns/point  N3={N3})  "
-              f"wall={t_julia:.1f}s")
+                  "mode": mode_tag, "skipped": fft_only}
+    if fft_only:
+        print(f"  [sym]  skipped (--fft_only)")
+    else:
+        print(f"  [sym]  Julia [{mode_tag}]  ({n_random} waves) ...", flush=True)
+        t0 = time.perf_counter()
+        try:
+            if use_accumulate:
+                C_sym, jtiming = _eval_hn_accumulate(
+                    hn_scripts, coeffs_full, x1d, k_vals, b_vals,
+                    julia_exe, N, cheb_m)
+            else:
+                C_sym, jtiming = julia_eval_filter(
+                    jl_path, x1d, k_vals, b_vals, julia_exe)
+            t_julia  = time.perf_counter() - t0
+            es       = jtiming.get('eval_s') or 0.0
+            nw       = jtiming.get('n_eval_waves') or 1
+            ms_wave  = es / nw * 1e3
+            ns_point = es / nw / N3 * 1e9
+            jtiming.update({'N3': N3, 'ms_per_wave': ms_wave, 'ns_per_point': ns_point})
+            print(f"    warmup={jtiming.get('warmup_s','?'):.4f}s  "
+                  f"eval={es:.4f}s/{nw} waves  "
+                  f"({ms_wave:.3f} ms/wave  {ns_point:.3f} ns/point  N3={N3})  "
+                  f"wall={t_julia:.1f}s")
 
-        nan_count = int(np.isnan(C_sym).any(axis=(1,2,3)).sum())
-        if nan_count:
-            print(f"    WARNING: {nan_count}/{n_random} waves have NaN  "
-                  f"-- rerun with --force_rebuild")
-        good = ~np.isnan(C_sym).any(axis=(1, 2, 3))
-        C_clean = C_sym[good]
+            nan_count = int(np.isnan(C_sym).any(axis=(1,2,3)).sum())
+            if nan_count:
+                print(f"    WARNING: {nan_count}/{n_random} waves have NaN  "
+                      f"-- rerun with --force_rebuild")
+            good = ~np.isnan(C_sym).any(axis=(1, 2, 3))
+            C_clean = C_sym[good]
 
-        sym_result['ok']           = True
-        sym_result['julia_timing'] = jtiming
-        sym_result['t_julia_s']    = t_julia
+            sym_result['ok']           = True
+            sym_result['julia_timing'] = jtiming
+            sym_result['t_julia_s']    = t_julia
 
-        if C_clean.shape[0] >= 5:
-            basis = C_clean.reshape(C_clean.shape[0], N3).T
-            print(f"  [sym]  Ritz  basis={basis.shape} ...", end=' ', flush=True)
-            t0 = time.perf_counter()
-            E_sym, _, rank = svd_rayleigh_ritz_op(
-                basis, H_mv, svd_tol=svd_tol, max_energies=n_print, hermitian=True)
-            t_ritz = time.perf_counter() - t0
-            sym_result.update({"ritz_evals": E_sym.tolist(),
-                               "rank": int(rank), "t_ritz_s": t_ritz})
-            print(f"{t_ritz:.2f}s  rank={rank}  E[0]={E_sym[0]:.6f}")
-            print(f"    Ritz: {np.round(E_sym[:n_print],6).tolist()}")
-        else:
-            print(f"    too few clean waves ({C_clean.shape[0]}), skipping Ritz")
+            if C_clean.shape[0] >= 5:
+                basis = C_clean.reshape(C_clean.shape[0], N3).T
+                print(f"  [sym]  Ritz  basis={basis.shape} ...", end=' ', flush=True)
+                t0 = time.perf_counter()
+                E_sym, _, rank = svd_rayleigh_ritz_op(
+                    basis, H_mv, svd_tol=svd_tol, max_energies=n_print, hermitian=True)
+                t_ritz = time.perf_counter() - t0
+                sym_result.update({"ritz_evals": E_sym.tolist(),
+                                   "rank": int(rank), "t_ritz_s": t_ritz})
+                print(f"{t_ritz:.2f}s  rank={rank}  E[0]={E_sym[0]:.6f}")
+                print(f"    Ritz: {np.round(E_sym[:n_print],6).tolist()}")
+            else:
+                print(f"    too few clean waves ({C_clean.shape[0]}), skipping Ritz")
 
-    except Exception as exc:
-        print(f"    ERROR: {exc}")
-        sym_result['t_julia_s'] = time.perf_counter() - t0
+        except Exception as exc:
+            print(f"    ERROR: {exc}")
+            sym_result['t_julia_s'] = time.perf_counter() - t0
 
     # ── FFT recurrence ────────────────────────────────────────────────────────
     print(f"  [fft]  Chebyshev  ({n_random} waves) ...", end=' ', flush=True)
@@ -630,19 +683,24 @@ def run_one_N(N, box_L, cheb_m, a, b_sc,
 
     # ── error metrics ─────────────────────────────────────────────────────────
     nc = min(n_print, len(E_fft))
-    err_fe = np.array([np.min(np.abs(exact_all - e)) for e in E_fft[:nc]])
-    max_fe = float(err_fe.max());  mean_fe = float(err_fe.mean())
+    if exact_all is not None:
+        err_fe = np.array([np.min(np.abs(exact_all - e)) for e in E_fft[:nc]])
+        max_fe = float(err_fe.max());  mean_fe = float(err_fe.mean())
+    else:
+        max_fe = mean_fe = float('nan')
 
     max_sf = float('nan');  max_se = float('nan');  mean_se = float('nan')
     if sym_result["ritz_evals"]:
         Es  = np.array(sym_result["ritz_evals"])
         nc2 = min(nc, len(Es))
         max_sf = float(np.abs(Es[:nc2] - E_fft[:nc2]).max())
-        err_se = np.array([np.min(np.abs(exact_all - e)) for e in Es[:nc2]])
-        max_se = float(err_se.max());  mean_se = float(err_se.mean())
+        if exact_all is not None:
+            err_se = np.array([np.min(np.abs(exact_all - e)) for e in Es[:nc2]])
+            max_se = float(err_se.max());  mean_se = float(err_se.mean())
         print(f"  max|E_sym-E_fft| = {max_sf:.3e}")
 
-    print(f"  max|E_fft-exact| = {max_fe:.3e}  mean={mean_fe:.3e}")
+    if not np.isnan(max_fe):
+        print(f"  max|E_fft-exact| = {max_fe:.3e}  mean={mean_fe:.3e}")
     if not np.isnan(max_se):
         print(f"  max|E_sym-exact| = {max_se:.3e}  mean={mean_se:.3e}")
 
@@ -676,6 +734,17 @@ def main():
                     help='Delete and rebuild cached .jl scripts')
     ap.add_argument('--use_hn_accumulate', action='store_true',
                     help='Filter via Σ c_n H^n scripts instead of combined expression')
+    ap.add_argument('--fft_only',          action='store_true',
+                    help='Skip symbolic Julia path; only run FFT recurrence '
+                         '(fast parameter tuning before expensive sym build)')
+    # Potential
+    ap.add_argument('--potential', choices=['ho', 'gaussian'], default='ho',
+                    help='Potential type: ho = harmonic oscillator (default), '
+                         'gaussian = V = -A*exp(-B*R²)')
+    ap.add_argument('--gauss_A',   type=float, default=1.0,
+                    help='Gaussian amplitude A  (only used if --potential gaussian)')
+    ap.add_argument('--gauss_B',   type=float, default=1.0,
+                    help='Gaussian width     B  (only used if --potential gaussian)')
     args = ap.parse_args()
 
     N_list    = parse_N_sweep(args.N_sweep)
@@ -683,17 +752,40 @@ def main():
     a    =  2.0 / (args.E_hi - args.E_lo)
     b_sc = -(args.E_hi + args.E_lo) / (args.E_hi - args.E_lo)
 
-    print("=== Symbolic vs FFT Chebyshev filter  3D HO ===")
+    # ── potential setup ───────────────────────────────────────────────────────
+    if args.potential == 'gaussian':
+        A_sym, B_sym = sp.symbols('A B', positive=True)
+        V_sym_build  = -A_sym * sp.exp(-B_sym * (sp.Symbol('x')**2 +
+                                                   sp.Symbol('y')**2 +
+                                                   sp.Symbol('z')**2))
+        subs         = {A_sym: args.gauss_A, B_sym: args.gauss_B}
+        V_func       = lambda X, Y, Z: (
+            -args.gauss_A * np.exp(-args.gauss_B * (X**2 + Y**2 + Z**2)))
+        exact_all    = None          # no analytic levels for Gaussian
+        pot_label    = f'gaussian(A={args.gauss_A}, B={args.gauss_B})'
+    else:
+        V_sym_build  = None          # ensure_H_powers_cache uses HO default
+        subs         = None
+        V_func       = None          # run_one_N uses HO default
+        exact_all    = ho3d_exact_levels()
+        pot_label    = 'ho'
+
+    print("=== Symbolic vs FFT Chebyshev filter ===")
+    print(f"  potential={pot_label}")
     print(f"  cheb_m={args.cheb_m}  E_lo={args.E_lo}  E_hi={args.E_hi}")
     print(f"  a={a:.8f}  b_sc={b_sc:.8f}")
     print(f"  box_L={args.box_L}  N_sweep={N_list}  n_random={args.n_random}")
     print(f"  force_rebuild={args.force_rebuild}  "
+          f"fft_only={args.fft_only}  "
           f"use_hn_accumulate={args.use_hn_accumulate}")
+    if args.potential == 'gaussian':
+        print(f"  cache_dir={cache_dir}  "
+              f"(use a separate dir from HO to avoid pkl conflicts)")
     print()
 
     # Step 1: H^n pkl cache
     print("-- Step 1: H^n pkl cache --")
-    ensure_H_powers_cache(cache_dir, args.cheb_m)
+    ensure_H_powers_cache(cache_dir, args.cheb_m, V_sym=V_sym_build)
     print()
 
     # Step 2: Chebyshev coefficients
@@ -703,23 +795,27 @@ def main():
         print(f"  c_{n:2d} = {float(c):+.10g}")
     print()
 
-    # Step 3: Julia script(s)
-    if args.use_hn_accumulate:
+    # Step 3: Julia script(s)  [skipped if --fft_only]
+    if args.fft_only:
+        print("-- Step 3: skipped (--fft_only) --")
+        jl_path     = None
+        hn_scripts  = None
+        coeffs_full = None
+    elif args.use_hn_accumulate:
         print("-- Step 3: H^n Julia scripts (accumulation mode) --")
         jl_path    = None
         hn_scripts = ensure_Hn_julia_scripts(
-            cache_dir, args.cheb_m, force_rebuild=args.force_rebuild)
+            cache_dir, args.cheb_m,
+            force_rebuild=args.force_rebuild, subs=subs)
         coeffs_full = coeffs
     else:
         print("-- Step 3: combined Julia filter script --")
         jl_path     = ensure_julia_filter_script(
             cache_dir, args.cheb_m, args.E_lo, args.E_hi,
-            force_rebuild=args.force_rebuild)
+            force_rebuild=args.force_rebuild, subs=subs)
         hn_scripts  = None
         coeffs_full = None
     print()
-
-    exact_all = ho3d_exact_levels()
 
     # Step 4: sweep
     t0    = time.perf_counter()
@@ -732,23 +828,31 @@ def main():
             seed=args.seed, svd_tol=args.svd_tol, n_print=args.n_print,
             jl_path=jl_path, julia_exe=args.julia_exe,
             exact_all=exact_all,
-            hn_scripts=hn_scripts, coeffs_full=coeffs_full))
+            hn_scripts=hn_scripts, coeffs_full=coeffs_full,
+            fft_only=args.fft_only, V_func=V_func))
     wall = time.perf_counter() - t0
 
     print(f"\n{'='*70}")
     print("Summary")
-    print(f"{'N':>4}  {'d':>7}  {'N3':>7}  "
-          f"{'sym_vs_fft':>12}  {'fft_vs_exact':>13}  {'sym_vs_exact':>13}")
+    have_exact = exact_all is not None
+    hdr = (f"{'N':>4}  {'d':>7}  {'N3':>7}  {'sym_vs_fft':>12}"
+           + (f"  {'fft_vs_exact':>13}  {'sym_vs_exact':>13}" if have_exact else ""))
+    print(hdr)
     for r in sweep:
-        print(f"{r['N']:>4}  {r['d']:>7.4f}  {r['N']**3:>7d}  "
-              f"{r['max_sym_vs_fft']:>12.3e}  "
-              f"{r['max_fft_vs_exact']:>13.3e}  "
-              f"{r['max_sym_vs_exact']:>13.3e}")
+        row = (f"{r['N']:>4}  {r['d']:>7.4f}  {r['N']**3:>7d}  "
+               f"{r['max_sym_vs_fft']:>12.3e}")
+        if have_exact:
+            row += (f"  {r['max_fft_vs_exact']:>13.3e}"
+                    f"  {r['max_sym_vs_exact']:>13.3e}")
+        print(row)
     print(f"\nTotal wall time: {wall:.1f}s")
 
     out = {"script": Path(__file__).name,
            "datetime": datetime.now().strftime("%Y%m%d_%H%M%S"),
            "params": {"N_list": N_list, "box_L": args.box_L,
+                      "potential": args.potential,
+                      "gauss_A": args.gauss_A if args.potential == 'gaussian' else None,
+                      "gauss_B": args.gauss_B if args.potential == 'gaussian' else None,
                       "cheb_m": args.cheb_m, "E_lo": args.E_lo, "E_hi": args.E_hi,
                       "a": a, "b_sc": b_sc, "coeffs": [float(c) for c in coeffs],
                       "n_random": args.n_random, "n_print": args.n_print,
