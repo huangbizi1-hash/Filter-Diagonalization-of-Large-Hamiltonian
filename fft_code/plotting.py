@@ -30,7 +30,8 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
                                filter_label: str = "Filter",
                                samp_ref: Optional[np.ndarray] = None,
                                samp_ref_label: str = "ref nodes",
-                               extra_components: Optional[list] = None) -> None:
+                               extra_components: Optional[list] = None,
+                               style: Optional[Dict] = None) -> None:
     """
     真实窗函数 vs Newton 多项式插值。
 
@@ -73,8 +74,16 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
         # 转换关系：x_phys = (samp + 2) * dE/4 + Vmin
         x_nodes = (samp + 2.0) * par.dE / 4.0 + par.Vmin
 
+    style = style or {}
+    title_txt = style.get("title")
+    title_fs = style.get("title_fontsize")
+    label_fs = style.get("label_fontsize")
+    tick_fs = style.get("tick_fontsize")
+    legend_fs = style.get("legend_fontsize")
+    figsize = tuple(style.get("figsize", (10, 6)))
+
     x_plot = np.linspace(interval[0], interval[1], 1000)
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=figsize)
 
     # 主滤波分量（蓝色=真实，红色虚线=Newton 插值）
     for ie, El in enumerate(El_list):
@@ -134,14 +143,20 @@ def plot_filter_interpolation(El_list, an, samp, par: PhysParams,
                     clip_on=False)
         ax.set_ylim(y_lo, y_hi)
 
-    ax.set_xlabel('Energy (Hartree)')
-    ax.set_ylabel('f(E)')
+    ax.set_xlabel('Energy (Hartree)', fontsize=label_fs)
+    ax.set_ylabel('f(E)', fontsize=label_fs)
     if has_nodes:
-        ax.set_title(f'{filter_label} vs Newton Interpolation (nc={len(samp)})')
+        default_title = f'{filter_label} vs Newton Interpolation (nc={len(samp)})'
     else:
-        ax.set_title(f'{filter_label}')
+        default_title = f'{filter_label}'
+    ax.set_title(title_txt or default_title, fontsize=title_fs)
     ax.set_xlim(interval[0], interval[1])
-    ax.legend()
+    if tick_fs is not None:
+        ax.tick_params(axis='both', labelsize=tick_fs)
+    if legend_fs is not None:
+        ax.legend(fontsize=legend_fs)
+    else:
+        ax.legend()
     ax.grid(True)
     fig.tight_layout()
     _savefig(fig, out_dir / "filter_interpolation.png")
@@ -304,8 +319,16 @@ def plot_filter_monomial(El_list, cn, par: PhysParams,
             result = result * x + mono[k]
         return result
 
+    style = style or {}
+    title_txt = style.get("title")
+    title_fs = style.get("title_fontsize")
+    label_fs = style.get("label_fontsize")
+    tick_fs = style.get("tick_fontsize")
+    legend_fs = style.get("legend_fontsize")
+    figsize = tuple(style.get("figsize", (10, 6)))
+
     x_plot = np.linspace(interval[0], interval[1], 1000)
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=figsize)
     for ie, El in enumerate(El_list):
         y_true = filter_func(x_plot, El)
         y_mono = np.array([_mono_eval(x, cn[ie]) for x in x_plot])
@@ -319,7 +342,12 @@ def plot_filter_monomial(El_list, cn, par: PhysParams,
     ax.set_ylabel('f(x)')
     ax.set_title(f'Filter Function vs Monomial Evaluation (nc={len(cn[0])})')
     ax.set_xlim(interval[0], interval[1])
-    ax.legend()
+    if tick_fs is not None:
+        ax.tick_params(axis='both', labelsize=tick_fs)
+    if legend_fs is not None:
+        ax.legend(fontsize=legend_fs)
+    else:
+        ax.legend()
     ax.grid(True)
     fig.tight_layout()
     _savefig(fig, out_dir / "filter_monomial.png")
@@ -341,7 +369,12 @@ def plot_filtered_energies(El_list, E_mean_all, E_std_all, N_values,
     ax.set_xlabel('El')
     ax.set_ylabel('E_filtered')
     ax.set_title(f'Filtered Energy by FFT (Averaged over {n_random} Random States)')
-    ax.legend()
+    if tick_fs is not None:
+        ax.tick_params(axis='both', labelsize=tick_fs)
+    if legend_fs is not None:
+        ax.legend(fontsize=legend_fs)
+    else:
+        ax.legend()
     ax.grid(True)
     fig.tight_layout()
     _savefig(fig, out_dir / "filtered_energies.png")
