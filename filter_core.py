@@ -50,7 +50,65 @@ __all__ = [
     "apply_filter_H_op",
     "apply_filter_H_all_op",
     "svd_rayleigh_ritz_op",
+    "power_method_max_eig",
 ]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 算符无关的最大本征值估计：幂法（带下界平移确保正定）
+# ──────────────────────────────────────────────────────────────────────
+
+def power_method_max_eig(
+    H_apply: Callable[[np.ndarray], np.ndarray],
+    shape: Tuple[int, ...],
+    V_lower: float,
+    n_iter: int = 30,
+    rng: np.random.Generator | None = None,
+    tol: float = 1e-4,
+) -> Tuple[float, int]:
+    """
+    用幂法估计 Hermitian 算符 H 的最大本征值。
+
+    通过平移 H' = H - (V_lower - 1)·I 使 H' 正定（前提：V_lower ≤ λ_min(H)），
+    然后对 H' 做幂迭代，主导本征值即 λ_max(H) - (V_lower - 1)。
+
+    参数
+    ----
+    H_apply : callable(psi) -> Hψ
+    shape   : 测试向量的形状（与 H_apply 接受的输入形状一致）
+    V_lower : H 谱下界的估计（如 V.min()），必须 ≤ λ_min(H)
+    n_iter  : 最大迭代次数
+    rng     : 随机数生成器
+    tol     : 相对收敛阈值（|λ_k - λ_{k-1}| / |λ_k| < tol 即停止）
+
+    返回
+    ----
+    lam_max : 最大本征值估计
+    iters   : 实际迭代次数
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
+    psi = rng.standard_normal(shape).astype(np.float64)
+    nrm = float(np.linalg.norm(psi))
+    if nrm == 0.0:
+        psi.flat[0] = 1.0
+        nrm = 1.0
+    psi /= nrm
+
+    shift = float(V_lower) - 1.0   # H' = H - shift*I, 谱 ⊂ [1, λ_max - shift]
+    lam_prev = 0.0
+    lam = 0.0
+    for k in range(1, n_iter + 1):
+        Hpsi   = H_apply(psi) - shift * psi
+        lam    = float(np.real(np.vdot(psi.ravel(), Hpsi.ravel())))
+        nrm    = float(np.linalg.norm(Hpsi))
+        if nrm == 0.0:
+            break
+        psi    = Hpsi / nrm
+        if k > 1 and abs(lam - lam_prev) <= tol * max(abs(lam), 1e-12):
+            return lam + shift, k
+        lam_prev = lam
+    return lam + shift, n_iter
 
 
 # ──────────────────────────────────────────────────────────────────────
