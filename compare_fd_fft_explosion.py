@@ -347,20 +347,42 @@ def run_single_N(N: int, args, fd_orders: list, n_print, ritz_h: str = 'consiste
 
 
 
-def exact_n_plus_half(n_levels: int, omega: float = 1.0) -> np.ndarray:
-    """Return exact reference values E_n = omega*(n + 0.5)."""
-    n = np.arange(n_levels, dtype=float)
-    return omega * (n + 0.5)
+def exact_ho3d_evals(n_levels: int, omega: float = 1.0) -> np.ndarray:
+    """First n_levels eigenvalues of 3D isotropic HO: E = omega*(nx+ny+nz+3/2).
+
+    Each principal quantum number N = nx+ny+nz has degeneracy (N+1)*(N+2)//2.
+    Returns sorted eigenvalues with correct degeneracy.
+    """
+    evals = []
+    for N in range(n_levels + 20):
+        degen = (N + 1) * (N + 2) // 2
+        evals.extend([omega * (N + 1.5)] * degen)
+        if len(evals) >= n_levels:
+            break
+    return np.array(evals[:n_levels])
 
 
 def benchmark_h_apply_time(H_matvec, N3: int, n_repeat: int = 500) -> float:
-    """Average wall-time (seconds) per H application over n_repeat calls."""
+    """Average wall-time (seconds) per H application over n_repeat calls.
+
+    Applies H to the same fixed unit vector each time to avoid overflow from
+    repeated power-iteration amplification of large eigenvalues.
+    """
     rng = np.random.default_rng(12345)
     v = rng.standard_normal(N3).astype(np.float64)
+    v /= np.linalg.norm(v)
+    H_matvec(v)  # warm-up (not timed)
     t0 = time.perf_counter()
     for _ in range(n_repeat):
-        v = H_matvec(v)
+        H_matvec(v)
     return (time.perf_counter() - t0) / max(n_repeat, 1)
+
+
+def _get_num_matvecs(stats) -> int:
+    """Extract numMatvecs from primme stats (dict or object with attributes)."""
+    if isinstance(stats, dict):
+        return int(stats.get('numMatvecs', -1))
+    return int(getattr(stats, 'numMatvecs', -1))
 
 
 def run_jdqmr_single_N(N: int, args, fd_orders: list) -> dict:
@@ -370,44 +392,73 @@ def run_jdqmr_single_N(N: int, args, fd_orders: list) -> dict:
     d, x1d = make_grid_from_N(N, args.box_L)
     N3 = N**3
     X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
-    V_num = 0.5 * args.omega**2 * (X**2 + Y**2 + Z**2)
+
+    if args.potential == 'gaussian':
+        V_num = -args.A * np.exp(-args.B * (X**2 + Y**2 + Z**2))
+    else:
+        V_num = 0.5 * args.omega**2 * (X**2 + Y**2 + Z**2)
+
     T_k_exact = make_T_k(N, d)
 
+    # Reference exact eigenvalues (3D HO only; gaussian has no closed form here)
+    if args.potential == 'harmonic':
+        exact = exact_ho3d_evals(args.n_levels, omega=args.omega)
+    else:
+        exact = None
+
+    def _make_entry(label, evals, t_avg, stats):
+        evals = np.sort(np.asarray(evals).real)
+        entry = {
+            'label'        : label,
+            'evals'        : evals.tolist(),
+            'avg_h_apply_s': float(t_avg),
+            'num_matvecs'  : _get_num_matvecs(stats),
+        }
+        if exact is not None:
+            n = min(len(evals), len(exact))
+            err = np.abs(evals[:n] - exact[:n])
+            entry['exact_ho3d']    = exact[:n].tolist()
+            entry['abs_err']       = err.tolist()
+            entry['mean_abs_err']  = float(np.mean(err))
+            entry['max_abs_err']   = float(np.max(err))
+        return entry
+
+    def _run_jdqmr(H_linop):
+        return primme.eigsh(
+            H_linop,
+            k=args.n_levels, which='SA', method='PRIMME_JDQMR',
+            tol=args.jdqmr_tol, maxMatvecs=args.max_matvecs,
+            return_stats=True, return_history=False,
+        )
+
+    methods = []
+
+    # FFT method
     def H_fft(v):
         return apply_H_fft(v, V_num, T_k_exact)
 
-    methods = []
-    for label, H in [('fft', H_fft)]:
-        t_avg = benchmark_h_apply_time(H, N3, n_repeat=args.h_repeat)
-        evals, _, stats = primme.eigsh(
-            LinearOperator((N3, N3), matvec=H, dtype=float),
-            k=args.n_levels, which='SA', method='PRIMME_JDQMR',
-            tol=args.jdqmr_tol, maxMatvecs=args.max_matvecs,
-            ncv=max(4 * args.n_levels, 40), return_stats=True, return_history=False,
-        )
-        evals = np.sort(evals.real)
-        exact = exact_n_plus_half(len(evals), omega=args.omega)
-        err = np.abs(evals - exact)
-        methods.append({'label':label,'evals':evals.tolist(),'exact_n_plus_half':exact.tolist(),'abs_err':err.tolist(),'mean_abs_err':float(np.mean(err)),'max_abs_err':float(np.max(err)),'avg_h_apply_s':float(t_avg),'num_matvecs':int(stats.get('numMatvecs',-1))})
+    t_avg = benchmark_h_apply_time(H_fft, N3, n_repeat=args.h_repeat)
+    evals, _, stats = _run_jdqmr(LinearOperator((N3, N3), matvec=H_fft, dtype=float))
+    methods.append(_make_entry('fft', evals, t_avg, stats))
+    print(f'  [fft]  avg_H={t_avg*1e3:.3f}ms  matvecs={_get_num_matvecs(stats)}'
+          + (f'  mean_err={methods[-1]["mean_abs_err"]:.2e}' if exact is not None else ''))
 
+    # FD methods
     for order in fd_orders:
         stencil = FD_STENCILS[order].astype(np.float64)
         inv_d2  = -0.5 / (d ** 2)
+
         def H_fd(v, _s=stencil, _id2=inv_d2, _N=N):
             return apply_H_fd(v.reshape(_N, _N, _N), V_num, _s, _id2).ravel()
-        t_avg = benchmark_h_apply_time(H_fd, N3, n_repeat=args.h_repeat)
-        evals, _, stats = primme.eigsh(
-            LinearOperator((N3, N3), matvec=H_fd, dtype=float),
-            k=args.n_levels, which='SA', method='PRIMME_JDQMR',
-            tol=args.jdqmr_tol, maxMatvecs=args.max_matvecs,
-            ncv=max(4 * args.n_levels, 40), return_stats=True, return_history=False,
-        )
-        evals = np.sort(evals.real)
-        exact = exact_n_plus_half(len(evals), omega=args.omega)
-        err = np.abs(evals - exact)
-        methods.append({'label':f'fd{order}','evals':evals.tolist(),'exact_n_plus_half':exact.tolist(),'abs_err':err.tolist(),'mean_abs_err':float(np.mean(err)),'max_abs_err':float(np.max(err)),'avg_h_apply_s':float(t_avg),'num_matvecs':int(stats.get('numMatvecs',-1))})
 
-    return {'N':N,'N3':N3,'d':d,'solver':'jdqmr','methods':methods}
+        t_avg = benchmark_h_apply_time(H_fd, N3, n_repeat=args.h_repeat)
+        evals, _, stats = _run_jdqmr(LinearOperator((N3, N3), matvec=H_fd, dtype=float))
+        methods.append(_make_entry(f'fd{order}', evals, t_avg, stats))
+        print(f'  [fd{order}] avg_H={t_avg*1e3:.3f}ms  matvecs={_get_num_matvecs(stats)}'
+              + (f'  mean_err={methods[-1]["mean_abs_err"]:.2e}' if exact is not None else ''))
+
+    return {'N': N, 'N3': N3, 'd': d, 'solver': 'jdqmr',
+            'potential': args.potential, 'methods': methods}
 
 # ── CLI helpers ────────────────────────────────────────────────────────────────
 
