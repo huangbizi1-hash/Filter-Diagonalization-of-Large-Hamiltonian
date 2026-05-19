@@ -369,12 +369,7 @@ def plot_filtered_energies(El_list, E_mean_all, E_std_all, N_values,
     ax.set_xlabel('El')
     ax.set_ylabel('E_filtered')
     ax.set_title(f'Filtered Energy by FFT (Averaged over {n_random} Random States)')
-    if tick_fs is not None:
-        ax.tick_params(axis='both', labelsize=tick_fs)
-    if legend_fs is not None:
-        ax.legend(fontsize=legend_fs)
-    else:
-        ax.legend()
+    ax.legend()
     ax.grid(True)
     fig.tight_layout()
     _savefig(fig, out_dir / "filtered_energies.png")
