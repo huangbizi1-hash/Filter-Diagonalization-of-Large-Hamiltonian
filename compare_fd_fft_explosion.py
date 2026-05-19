@@ -260,14 +260,15 @@ def run_single_N(N: int, args, fd_orders: list, n_print, ritz_h: str = 'consiste
           f'V_max={V_max:.2f} Ha  kinetic_cut={kinetic_cut:.2f} Ha')
 
     # ── reference: eigsh ──────────────────────────────────────────────────────
-    print(f'  [ref] eigsh ({args.n_levels} levels) ...', end=' ', flush=True)
+    n_ref = max(args.n_levels, n_print or 0)
+    print(f'  [ref] eigsh ({n_ref} levels) ...', end=' ', flush=True)
     t0 = time.perf_counter()
     H_linop = LinearOperator(
         (N3, N3),
         matvec=lambda v: apply_H_fft(v, V_num, T_k_exact),
         dtype=float,
     )
-    E_ref, _ = eigsh(H_linop, k=args.n_levels, which='SA')
+    E_ref, _ = eigsh(H_linop, k=n_ref, which='SA')
     t_ref = time.perf_counter() - t0
     E_ref = np.sort(E_ref)
     print(f'{t_ref:.2f}s  E_ref={np.round(E_ref, 5).tolist()}')
@@ -493,6 +494,48 @@ def _print_result(res: dict, n_print):
     print(f'    Ritz ({len(ritz)} evals): {np.round(ritz, 6).tolist()}')
 
 
+# ── metrics (Pareto-frontier format) ──────────────────────────────────────────
+
+def _build_metrics_entries(sweep_results, potential: str, omega: float,
+                           metrics_n: int):
+    """Return (fft_entries, fd_entries) in the Pareto-frontier JSON format.
+
+    Each entry: {N, N3, Method, avg_error, filter_time}.
+      avg_error   = mean(|Ritz[:metrics_n] - reference[:metrics_n]|)
+      filter_time = time to apply f(H) to one state (filter_per_state_s)
+
+    Reference values:
+      - harmonic potential → analytical 3D-HO eigenvalues with full degeneracy
+      - other potentials   → eigsh result on H_FFT for this N (E_ref)
+    """
+    fft_entries = []
+    fd_entries  = []
+    for res in sweep_results:
+        N  = res['N']
+        N3 = res['N3']
+        if potential == 'harmonic':
+            ref = exact_ho3d_evals(metrics_n, omega=omega)
+        else:
+            ref = np.asarray(res['E_ref'][:metrics_n], dtype=float)
+        for m in res['methods']:
+            evals = np.asarray(m['ritz_evals'][:metrics_n], dtype=float)
+            n = min(len(evals), len(ref))
+            if n == 0:
+                continue
+            entry = {
+                'N'          : N,
+                'N3'         : N3,
+                'Method'     : m['label'],
+                'avg_error'  : float(np.mean(np.abs(evals[:n] - ref[:n]))),
+                'filter_time': float(m['filter_per_state_s']),
+            }
+            if m['label'] == 'fft':
+                fft_entries.append(entry)
+            else:
+                fd_entries.append(entry)
+    return fft_entries, fd_entries
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -561,6 +604,15 @@ def main():
                     help='Average H-apply time over this many repeats [default 500]')
     ap.add_argument('--out_json',  type=str,   default='fd_fft_explosion.json',
                     help='Output JSON path  [default fd_fft_explosion.json]')
+    ap.add_argument('--fft_metrics_out', type=str, default='fft_metrics.json',
+                    help='Pareto-frontier metrics JSON for the FFT method '
+                         '[default fft_metrics.json]')
+    ap.add_argument('--fd_metrics_out',  type=str, default='fd_metrics.json',
+                    help='Pareto-frontier metrics JSON for all FD orders '
+                         '[default fd_metrics.json]')
+    ap.add_argument('--metrics_n', type=int, default=20,
+                    help='Number of eigenvalues used to compute avg_error '
+                         '(|Ritz - reference|)  [default 20]')
     args = ap.parse_args()
 
     t_wall_start = time.perf_counter()
@@ -667,6 +719,15 @@ def main():
     }
     Path(args.out_json).write_text(json.dumps(summary, indent=2))
     print(f'Results → {args.out_json}')
+
+    # ── Pareto-frontier metrics JSONs ─────────────────────────────────────────
+    if args.solver == 'explosion':
+        fft_entries, fd_entries = _build_metrics_entries(
+            sweep_results, args.potential, args.omega, args.metrics_n)
+        Path(args.fft_metrics_out).write_text(json.dumps(fft_entries, indent=2))
+        Path(args.fd_metrics_out ).write_text(json.dumps(fd_entries,  indent=2))
+        print(f'FFT metrics → {args.fft_metrics_out} ({len(fft_entries)} entries)')
+        print(f'FD  metrics → {args.fd_metrics_out } ({len(fd_entries)} entries)')
 
 
 if __name__ == '__main__':
