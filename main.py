@@ -115,6 +115,7 @@ from filter_core import (
     apply_filter_H_op,
     apply_filter_H_all_op,
     svd_rayleigh_ritz_op,
+    power_method_max_eig,
 )
 
 
@@ -286,15 +287,26 @@ def run(cfg: Dict[str, Any]) -> None:
     kinetic_cut  = cfg.get("kinetic_cut", 30.0)
     T_k_diagonal = build_k_diagonal(x_grid, kinetic_cut=kinetic_cut)
 
-    # H_apply_fft：3D 网格输入/输出，供滤波阶段共享基底
+    # H_apply_fft：3D 网格输入/输出，FFT 动能 + V
     H_apply_fft  = lambda psi: apply_H(psi, V, T_k_diagonal)
-    # H_apply_flat：1D flat 输入/输出，供 RR 阶段列向量运算（始终用 FFT）
+    # H_apply_flat：1D flat 输入/输出，供 Ritz 阶段列向量运算（始终用 FFT）
     H_apply_flat = lambda psi_flat: apply_H(
         psi_flat.reshape(Nx, Ny, Nz), V, T_k_diagonal).ravel()
 
-    # FD H_apply（仅当 fd_order 指定时构建，用于 chebyshev_explosion filter）
+    # ---- 滤波阶段动能选择：FFT（默认）或 FD（各阶有限差分） ----
+    # Ritz 阶段始终用 FFT —— 这是混合模式的关键特征。
+    filter_kinetic = str(cfg.get("filter_kinetic", "fft")).lower()
+    if filter_kinetic not in ("fft", "fd"):
+        raise ValueError(
+            f"filter_kinetic must be 'fft' or 'fd', got {filter_kinetic!r}")
+
     fd_order = cfg.get("fd_order", None)
-    if fd_order is not None:
+    H_apply_fd = None
+    H_max_fd_est = None
+    power_iter_seconds = None
+    if filter_kinetic == "fd":
+        if fd_order is None:
+            raise ValueError("filter_kinetic='fd' requires fd_order to be set")
         fd_order = int(fd_order)
         if fd_order not in FD_STENCILS:
             raise ValueError(
@@ -308,9 +320,55 @@ def run(cfg: Dict[str, Any]) -> None:
                     convolve1d(psi, _fd_stencil, axis=2, mode='wrap')) * _fd_inv_d2
             return Tpsi + V * psi
 
-        print(f"   FD kinetic: order={fd_order}  (filter only; Ritz uses H_FFT)")
+        H_apply_filter = H_apply_fd
+        print(f"   Filter kinetic: FD order={fd_order}  (Ritz uses H_FFT)")
+
+        # ---- 用幂法估计 FD 哈密顿量的最大本征值，验证滤波窗口覆盖谱 ----
+        pm_iters = int(cfg.get("power_iter_iters", 50))
+        pm_tol   = float(cfg.get("power_iter_tol", 1e-4))
+        t_pm = time.perf_counter()
+        rng_pm = np.random.default_rng(seed + 1)
+        H_max_fd_est, pm_done = power_method_max_eig(
+            H_apply_fd, (Nx, Ny, Nz),
+            V_lower=float(V.min()),
+            n_iter=pm_iters, rng=rng_pm, tol=pm_tol,
+        )
+        H_max_fd_est = float(H_max_fd_est)
+        power_iter_seconds = time.perf_counter() - t_pm
+        timings["power_iter_fd_max_eig"] = power_iter_seconds
+        print(f"   FD spectrum check: H_max ≈ {H_max_fd_est:.4f} "
+              f"(power iter, {pm_done}/{pm_iters} steps, "
+              f"{power_iter_seconds:.2f} s)")
+        win_lo_fd = cfg["Vmin"]
+        win_hi_fd = cfg["Vmin"] + cfg["dE"]
+        if win_lo_fd > float(V.min()) or win_hi_fd < H_max_fd_est:
+            needed_dE = H_max_fd_est - float(V.min())
+            print(f"\n  ⚠️  WARNING: filter window [{win_lo_fd}, {win_hi_fd}] does NOT cover "
+                  f"FD spectrum ≈ [{float(V.min()):.2f}, {H_max_fd_est:.2f}]!")
+            print(f"     Suggested fix for FD-{fd_order}: "
+                  f"Vmin ≤ {float(V.min()):.2f}, dE ≥ {needed_dE:.2f}\n")
+        else:
+            print(f"   Filter window [{win_lo_fd}, {win_hi_fd}] ⊇ FD spectrum "
+                  f"≈ [{float(V.min()):.2f}, {H_max_fd_est:.2f}]")
     else:
-        H_apply_fd = None
+        # filter_kinetic == "fft": 滤波阶段也用 FFT；fd_order（若指定）只对
+        # chebyshev_explosion 这种旧路径生效（保留向后兼容）
+        if fd_order is not None:
+            fd_order = int(fd_order)
+            if fd_order not in FD_STENCILS:
+                raise ValueError(
+                    f"fd_order={fd_order} not in FD_STENCILS {sorted(FD_STENCILS)}")
+            _fd_stencil = FD_STENCILS[fd_order].astype(np.float64)
+            _fd_inv_d2  = -0.5 / (float(x[1] - x[0]) ** 2)
+
+            def H_apply_fd(psi: np.ndarray) -> np.ndarray:
+                Tpsi = (convolve1d(psi, _fd_stencil, axis=0, mode='wrap') +
+                        convolve1d(psi, _fd_stencil, axis=1, mode='wrap') +
+                        convolve1d(psi, _fd_stencil, axis=2, mode='wrap')) * _fd_inv_d2
+                return Tpsi + V * psi
+            print(f"   FD kinetic available (order={fd_order}) for "
+                  f"chebyshev_explosion path; main filter uses FFT.")
+        H_apply_filter = H_apply_fft
 
     # ================================================================
     # 3. 构建滤波系数
@@ -512,16 +570,19 @@ def run(cfg: Dict[str, Any]) -> None:
     _make_psi = _psi_generators[_init_type]
     print(f"   Initial state type: {_init_type}")
 
+    # Per-state filter timing: 仅记录 f(H)|ψ⟩ 的纯递推耗时（不含归一化/Ritz 期望值）
+    filter_apply_seconds_per_state: list = []
     for i in range(n_random):
         psi_rand = _make_psi(X, Y, Z, rng=rng)
 
+        _t_state = time.perf_counter()
         if filter_type == "split_bandpass":
             psi_hi_all = apply_filter_H_all_op(
-                H_apply_fft, psi_rand, samp, an_hi, par)        # (ms, Nx, Ny, Nz)
+                H_apply_filter, psi_rand, samp, an_hi, par)     # (ms, Nx, Ny, Nz)
             psi_filt_all = np.zeros_like(psi_hi_all)
             for ie in range(ist.ms):
                 psi_filt_all[ie] = apply_filter_H_op(
-                    H_apply_fft, psi_hi_all[ie], samp, an_lo[ie], par)
+                    H_apply_filter, psi_hi_all[ie], samp, an_lo[ie], par)
         elif filter_type == "chebyshev_explosion":
             cheb_m = int(cfg.get("cheb_m", nc))
             cheb_E_lo = float(cfg.get("cheb_E_lo", cfg.get("Vmin", -1.0)))
@@ -547,7 +608,8 @@ def run(cfg: Dict[str, Any]) -> None:
             psi_filt_all = np.stack([psi_f for _ in range(ist.ms)], axis=0)
         else:
             psi_filt_all = apply_filter_H_all_op(
-                H_apply_fft, psi_rand, samp, an, par)           # (ms, Nx, Ny, Nz)
+                H_apply_filter, psi_rand, samp, an, par)        # (ms, Nx, Ny, Nz)
+        filter_apply_seconds_per_state.append(time.perf_counter() - _t_state)
 
         for ie in range(ist.ms):
             psi_filt = normalize_psi(psi_filt_all[ie])
@@ -570,6 +632,11 @@ def run(cfg: Dict[str, Any]) -> None:
                 print(f"   El={El_list[ie]:.2f}  mean={mean_e:.4f}  std={std_e:.4f}")
 
     timings["filter_states"] = time.perf_counter() - t0
+    # 仅 f(H)|ψ⟩ 递推耗时（不含归一化/Ritz 期望值/打印）
+    timings["filter_apply_total"] = float(sum(filter_apply_seconds_per_state))
+    timings["filter_apply_mean_per_state"] = (
+        timings["filter_apply_total"] / max(len(filter_apply_seconds_per_state), 1)
+    )
     if filter_type == "chebyshev_explosion":
         error_mean = None
         print("   Explosion filter mode: El/error_mean_vs_El not used.")
@@ -579,7 +646,10 @@ def run(cfg: Dict[str, Any]) -> None:
     else:
         error_mean = float(np.mean(np.abs(np.array(E_mean) - El_list)))
         print(f"   Mean error vs El: {error_mean:.6f}")
-    print(f"   Time: {timings['filter_states']:.3f} s")
+    print(f"   Time (filter incl. normalize/⟨H⟩): {timings['filter_states']:.3f} s")
+    print(f"   Time (filter apply only, sum over {n_random} state(s)): "
+          f"{timings['filter_apply_total']:.3f} s "
+          f"(mean/state = {timings['filter_apply_mean_per_state']:.3f} s)")
 
     if filter_type != "chebyshev_explosion":
         plot_filtered_energies(El_list, [E_mean], [E_std], [N], [error_mean],
@@ -647,7 +717,16 @@ def run(cfg: Dict[str, Any]) -> None:
             **({"beta": beta, "E1": E1}
                if filter_type == "bandpass" else {}),
             "fd_order": fd_order,
+            "filter_kinetic": filter_kinetic,
             "ritz_kinetic": "FFT",
+            "H_max_fd_power_iter": H_max_fd_est,
+            "power_iter_seconds":  power_iter_seconds,
+            "build_filter_seconds":        timings.get("build_filter"),
+            "filter_states_seconds":       timings.get("filter_states"),
+            "filter_apply_total_seconds":  timings.get("filter_apply_total"),
+            "filter_apply_mean_per_state_seconds":
+                timings.get("filter_apply_mean_per_state"),
+            "filter_apply_seconds_per_state": filter_apply_seconds_per_state,
             "El_list": El_list.tolist(),
             "E_mean":  E_mean,
             "E_std":   E_std,
@@ -718,6 +797,17 @@ def main():
     parser.add_argument("--scan_json", type=str, default=None)
     parser.add_argument("--set",       action="append", default=[],
                         metavar="KEY=VALUE")
+    parser.add_argument("--filter_kinetic", type=str, default=None,
+                        choices=["fft", "fd"],
+                        help="kinetic operator used in filter step "
+                             "(Ritz always uses FFT)")
+    parser.add_argument("--fd_order", type=int, default=None,
+                        help="single FD order for filter step "
+                             "(requires --filter_kinetic fd)")
+    parser.add_argument("--fd_orders", type=str, default=None,
+                        help="comma-separated FD orders, e.g. '2,4,6,8' — "
+                             "sweep one run per order; implies "
+                             "--filter_kinetic fd")
     args = parser.parse_args()
 
     base_cfg = copy.deepcopy(CONFIG)
@@ -733,11 +823,29 @@ def main():
     if args.set:
         base_cfg["dt"] = (base_cfg["nc"] / (base_cfg["dE"] * 2.5)) ** 2
 
+    # CLI overrides for filter kinetic / FD sweep
+    if args.filter_kinetic is not None:
+        base_cfg["filter_kinetic"] = args.filter_kinetic
+    if args.fd_order is not None:
+        base_cfg["fd_order"] = args.fd_order
+
+    fd_orders_cli = None
+    if args.fd_orders is not None:
+        fd_orders_cli = [int(s.strip()) for s in args.fd_orders.split(",")
+                         if s.strip()]
+        if not fd_orders_cli:
+            parser.error(f"--fd_orders 解析为空: {args.fd_orders!r}")
+        base_cfg["filter_kinetic"] = "fd"
+
     if args.scan_json:
         scan_list = json.loads(args.scan_json)
     elif args.scan:
         with open(args.scan, "r") as f:
             scan_list = json.load(f)
+    elif fd_orders_cli is not None:
+        # FD 阶数 sweep：每个阶数一组 override
+        scan_list = [{"fd_order": o, "filter_kinetic": "fd",
+                      "tag_suffix": f"fd{o}"} for o in fd_orders_cli]
     else:
         scan_list = SCAN
 
@@ -749,10 +857,13 @@ def main():
     print(f"\n{'='*60}\n  SCAN 模式：共 {n} 组配置\n{'='*60}")
     for i, override in enumerate(scan_list, start=1):
         cfg = copy.deepcopy(base_cfg)
+        # pop sweep-only metadata before merging (it's not a real config key)
+        tag_suffix = override.pop("tag_suffix", None) if isinstance(override, dict) else None
         _merge_override(cfg, override)
         changed  = ", ".join(f"{k}={v}" for k, v in override.items() if k != "tag")
         base_tag = cfg.get("tag", "")
-        cfg["tag"] = f"{base_tag}_scan{i}" if base_tag else f"scan{i}"
+        suffix   = tag_suffix if tag_suffix is not None else f"scan{i}"
+        cfg["tag"] = f"{base_tag}_{suffix}" if base_tag else suffix
         print(f"\n{chr(9472)*60}\n  运行 {i}/{n}：{changed}\n{chr(9472)*60}")
         run(cfg)
 
