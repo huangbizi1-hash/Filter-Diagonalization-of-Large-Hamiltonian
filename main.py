@@ -80,7 +80,7 @@ import random
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import matplotlib
@@ -232,7 +232,7 @@ def save_json(obj: Dict[str, Any], path: Path) -> None:
 # ============================================================
 # 主运行函数
 # ============================================================
-def run(cfg: Dict[str, Any]) -> None:
+def run(cfg: Dict[str, Any]) -> "Tuple[Path, Dict[str, Any]]":
     # ---- 输出目录 ----
     stamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag     = cfg.get("tag", "")
@@ -746,6 +746,8 @@ def run(cfg: Dict[str, Any]) -> None:
     print(f"   Saved: {out_dir / 'res.json'}")
     print(f"\nAll outputs in: {out_dir}")
 
+    return out_dir, results
+
 
 # ============================================================
 # 辅助：将 override dict 深度合并到 base dict（原地修改 base）
@@ -779,6 +781,86 @@ def _parse_val(s: str) -> Any:
 
 
 # ============================================================
+# Summary 聚合：把 SCAN 中每个 run 的 res 收成一个大 JSON
+# ============================================================
+def _resolve_summary_path(spec: str,
+                          base_cfg: Dict[str, Any],
+                          ref_dir: "Path | None") -> Path:
+    """
+    将 --summary_json 参数解析为最终输出路径。
+    - 'auto'           : results/<stamp>_<tag>_summary.json （或放在首次 run 的
+                          out_dir 旁边作为兄弟文件）
+    - 其他字符串       : 直接当作路径（绝对或相对均可）
+    """
+    if spec.lower() == "auto":
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tag = base_cfg.get("tag", "") or "run"
+        out_root = Path(base_cfg.get("out_root", "results"))
+        return out_root / f"{stamp}_{tag}_summary.json"
+    return Path(spec)
+
+
+def _flatten_run_summary(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """从单个 run 的 res dict 抽出关键标量/数组，方便后处理脚本快速读。"""
+    res = entry.get("res", {}) or {}
+    f   = res.get("filter", {}) or {}
+    rr  = res.get("rayleigh_ritz", {}) or {}
+    t   = res.get("timings_seconds", {}) or {}
+    cfg = res.get("config", {}) or {}
+    return {
+        "tag":            entry.get("tag"),
+        "override":       entry.get("override"),
+        "out_dir":        entry.get("out_dir"),
+        "filter_kinetic": f.get("filter_kinetic"),
+        "fd_order":       f.get("fd_order"),
+        "filter_type":    f.get("filter_type"),
+        "nc":             f.get("nc"),
+        "nc_true":        f.get("nc_true"),
+        "dE":             cfg.get("dE"),
+        "Vmin":           cfg.get("Vmin"),
+        "H_max_fd_power_iter": f.get("H_max_fd_power_iter"),
+        "error_mean_vs_El":    f.get("error_mean_vs_El"),
+        "E_mean":         f.get("E_mean"),
+        "E_std":          f.get("E_std"),
+        "El_list":        f.get("El_list"),
+        "energies":       rr.get("energies"),
+        "n_energies":     rr.get("n_energies"),
+        "rank":           rr.get("rank"),
+        "timings": {
+            "build_potential":      t.get("build_potential"),
+            "build_filter":         t.get("build_filter"),
+            "filter_states":        t.get("filter_states"),
+            "filter_apply_total":   t.get("filter_apply_total"),
+            "filter_apply_mean_per_state": t.get("filter_apply_mean_per_state"),
+            "power_iter_fd_max_eig": t.get("power_iter_fd_max_eig"),
+            "rayleigh_ritz":        t.get("rayleigh_ritz"),
+            "total":                t.get("total"),
+        },
+    }
+
+
+def _write_summary(path: Path,
+                   base_cfg: Dict[str, Any],
+                   runs: list) -> None:
+    """
+    汇总输出：
+      - meta             : timestamp、base_cfg、运行数
+      - summary          : 每个 run 一行扁平化关键字段（n_runs 个）
+      - runs             : 每个 run 完整 res.json 内容
+    """
+    summary = {
+        "meta": {
+            "timestamp":     datetime.now().isoformat(timespec="seconds"),
+            "n_runs":        len(runs),
+            "base_cfg":      base_cfg,
+        },
+        "summary": [_flatten_run_summary(r) for r in runs],
+        "runs":    runs,
+    }
+    save_json(summary, path)
+
+
+# ============================================================
 # CLI 入口
 # ============================================================
 def main():
@@ -808,6 +890,11 @@ def main():
                         help="comma-separated FD orders, e.g. '2,4,6,8' — "
                              "sweep one run per order; implies "
                              "--filter_kinetic fd")
+    parser.add_argument("--summary_json", type=str, default=None,
+                        metavar="PATH",
+                        help="aggregate every SCAN run's res.json into one "
+                             "big JSON written to PATH (use 'auto' to derive "
+                             "results/<stamp>_<tag>_summary.json automatically)")
     args = parser.parse_args()
 
     base_cfg = copy.deepcopy(CONFIG)
@@ -850,11 +937,21 @@ def main():
         scan_list = SCAN
 
     if not scan_list:
-        run(base_cfg)
+        out_dir, res = run(base_cfg)
+        if args.summary_json:
+            summary_path = _resolve_summary_path(args.summary_json,
+                                                 base_cfg, out_dir)
+            _write_summary(summary_path, base_cfg,
+                           [{"override": {}, "tag": base_cfg.get("tag", ""),
+                             "out_dir": str(out_dir), "res": res}])
+            print(f"\nSummary JSON written: {summary_path}")
         return
 
     n = len(scan_list)
     print(f"\n{'='*60}\n  SCAN 模式：共 {n} 组配置\n{'='*60}")
+
+    aggregated = []  # one entry per run; used by --summary_json
+    first_out_dir = None
     for i, override in enumerate(scan_list, start=1):
         cfg = copy.deepcopy(base_cfg)
         # pop sweep-only metadata before merging (it's not a real config key)
@@ -865,9 +962,24 @@ def main():
         suffix   = tag_suffix if tag_suffix is not None else f"scan{i}"
         cfg["tag"] = f"{base_tag}_{suffix}" if base_tag else suffix
         print(f"\n{chr(9472)*60}\n  运行 {i}/{n}：{changed}\n{chr(9472)*60}")
-        run(cfg)
+        out_dir, res = run(cfg)
+        if first_out_dir is None:
+            first_out_dir = out_dir
+        aggregated.append({
+            "index":    i,
+            "tag":      cfg.get("tag", ""),
+            "override": override,
+            "out_dir":  str(out_dir),
+            "res":      res,
+        })
 
     print(f"\n{'='*60}\n  SCAN 完成：共 {n} 组均已运行\n{'='*60}\n")
+
+    if args.summary_json:
+        summary_path = _resolve_summary_path(args.summary_json,
+                                             base_cfg, first_out_dir)
+        _write_summary(summary_path, base_cfg, aggregated)
+        print(f"Summary JSON written: {summary_path}")
 
 
 if __name__ == "__main__":
