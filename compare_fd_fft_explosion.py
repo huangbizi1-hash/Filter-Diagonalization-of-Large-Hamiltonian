@@ -461,7 +461,49 @@ def run_jdqmr_single_N(N: int, args, fd_orders: list) -> dict:
     return {'N': N, 'N3': N3, 'd': d, 'solver': 'jdqmr',
             'potential': args.potential, 'methods': methods}
 
-# ── CLI helpers ────────────────────────────────────────────────────────────────
+
+def run_bench_single_N(N: int, args, fd_orders: list) -> dict:
+    """Benchmark H-apply time only — no eigensolving.
+
+    For each method (FFT and requested FD orders), calls benchmark_h_apply_time
+    and reports avg seconds per H application.
+    """
+    d, x1d = make_grid_from_N(N, args.box_L)
+    N3 = N**3
+    X, Y, Z = np.meshgrid(x1d, x1d, x1d, indexing='ij')
+
+    if args.potential == 'gaussian':
+        V_num = -args.A * np.exp(-args.B * (X**2 + Y**2 + Z**2))
+    else:
+        V_num = 0.5 * args.omega**2 * (X**2 + Y**2 + Z**2)
+
+    T_k_exact = make_T_k(N, d)
+    methods = []
+
+    def H_fft(v):
+        return apply_H_fft(v, V_num, T_k_exact)
+
+    t_avg = benchmark_h_apply_time(H_fft, N3, n_repeat=args.h_repeat)
+    methods.append({'label': 'fft', 'avg_h_apply_s': float(t_avg)})
+    print(f'  [fft]  N={N}  N³={N3}  avg_H={t_avg * 1e3:.4f} ms  '
+          f'({t_avg * 1e6 / N3:.4f} µs/pt)')
+
+    for order in fd_orders:
+        stencil = FD_STENCILS[order].astype(np.float64)
+        inv_d2  = -0.5 / (d ** 2)
+
+        def H_fd(v, _s=stencil, _id2=inv_d2, _N=N):
+            return apply_H_fd(v.reshape(_N, _N, _N), V_num, _s, _id2).ravel()
+
+        t_avg = benchmark_h_apply_time(H_fd, N3, n_repeat=args.h_repeat)
+        methods.append({'label': f'fd{order}', 'avg_h_apply_s': float(t_avg)})
+        print(f'  [fd{order}] N={N}  N³={N3}  avg_H={t_avg * 1e3:.4f} ms  '
+              f'({t_avg * 1e6 / N3:.4f} µs/pt)')
+
+    return {'N': N, 'N3': N3, 'd': float(d), 'solver': 'bench',
+            'potential': args.potential, 'methods': methods}
+
+
 
 def _parse_N_sweep(s: str) -> list:
     """Parse --N_sweep string into a list of N values.
@@ -594,8 +636,12 @@ def main():
                          '"fft" = always H_FFT (exact kinetic energy); '
                          '"fd"/"consistent" = each FD method uses its own H_FD '
                          '(measures true discretisation error).  [default consistent]')
-    ap.add_argument('--solver', choices=['explosion','jdqmr'], default='explosion',
-                    help='Eigen solver mode: explosion (Chebyshev filter) or jdqmr')
+    ap.add_argument('--solver', choices=['explosion', 'jdqmr', 'bench'],
+                    default='explosion',
+                    help='Solver mode: '
+                         '"explosion" = Chebyshev filter + Ritz; '
+                         '"jdqmr" = PRIMME JDQMR eigenvalues; '
+                         '"bench" = H-apply timing only (no eigensolving)')
     ap.add_argument('--jdqmr_tol', type=float, default=1e-8,
                     help='JDQMR tolerance [default 1e-8]')
     ap.add_argument('--max_matvecs', type=int, default=50000,
@@ -652,7 +698,7 @@ def main():
     print(f'box_L={args.box_L}  n_random={args.n_random}  '
           f'cheb_m={args.cheb_m}  E_lo={args.E_lo}  E_hi={args.E_hi}')
     print(f'FD orders:  {fd_orders}')
-    if is_sweep and args.solver == 'explosion':
+    if is_sweep and args.solver in ('explosion', 'bench'):
         print(f'N sweep:    {N_list}')
 
     # ── run ───────────────────────────────────────────────────────────────────
@@ -660,11 +706,33 @@ def main():
     for N in N_list:
         if args.solver == 'jdqmr':
             result = run_jdqmr_single_N(N, args, fd_orders)
+        elif args.solver == 'bench':
+            result = run_bench_single_N(N, args, fd_orders)
         else:
             result = run_single_N(N, args, fd_orders, n_print, ritz_h=args.ritz_h)
         sweep_results.append(result)
 
     t_wall = time.perf_counter() - t_wall_start
+
+    # ── final summary (bench sweep) ───────────────────────────────────────────
+    if args.solver == 'bench' and is_sweep:
+        method_labels = ['fft'] + [f'fd{o}' for o in fd_orders]
+        col_w = 13
+        print(f'\n{"="*70}')
+        print('H-apply timing sweep  (ms per application)')
+        hdr = f'{"N":>5} {"N³":>9} {"d":>8}'
+        for lbl in method_labels:
+            hdr += f'  {lbl:>{col_w}}'
+        print(hdr)
+        print('-' * 70)
+        for res in sweep_results:
+            mmap = {m['label']: m['avg_h_apply_s'] for m in res['methods']}
+            row  = f'{res["N"]:>5} {res["N3"]:>9} {res["d"]:>8.5f}'
+            for lbl in method_labels:
+                t = mmap.get(lbl)
+                row += f'  {t * 1e3:>{col_w}.4f}' if t is not None else f'  {"—":>{col_w}}'
+            print(row)
+        print(f'{"="*70}')
 
     # ── final summary (sweep mode) ─────────────────────────────────────────────
     if is_sweep and args.solver == 'explosion':
