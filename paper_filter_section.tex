@@ -1,0 +1,297 @@
+% ------------------------------------------------------------------
+% Filter-diagonalization section (ready to include in a paper)
+% ------------------------------------------------------------------
+\section{Polynomial Filter Construction and Application}
+\label{sec:filter}
+
+We seek eigenpairs of a Hamiltonian operator $H$ in a target energy region.
+The filtering stage is designed to (i) isolate selected energy windows and
+(ii) do so with a fixed number of Hamiltonian applications independent of the
+number of windows.
+
+\subsection{Step 1: Energy interval selection and spectral scaling}
+
+Let the physical spectral interval of interest be
+\begin{equation}
+E \in [E_{\min},E_{\max}], \qquad
+V_{\min}=E_{\min}, \qquad dE = E_{\max}-E_{\min}.
+\end{equation}
+We define the scaled operator
+\begin{equation}
+\widetilde{H} = \frac{4}{dE}(H - V_{\min}I) - 2I,
+\label{eq:Hscale}
+\end{equation}
+so that the spectrum is mapped to (approximately) $[-2,2]$.
+
+This scaling is numerically important: after repeated polynomial recursions
+(e.g., $\sim 500$ iterations), intermediate vectors remain in a safe dynamic
+range for double precision because the effective argument of the polynomial is
+confined near $[-2,2]$.
+
+\subsection{Step 2: Gaussian filter width from interpolation order}
+
+For a window centered at $E_\ell$, the Gaussian filter is
+\begin{equation}
+f_\ell(E)=\sqrt{\frac{dt}{\pi}}\exp\!\left[-dt\,(E-E_\ell)^2\right],
+\end{equation}
+with bandwidth
+\begin{equation}
+\sigma = \frac{1}{\sqrt{2dt}}.
+\end{equation}
+In our implementation, $dt$ is chosen from the interpolation order $n$ (named
+\texttt{nc} in code) and global energy span $dE$ via
+\begin{equation}
+dt = \left(\frac{n}{2.5\,dE}\right)^2,
+\qquad
+\sigma = \frac{1}{\sqrt{2dt}}.
+\label{eq:dt_sigma}
+\end{equation}
+Hence increasing $n$ yields narrower Gaussian windows (smaller $\sigma$), while
+also improving interpolation accuracy.
+
+\subsection{Step 3: Newton interpolation of each filter}
+
+Choose interpolation nodes $\{s_j\}_{j=0}^{n-1}\subset[-2,2]$ in scaled
+coordinates and map them back to physical energies by
+\begin{equation}
+E(s)=\frac{(s+2)dE}{4}+V_{\min}.
+\end{equation}
+For each window center $E_\ell$, compute Newton divided-difference
+coefficients $a_{\ell,j}$ such that
+\begin{equation}
+P_\ell(s)=\sum_{j=0}^{n-1} a_{\ell,j}
+\prod_{k=0}^{j-1}(s-s_k)
+\approx f_\ell(E(s)).
+\label{eq:newton_poly}
+\end{equation}
+Then $P_\ell(\widetilde{H})$ approximates $f_\ell(H)$.
+
+\subsection{Step 4: Shared recursion for $N_{\mathrm{windows}}$ filters}
+
+A direct strategy would apply each filter independently, costing
+$\mathcal{O}(N_{\mathrm{windows}}\,n)$ Hamiltonian applications.
+Instead, we share one Newton basis recursion among all windows.
+
+Define basis vectors for an input state $\psi$:
+\begin{align}
+\phi_0 &= \psi,\\
+\phi_j &= (\widetilde{H}-s_{j-1}I)\phi_{j-1}, \qquad j=1,\dots,n-1.
+\label{eq:basis_rec}
+\end{align}
+Each filtered state is a linear combination
+\begin{equation}
+\psi^{(\ell)}_{\mathrm{filt}} = \sum_{j=0}^{n-1} a_{\ell,j}\,\phi_j.
+\label{eq:combine}
+\end{equation}
+Therefore, all $N_{\mathrm{windows}}$ outputs are produced with only
+$n-1$ applications of $H$ total (equivalently $n$ Newton levels), not
+$N_{\mathrm{windows}}\times n$.
+
+\subsection{Operator application with Horner/Newton recursion}
+
+The implementation evaluates the Newton polynomial action via nested
+recurrence (Horner form for Newton basis), while accumulating all windows in
+parallel through different coefficient rows $\{a_{\ell,j}\}_{\ell}$.
+
+\begin{algorithm}[t]
+\caption{Shared Newton--Horner Filter Application for Multiple Windows}
+\label{alg:shared_filter}
+\begin{algorithmic}[1]
+\Require Hamiltonian apply routine $\mathrm{ApplyH}(\cdot)$, initial state $\psi$,
+         nodes $s[0{:}n-1]$, coefficients $a[0{:}N_w-1,0{:}n-1]$, parameters $(V_{\min},dE)$
+\Ensure Filtered states $\Psi_{\mathrm{out}}[\ell] \approx f_\ell(H)\psi$, $\ell=0,\dots,N_w-1$
+\State $\phi \gets \psi$
+\State $\Psi_{\mathrm{out}}[\ell] \gets a[\ell,0]\,\psi$ for all $\ell$
+\For{$j=1$ to $n-1$}
+    \State $u \gets \mathrm{ApplyH}(\phi)$
+    \State $\phi \gets \dfrac{4}{dE}(u - V_{\min}\phi) - 2\phi - s[j-1]\phi$
+    \For{$\ell=0$ to $N_w-1$}
+        \State $\Psi_{\mathrm{out}}[\ell] \gets \Psi_{\mathrm{out}}[\ell] + a[\ell,j]\,\phi$
+    \EndFor
+\EndFor
+\State \Return $\Psi_{\mathrm{out}}$
+\end{algorithmic}
+\end{algorithm}
+
+\appendix
+\section{Node selection and node-ordering strategy for Newton interpolation}
+\label{app:nodes}
+
+This appendix summarizes the node-construction logic used in the code for
+Newton interpolation. The key implementation detail is that both
+\\emph{node locations} and \\emph{node order} are treated as first-class
+numerical design choices.
+
+\subsection{Why node order matters}
+
+For nodes $\{s_j\}_{j=0}^{n-1}$, the Newton form is
+\begin{equation}
+P(s)=a_0+a_1(s-s_0)+a_2(s-s_0)(s-s_1)+\cdots .
+\end{equation}
+The divided-difference coefficients $\{a_j\}$ depend on the \\emph{ordered}
+sequence $(s_0,s_1,\ldots,s_{n-1})$, not only on the unordered set.
+Therefore, reordering nodes (e.g., sorting by coordinate) changes the
+high-order coefficients and can significantly alter numerical stability.
+In this implementation, when nodes are generated by greedy procedures
+(Ashkenazy/Leja), their greedy order is preserved.
+
+\subsection{Base node sets on the scaled interval $[-2,2]$}
+
+All nodes are built in scaled coordinates $s\in[-2,2]$.
+The code supports four base strategies:
+\begin{enumerate}
+  \item \textbf{Ashkenazy greedy nodes.}
+  On a dense candidate pool, choose nodes sequentially by maximizing the
+  incremental log-Vandermonde objective:
+  \begin{equation}
+  s_j=\arg\max_{s\in\mathcal C}
+  \sum_{i=0}^{j-1}\log|s-s_i|^2.
+  \label{eq:ashkenazy_obj}
+  \end{equation}
+  This produces an endpoint-enriched distribution similar to Chebyshev-like
+  behavior while keeping a stable greedy order.
+
+  \item \textbf{Chebyshev nodes.}
+  First-kind Chebyshev nodes mapped to $[-2,2]$:
+  \begin{equation}
+  s_k = \frac{S_{\min}+S_{\max}}{2}
+      + \frac{S_{\max}-S_{\min}}{2}
+      \cos\!\left(\frac{(2k+1)\pi}{2n}\right),
+  \end{equation}
+  with $S_{\min}=-2$, $S_{\max}=2$.
+
+  \item \textbf{Derivative-adapted nodes (for bandpass-like windows).}
+  Build a sampling density from transition-region derivatives, then sample
+  inverse-CDF quantiles to place more nodes near steep filter edges.
+
+  \item \textbf{Density-mapped nodes.}
+  Define a custom density $\rho(s)$ (typically Gaussian-enhanced in a target
+  sub-interval), compute the normalized cumulative map, run Ashkenazy in the
+  mapped coordinate, then invert the map back to $s$.
+\end{enumerate}
+
+\subsection{Adaptive refinement: Leja extension without moving old nodes}
+
+When local interpolation accuracy in a specified energy interval is
+insufficient, the code does \\emph{not} regenerate all nodes from scratch.
+Instead, it appends new nodes with a Leja-style extension:
+\begin{equation}
+s_{n+j}
+=\arg\max_{s\in\mathcal C}
+\sum_{i=0}^{n+j-1}\log|s-s_i|^2,
+\qquad j=0,1,\dots
+\label{eq:leja_append}
+\end{equation}
+while freezing existing nodes $\{s_0,\dots,s_{n-1}\}$.
+This preserves the previously fitted polynomial structure and avoids global
+node drift.
+
+Let $I_{\mathrm{enh}}=[s_{\mathrm{lo}},s_{\mathrm{hi}}]$ be the enhancement
+interval (mapped from physical energy bounds), and let
+$\varepsilon_{\max}$ be the maximum interpolation error in $I_{\mathrm{enh}}$
+over all windows:
+\begin{equation}
+\varepsilon_{\max}
+= \max_{\ell}\max_{s\in I_{\mathrm{enh}}}
+\left|f_\ell(E(s)) - P_\ell(s)\right|.
+\end{equation}
+Refinement repeats in batches until
+$\varepsilon_{\max}\le \tau_{\mathrm{interp}}$ or a maximum number of
+iterations is reached.
+
+\begin{algorithm}[t]
+\caption{Node generation and ordering for stable Newton interpolation}
+\label{alg:node_strategy}
+\begin{algorithmic}[1]
+\Require Initial order $n$, method in \{Ashkenazy, Chebyshev, derivative-adapted, density-mapped\}, optional enhancement interval
+\Ensure Ordered node sequence $s[0{:}n_{\mathrm{true}}-1]$ and coefficients $a_{\ell,j}$
+\State Build base nodes $s[0{:}n-1]$ in scaled domain $[-2,2]$ using the selected method
+\State Keep generated order unchanged (no coordinate sorting)
+\State Compute Newton coefficients $a_{\ell,:}$ for each window center $E_\ell$
+\If{enhancement interval is provided}
+  \State Evaluate worst interpolation error $\varepsilon_{\max}$ in the interval
+  \While{$\varepsilon_{\max}>\tau_{\mathrm{interp}}$ and iteration limit not reached}
+    \State Append nodes by Leja objective in Eq.~\eqref{eq:leja_append} (old nodes fixed)
+    \State Recompute coefficients $a_{\ell,:}$ on the extended ordered node list
+    \State Re-evaluate $\varepsilon_{\max}$
+  \EndWhile
+\EndIf
+\State \Return final ordered nodes and Newton coefficients
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Complexity note.}
+Algorithm~\ref{alg:shared_filter} requires only $n-1$ calls to
+$\mathrm{ApplyH}$ for all windows together; additional windows only increase
+cheap axpy-style vector combinations.
+
+\subsection{Ritz extraction after filtering: SVD and projected diagonalization}
+
+Let $\{\psi^{(i)}_{\mathrm{filt}}\}_{i=1}^{N_b}$ denote all filtered states
+(from all random seeds and all windows), reshaped as columns of
+\begin{equation}
+B = [\psi^{(1)}_{\mathrm{filt}},\ldots,\psi^{(N_b)}_{\mathrm{filt}}]
+\in \mathbb{C}^{N_g\times N_b},
+\end{equation}
+where $N_g$ is the full grid/basis dimension.
+
+Because filtered vectors are often nearly linearly dependent, we first build a
+numerically stable orthonormal subspace by QR+SVD:
+\begin{align}
+B &= QR,\\
+R &= U_1 \Sigma V^\ast,\\
+U_r &= (Q U_1)_{(:,1:r)},
+\end{align}
+where $r$ is the effective rank selected by a singular-value threshold
+$\sigma_i>\tau_{\mathrm{svd}}$. The columns of $U_r\in\mathbb{C}^{N_g\times r}$
+form the reduced Ritz subspace.
+
+We then construct the projected (Rayleigh--Ritz) matrix
+\begin{equation}
+\widetilde{H}_{ij}
+= \langle u_i, H u_j\rangle,
+\qquad i,j=1,\ldots,r,
+\label{eq:Htilde}
+\end{equation}
+or in matrix form
+\begin{equation}
+\widetilde{H}=U_r^\ast H U_r\in\mathbb{C}^{r\times r}.
+\end{equation}
+For Hermitian problems, we optionally enforce numerical symmetry by
+\begin{equation}
+\widetilde{H}\leftarrow \frac{\widetilde{H}+\widetilde{H}^\ast}{2}.
+\end{equation}
+
+Finally, solve the reduced eigenproblem
+\begin{equation}
+\widetilde{H} y_k = \theta_k y_k,
+\qquad k=1,\ldots,r.
+\end{equation}
+The scalars $\theta_k$ are Ritz values (approximations to eigenvalues of $H$),
+and the Ritz vectors in the full space are
+\begin{equation}
+x_k = U_r y_k.
+\end{equation}
+Sorting $\theta_k$ in ascending order gives the final energy estimates in the
+target window; the corresponding $x_k$ are the approximate eigenstates.
+
+\begin{algorithm}[t]
+\caption{SVD-accelerated Rayleigh--Ritz from filtered basis}
+\label{alg:ritz}
+\begin{algorithmic}[1]
+\Require Filtered basis matrix $B\in\mathbb{C}^{N_g\times N_b}$, operator apply $\mathrm{ApplyH}(\cdot)$, SVD cutoff $\tau_{\mathrm{svd}}$
+\Ensure Ritz pairs $(\theta_k, x_k)$
+\State Remove zero/invalid columns of $B$ and normalize remaining columns
+\State Compute reduced QR: $B=QR$
+\State SVD of $R$: $R=U_1\Sigma V^\ast$
+\State $r \gets \#\{i:\Sigma_{ii}>\tau_{\mathrm{svd}}\}$, then $r\gets \max(1,r)$
+\State $U_r \gets (Q U_1)_{(:,1:r)}$
+\State Build $\widetilde{H}\in\mathbb{C}^{r\times r}$ by
+      $\widetilde{H}_{ij}=\langle U_r[:,i], \mathrm{ApplyH}(U_r[:,j])\rangle$
+\State (Optional Hermitian cleanup) $\widetilde{H}\gets (\widetilde{H}+\widetilde{H}^\ast)/2$
+\State Diagonalize: $\widetilde{H}Y=Y\Theta$
+\State Ritz values: $\theta_k=\Theta_{kk}$; Ritz vectors: $x_k=U_rY[:,k]$
+\State Sort $(\theta_k,x_k)$ by ascending $\theta_k$
+\State \Return $\{(\theta_k,x_k)\}$
+\end{algorithmic}
+\end{algorithm}
