@@ -530,7 +530,7 @@ def run(cfg: Dict[str, Any]) -> None:
             dtype=np.float64,
         )
         which_arg = target if target is not None else which
-        evals, _evecs, stats = primme.eigsh(
+        evals, _evecs, stats = primme.eigs(
             H_op,
             k=n_levels,
             which=which_arg,
