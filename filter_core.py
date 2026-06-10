@@ -246,6 +246,9 @@ def svd_rayleigh_ritz_op(
     r_eff = int(np.sum(sigma > svd_tol))
     r = max(1, r_eff)
     Ur = (Q @ U1)[:, :r]
+    if Ur.shape[1] == 0:
+        empty_evals = np.array([], dtype=np.float64)
+        return empty_evals, Ur, 0
 
     # H̃[i,j] = ⟨ur_i|H|ur_j⟩
     H_tilde = np.zeros((r, r), dtype=np.result_type(Ur.dtype, np.float64))

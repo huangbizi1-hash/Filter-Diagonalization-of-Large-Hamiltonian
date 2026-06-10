@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
+from datetime import datetime
 from pathlib import Path
 
 from rbf_core import (RBFConfig, build_problem, build_qd_problem,
+                       build_hamiltonian_matrix,
                        iterate_hamiltonian, relative_laplacian_error,
                        solve_lowest_eigenvalues, sweep_rbf_kernels,
                        sweep_stencil_eps,
@@ -135,6 +138,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--csv", type=str, default="",
         help="Optional CSV output path for iteration summary.",
+    )
+    parser.add_argument(
+        "--save-artifacts", action="store_true",
+        help="Save generated nodes and sparse Hamiltonian matrix to files.",
+    )
+    parser.add_argument(
+        "--artifacts-dir", type=str, default="rbf_artifacts",
+        help="Output directory for saved nodes/matrix/metadata files.",
+    )
+    parser.add_argument(
+        "--artifact-tag", type=str, default="",
+        help="Optional extra tag appended to artifact filenames.",
     )
     return parser.parse_args()
 
@@ -626,6 +641,8 @@ def main() -> None:
         print(f"nodes total    : {problem.nodes.shape[0]}")
         print(f"interior nodes : {problem.interior_idx.shape[0]}")
         print(f"V range        : [{problem.V_nodes.min():.4f}, {problem.V_nodes.max():.4f}] Ha")
+        if args.save_artifacts:
+            _save_problem_artifacts(problem, mode="qd", order=order, args=args)
         if not args.no_eigs:
             print("-" * 72)
             print(f"Sparse eigenvalue solve  n_eigs={args.n_eigs}  device={args.device}"
@@ -648,6 +665,8 @@ def main() -> None:
     )
 
     problem = build_problem(config=config, build_interpolation=not args.no_interp)
+    if args.save_artifacts:
+        _save_problem_artifacts(problem, mode="ho", order=config.order, args=args)
 
     err = relative_laplacian_error(problem)
     print("=" * 72)
